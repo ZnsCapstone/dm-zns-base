@@ -12,16 +12,32 @@
 #include <linux/init.h>
 #include <linux/bio.h>
 #include <linux/device-mapper.h>
+#include <linux/spinlock.h>
+#include <linux/slab.h>
 
 #define DM_MSG_PREFIX "zns-base"
+#define ZNS_BASE_BLOCK_SIZE 4096
+#define SECTORS_PER_BLOCK 8
+
+static const sector_t invalid_sector = (sector_t) - 1;
 
 struct zns_base_c {
 	struct dm_dev *dev;
+
+	//sector_t는 Linux 커널에서 블록 디바이스의 sector 번호를 저장할 때 쓰는 정수 타입이다.
+	sector_t next_write_sector; // 실제 아래쪽 zoned device의 physical sector 번호를 뜻한다.
+	sector_t *map;
+	size_t nr_logical_blocks;
+
+	spinlock_t lock;
 };
 
 static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct zns_base_c *c;
+	sector_t *mapping_table;
+	size_t nr_logical_blocks;
+	size_t i;
 	int ret;
 
 	if (argc != 1) {
@@ -43,6 +59,53 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return ret;
 	}
 
+	if(ti -> len % SECTORS_PER_BLOCK != 0){
+		ti -> error = "target length is not 4KiB aligned";
+		dm_put_device(ti, c->dev);
+		kfree(c);
+	
+		return -EINVAL; // 인자가 잘못됐다
+	}
+	nr_logical_blocks = ti -> len / SECTORS_PER_BLOCK;
+
+	/*
+	 	map[0] -> logical block 0의 최신 physical 시작 sector
+		map[1] -> logical block 1의 최신 physical 시작 sector
+		map[2] -> logical block 2의 최신 physical 시작 sector
+
+		logical block 0은 sector 0~7을 포함해.
+
+		logical block 0 = logical sector 0~7
+		logical block 1 = logical sector 8~15
+		logical block 2 = logical sector 16~23
+	*/
+	/*
+		여기서는 kzalloc이 아니라 kvcalloc을 사용. 이것은 꼭 연속된 메모리 공간이 아니여도 된다.
+		nr_logical_blocks개만큼, 각 entry는 sector_t 크기, 0으로 초기화해서 할당
+		
+		GFP_KERNEL의 의미는:
+		일반적인 커널 context에서 쓰는 메모리 할당
+		필요하면 sleep 가능
+		메모리를 확보하기 위해 reclaim 가능
+	*/
+	mapping_table = kvcalloc(nr_logical_blocks, sizeof(sector_t), GFP_KERNEL);
+	
+	if(mapping_table == NULL){
+		ti->error = "failed to allocate mapping table";
+		dm_put_device(ti, c->dev);
+		kfree(c);
+		// Error: Not enough memory
+		return -ENOMEM;
+	}
+
+	for(i = 0; i < nr_logical_blocks; i++){
+		mapping_table[i] = invalid_sector;
+	}
+	c -> map = mapping_table;
+	c -> nr_logical_blocks = nr_logical_blocks;
+	c -> next_write_sector = 0;
+	spin_lock_init(&c -> lock); // lock 초기화
+
 	ti->private = c;
 	ti->num_flush_bios = 1;
 	ti->num_discard_bios = 1;
@@ -55,6 +118,7 @@ static void zns_base_dtr(struct dm_target *ti)
 {
 	struct zns_base_c *c = ti->private;
 
+	kvfree(c -> map);
 	dm_put_device(ti, c->dev);
 	kfree(c);
 	DMINFO("dtr: target detached");
@@ -63,45 +127,67 @@ static void zns_base_dtr(struct dm_target *ti)
 static int zns_base_map(struct dm_target *ti, struct bio *bio)
 {
 	struct zns_base_c *c = ti->private;
+	size_t logical_block_num;
+  	sector_t physical_sector;
 
 	/* Student work goes here: translate random writes into sequential ones. */
+	if(bio -> bi_iter.bi_sector % SECTORS_PER_BLOCK != 0 || bio -> bi_iter.bi_size != ZNS_BASE_BLOCK_SIZE){
+		bio->bi_status = BLK_STS_NOTSUPP; // 이 bio는 지원하지 않는 요청으로 표시
+		bio_endio(bio); // bio 끝냄
+		return DM_MAPIO_SUBMITTED; // DM에게 내가 처리했다 라고 알리는것.
+	}
+	logical_block_num = bio -> bi_iter.bi_sector / SECTORS_PER_BLOCK;
+
+	if(logical_block_num >= c -> nr_logical_blocks){
+		bio_io_error(bio);
+  		return DM_MAPIO_SUBMITTED;
+	}
+
+	// write bio 처리
+	if(bio_op(bio) == REQ_OP_WRITE){
+		spin_lock(&c -> lock);
+		if(c -> next_write_sector + SECTORS_PER_BLOCK > ti -> len){
+			spin_unlock(&c->lock);
+			bio->bi_status = BLK_STS_NOSPC;
+			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
+		physical_sector = c -> next_write_sector;
+		c -> map[logical_block_num] = physical_sector;
+		c -> next_write_sector += SECTORS_PER_BLOCK;
+		spin_unlock(&c -> lock);
+		bio -> bi_iter.bi_sector = physical_sector;
+	}
+	// read bio 처리
+	else if(bio_op(bio) == REQ_OP_READ){
+		spin_lock(&c -> lock);
+		physical_sector = c -> map[logical_block_num];
+		spin_unlock(&c -> lock);
+		if(physical_sector == invalid_sector){
+			bio_io_error(bio);
+  			return DM_MAPIO_SUBMITTED;
+		}
+		bio -> bi_iter.bi_sector = physical_sector;
+	}
+	// read와 write 둘 다 아닌 경우 ex) flush, discard
+	else{
+		bio->bi_status = BLK_STS_NOTSUPP;
+		bio_endio(bio);
+		return DM_MAPIO_SUBMITTED;
+	}
+
+	// 이 bio 요청이 내려갈 대상 block device를 아래쪽 underlying device로 바꾸는 코드.
 	bio_set_dev(bio, c->dev->bdev);
 	return DM_MAPIO_REMAPPED;
-}
-
-/* 1:1 mapping, so ti->begin is passed straight through. A non-identity
- * mapping would need to translate args->next_sector. */
-static int zns_base_report_zones(struct dm_target *ti,
-				 struct dm_report_zones_args *args,
-				 unsigned int nr_zones)
-{
-	struct zns_base_c *c = ti->private;
-
-	return dm_report_zones(c->dev->bdev, ti->begin,
-			       args->next_sector, args, nr_zones);
-}
-
-/* DM_TARGET_ZONED_HM is just a capability flag. Without this callback the
- * underlying device's chunk_sectors and zoned attributes never propagate up
- * to the DM queue, and blkzone fails with "unable to determine zone size". */
-static int zns_base_iterate_devices(struct dm_target *ti,
-				    iterate_devices_callout_fn fn, void *data)
-{
-	struct zns_base_c *c = ti->private;
-
-	return fn(ti, c->dev, 0, ti->len, data);
 }
 
 static struct target_type zns_base_target = {
 	.name            = "zns-base",
 	.version         = {0, 1, 0},
-	.features        = DM_TARGET_ZONED_HM,
 	.module          = THIS_MODULE,
 	.ctr             = zns_base_ctr,
 	.dtr             = zns_base_dtr,
 	.map             = zns_base_map,
-	.report_zones    = zns_base_report_zones,
-	.iterate_devices = zns_base_iterate_devices,
 };
 
 static int __init zns_base_init(void)

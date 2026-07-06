@@ -15,3 +15,6 @@ Module.symvers
 .idea/
 *.swp
 .DS_Store
+
+m1-implement.md
+Q&A.md
