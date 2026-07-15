@@ -12,7 +12,6 @@
 #include <linux/init.h>
 #include <linux/bio.h>
 #include <linux/device-mapper.h>
-#include <linux/vmalloc.h>
 #include <linux/blkdev.h>
 
 #include "skiplist.h"
@@ -29,6 +28,7 @@ enum zone_tag {
 };
 
 #define ZONE_NONE UINT_MAX
+#define BLOCK_SECTORS 8   // 매핑 단위 = 4KB = 512B 섹터 8개
 
 // zone pool
 struct zone_pool {
@@ -36,6 +36,7 @@ struct zone_pool {
 	unsigned int nr_zones;
 	enum zone_tag *zone_tag; 					// zone_tag[zone_id] — 이 zone이 지금 뭘로 쓰이는지
 	sector_t *wp; 								// zone_id별 쓴 섹터 수
+	unsigned int *invalid_count; 				// zone_id별 무효(죽은) 섹터 수 — GC(M3) victim 선정 근거
 	unsigned int active_zone[ZONE_TAG_COUNT]; 	// 태그별 현재 활성 zone
 };
 
@@ -44,8 +45,7 @@ struct zns_base_c {
 
 	sector_t 		nr_sectors;
 	struct zone_pool *zp;
-	struct skiplist *memtable;
-	sector_t 		*map; // 물리 섹터
+	struct skiplist *memtable;  // LBA -> phys 매핑 (M1의 map[] flat array를 대체)
 
 	spinlock_t 		lock;
 };
@@ -111,6 +111,36 @@ static void zone_pool_reset(struct zone_pool *zp, unsigned int zone_id)
 	   지금은 compaction/GC를 아직 안 짰으니 이 부분은 9~10단계에서 채우면 됨 */
 	zp->wp[zone_id] = 0;
 	zp->zone_tag[zone_id] = ZONE_TAG_FREE;
+	zp->invalid_count[zone_id] = 0;
+}
+
+/* phys 섹터가 몇 번 zone에 속하는지 */
+static inline unsigned int zone_of(struct zone_pool *zp, sector_t phys)
+{
+	return phys / zp->zone_sectors;
+}
+
+/* memtable(skip list)에 lba->phys 기록. 이미 있던 lba를 덮어쓴 거라면,
+ * 그 옛 phys가 있던 zone은 이 순간부터 그만큼 죽은 공간이 생긴 것이므로
+ * invalid_count를 올려준다 — GC(M3)의 victim 선정 근거가 됨.
+ * 호출자가 c->lock을 쥐고 있다고 가정. */
+static int mapping_put(struct zns_base_c *c, u64 lba, u64 phys)
+{
+	u64 old_phys;
+	int ret = skiplist_upsert(c->memtable, lba, phys, &old_phys);
+
+	if (ret < 0)
+		return ret;
+	if (ret == 1)
+		c->zp->invalid_count[zone_of(c->zp, old_phys)]++;
+	return 0;
+}
+
+/* memtable에서 lba의 현재 물리 위치를 조회. 찾으면 1, 없으면 0.
+ * 호출자가 c->lock을 쥐고 있다고 가정. */
+static int mapping_get(struct zns_base_c *c, u64 lba, u64 *phys_out)
+{
+	return skiplist_lookup(c->memtable, lba, phys_out);
 }
 
 static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
@@ -153,13 +183,6 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	/* 전체 섹터 / zone 크기 = zone 개수 */
 	c->zp->nr_zones = c->nr_sectors / c->zp->zone_sectors;
 
-	/* map[lba] = 물리 섹터. 크기가 수십 MiB이므로 vmalloc 사용 */
-	c->map = vmalloc(c->nr_sectors * sizeof(sector_t));
-	if (!c->map) {
-		ti->error = "out of memory (map)";
-		return -ENOMEM;
-	}
-
 	/* wp[zone_id] = 해당 zone에 쓴 섹터 수. zone 개수만큼만 필요 */
 	c->zp->wp = kcalloc(c->zp->nr_zones, sizeof(sector_t), GFP_KERNEL);
 	if (!c->zp->wp) {
@@ -171,6 +194,13 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	c->zp->zone_tag = kcalloc(c->zp->nr_zones, sizeof(enum zone_tag), GFP_KERNEL);
 	if (!c->zp->zone_tag) {
 		ti->error = "out of memory (zone_tag)";
+		return -ENOMEM;
+	}
+
+	/* invalid_count[zone_id] — kcalloc이라 처음엔 전부 0(죽은 공간 없음) */
+	c->zp->invalid_count = kcalloc(c->zp->nr_zones, sizeof(unsigned int), GFP_KERNEL);
+	if (!c->zp->invalid_count) {
+		ti->error = "out of memory (invalid_count)";
 		return -ENOMEM;
 	}
 
@@ -196,6 +226,10 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->private = c;
 	ti->num_flush_bios = 1;
 	ti->num_discard_bios = 0;
+	/* 매핑 단위(4KB=BLOCK_SECTORS)보다 큰 bio는 DM core가 애초에 쪼개서
+	 * .map()에 보내게 함 — .map() 안에서 수동으로 dm_accept_partial_bio를
+	 * 부르는 것보다 이게 표준적이고 확실한 방법 */
+	ti->max_io_len = BLOCK_SECTORS;
 
 	DMINFO("ctr: target attached on top of '%s'", argv[0]);
 	return 0;
@@ -206,11 +240,11 @@ static void zns_base_dtr(struct dm_target *ti)
 	struct zns_base_c *c = ti->private;
 
 	dm_put_device(ti, c->dev);
-	vfree(c->map);
 	skiplist_destroy(c->memtable);
 	kfree(c->memtable);
 	kfree(c->zp->wp);
 	kfree(c->zp->zone_tag);
+	kfree(c->zp->invalid_count);
 	kfree(c->zp);
 	kfree(c);
 	DMINFO("dtr: target detached");
@@ -220,8 +254,36 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 {
 	struct zns_base_c *c = ti->private;
 
-	sector_t lba = bio->bi_iter.bi_sector;
+	sector_t lba;
 	sector_t nr = bio_sectors(bio);
+	sector_t block_lba;
+	sector_t offset_in_block;
+
+	/* 데이터 없는 순수 flush 요청(nr=0) — 특정 LBA와 무관한 "지금까지
+	 * 쓴 걸 확실히 반영해" 요청이라 매핑 로직을 타면 안 된다. 안 그러면
+	 * bio->bi_iter.bi_sector에 남아있는 임의의 값(보통 0)을 실제 lba처럼
+	 * 취급해서 엉뚱한 매핑 엔트리를 덮어쓰게 된다. 그냥 underlying으로
+	 * 그대로 전달한다. */
+	if (nr == 0) {
+		bio_set_dev(bio, c->dev->bdev);
+		return DM_MAPIO_REMAPPED;
+	}
+
+	lba = bio->bi_iter.bi_sector;
+
+	/* 매핑 키는 항상 블록(BLOCK_SECTORS) 정렬된 lba를 쓴다. 커널이 슈퍼블록을
+	 * 읽을 때처럼 블록 정렬 안 된 위치(예: sector 2부터 2섹터)로 요청이 올 수
+	 * 있는데, 이런 요청도 결국 어떤 블록 "안"의 일부이므로, 그 블록의 정렬된
+	 * lba로 조회하고 블록 내 옵셋만큼 phys를 보정해서 응답해야 한다. */
+	block_lba = (lba / BLOCK_SECTORS) * BLOCK_SECTORS;
+	offset_in_block = lba - block_lba;
+
+	/* bio가 지금 블록의 남은 부분을 넘어서면(블록 경계를 넘으면) 딱 그 블록
+	 * 끝까지만 처리하고 나머지는 DM core가 다음 map() 호출로 재분배하게 한다. */
+	if (nr > BLOCK_SECTORS - offset_in_block) {
+		dm_accept_partial_bio(bio, BLOCK_SECTORS - offset_in_block);
+		nr = BLOCK_SECTORS - offset_in_block;
+	}
 
 	switch (bio_op(bio)) {
 	case REQ_OP_WRITE: {
@@ -237,15 +299,36 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 			return DM_MAPIO_SUBMITTED;
 		}
 
-		c->map[lba] = phys;
+		ret = mapping_put(c, lba, phys);
 		spin_unlock_irq(&c->lock);
+		if (ret) {
+			bio->bi_status = BLK_STS_RESOURCE;
+			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
 		bio->bi_iter.bi_sector = phys;
 		break;
 	}
 	case REQ_OP_READ: {
+		sector_t phys;
+		int found;
+
+		/* block_lba(정렬된 키)로 조회 — 요청이 블록 중간에서 시작해도
+		 * 그 블록 전체가 어디 있는지는 찾을 수 있다. */
 		spin_lock_irq(&c->lock);
-		bio->bi_iter.bi_sector = c->map[lba];
+		found = mapping_get(c, block_lba, &phys);
 		spin_unlock_irq(&c->lock);
+		if (!found) {
+			/* 한 번도 안 쓴 블록 — 에러가 아니라 0으로 채워진 데이터로 읽히는 게
+			 * 표준 블록 디바이스 동작(thin-provisioning과 동일한 관례).
+			 * mkfs.ext4가 디바이스 전체를 스캔하면서 이런 읽기를 함. */
+			zero_fill_bio(bio);
+			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
+		/* phys는 block_lba의 물리 위치이므로, 실제 요청이 블록 중간에서
+		 * 시작했다면(offset_in_block) 그만큼 더해줘야 정확한 위치가 된다. */
+		bio->bi_iter.bi_sector = phys + offset_in_block;
 		break;
 	}
 	}
