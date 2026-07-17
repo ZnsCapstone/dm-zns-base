@@ -13,6 +13,7 @@
 #include <linux/bio.h>
 #include <linux/device-mapper.h>
 #include <linux/blkdev.h>
+#include <linux/mm.h>
 
 #include "skiplist.h"
 
@@ -57,6 +58,9 @@ struct SSTable {
 };
 
 // WAL - 복구용
+#define WAL_REC_PUT        1
+#define WAL_REC_CHECKPOINT 2
+
 struct wal_record {
 	u32 type;
 	u32 reserved;
@@ -64,6 +68,16 @@ struct wal_record {
         struct { u64 lba; u64 phys; } put;
         struct { u64 seq_no; u64 unused; } checkpoint;
     };
+};
+
+/* .map()의 WRITE 경로가 비동기로 넘어가면서, WAL append 완료 콜백(wal_put_done)까지
+ * 들고 가야 하는 상태를 담는다. */
+struct zns_io_ctx {
+	struct zns_base_c *c;
+	struct bio *orig_bio;
+	u64 lba;
+	sector_t phys;
+	struct wal_record *wal_buf;
 };
 
 /* FREE 태그 zone 하나를 찾아서 tag로 바꿔 배정. 없으면 ZONE_NONE */
@@ -141,6 +155,48 @@ static int mapping_put(struct zns_base_c *c, u64 lba, u64 phys)
 static int mapping_get(struct zns_base_c *c, u64 lba, u64 *phys_out)
 {
 	return skiplist_lookup(c->memtable, lba, phys_out);
+}
+
+/* WAL PUT record가 durable하게 쓰인 뒤 호출되는 완료 콜백.
+ * 여기서 비로소 memtable에 매핑을 반영하고, 원본 데이터 bio를 실제
+ * 물리 위치로 보내 제출한다 — WAL이 데이터보다 먼저 durable해야 한다는
+ * 순서를 지키기 위해 이 콜백 전에는 데이터 쓰기를 절대 내보내지 않는다. */
+static void wal_put_done(struct bio *wal_bio)
+{
+	struct zns_io_ctx *ctx = wal_bio->bi_private;
+	struct zns_base_c *c = ctx->c;
+	struct bio *orig = ctx->orig_bio;
+	blk_status_t wal_status = wal_bio->bi_status;
+	u64 lba = ctx->lba;
+	sector_t phys = ctx->phys;
+	int ret;
+
+	kfree(ctx->wal_buf);
+	bio_put(wal_bio);
+	kfree(ctx);
+
+	if (wal_status) {
+		orig->bi_status = wal_status;
+		bio_endio(orig);
+		return;
+	}
+
+	spin_lock_irq(&c->lock);
+	ret = mapping_put(c, lba, phys);
+	spin_unlock_irq(&c->lock);
+
+	if (ret) {
+		orig->bi_status = BLK_STS_RESOURCE;
+		bio_endio(orig);
+		return;
+	}
+
+	/* 원본 bio를 실제 phys 위치로 보내 그대로 제출. bi_end_io는 원래
+	 * 상위 계층(ext4 등)이 걸어둔 그대로라서, 이 데이터 쓰기가 실제로
+	 * 끝나면 별도 콜백 없이도 정상적으로 그쪽에 완료가 통보된다. */
+	orig->bi_iter.bi_sector = phys;
+	bio_set_dev(orig, c->dev->bdev);
+	submit_bio(orig);
 }
 
 static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
@@ -287,8 +343,13 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 
 	switch (bio_op(bio)) {
 	case REQ_OP_WRITE: {
-		sector_t phys; // zone storage의 물리 sector
+		sector_t phys;     // 실제 데이터가 놓일 물리 섹터
+		sector_t wal_phys; // WAL 레코드가 놓일 물리 섹터
 		int ret;
+		struct zns_io_ctx *ctx;
+		struct wal_record *rec;
+		struct bio *wal_bio;
+		struct page *page;
 
 		spin_lock_irq(&c->lock);
 		ret = zone_pool_alloc(c->zp, ZONE_TAG_USER_DATA, nr, &phys);
@@ -298,16 +359,50 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 			bio_endio(bio);
 			return DM_MAPIO_SUBMITTED;
 		}
-
-		ret = mapping_put(c, lba, phys);
+		/* WAL은 데이터와 별개 zone(태그)에서, 항상 1섹터(512B)짜리
+		 * 고정 레코드 하나만 append. 버퍼링 없이 매 쓰기마다 즉시. */
+		ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, 1, &wal_phys);
 		spin_unlock_irq(&c->lock);
 		if (ret) {
+			bio->bi_status = BLK_STS_NOSPC;
+			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
+
+		/* 섹터 하나(512B) 전체를 kzalloc — 레코드는 앞 32바이트뿐이지만
+		 * 디바이스에 512B보다 작은 단위로는 쓸 수 없어 나머지는 패딩. */
+		rec = kzalloc(512, GFP_NOIO);
+		ctx = kmalloc(sizeof(*ctx), GFP_NOIO);
+		if (!rec || !ctx) {
+			kfree(rec);
+			kfree(ctx);
 			bio->bi_status = BLK_STS_RESOURCE;
 			bio_endio(bio);
 			return DM_MAPIO_SUBMITTED;
 		}
-		bio->bi_iter.bi_sector = phys;
-		break;
+		rec->type = WAL_REC_PUT;
+		rec->put.lba = lba;
+		rec->put.phys = phys;
+
+		ctx->c = c;
+		ctx->orig_bio = bio;
+		ctx->lba = lba;
+		ctx->phys = phys;
+		ctx->wal_buf = rec;
+
+		wal_bio = bio_alloc(GFP_NOIO, 1);
+		bio_set_dev(wal_bio, c->dev->bdev);
+		wal_bio->bi_iter.bi_sector = wal_phys;
+		wal_bio->bi_opf = REQ_OP_WRITE;
+		page = virt_to_page(rec);
+		bio_add_page(wal_bio, page, 512, offset_in_page(rec));
+		wal_bio->bi_end_io = wal_put_done;
+		wal_bio->bi_private = ctx;
+		submit_bio(wal_bio);
+
+		/* 데이터 bio는 아직 안 내보냄 — wal_put_done이 WAL 완료 확인 후
+		 * 이어서 처리한다 (WAL이 데이터보다 먼저 durable해야 하므로). */
+		return DM_MAPIO_SUBMITTED;
 	}
 	case REQ_OP_READ: {
 		sector_t phys;

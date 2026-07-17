@@ -105,8 +105,13 @@ int skiplist_upsert(struct skiplist *sl, u64 lba, u64 phys, u64 *old_phys_out)
 
 	/* forward[]는 "노드"가 아니라 "포인터"의 배열이므로 sizeof(struct skiplist_node *)
 	 * 여야 한다. sizeof(struct skiplist_node)로 하면 노드 하나 크기만큼(포인터의
-	 * 몇 배) 잡아서 매번 불필요하게 큰 메모리를 낭비하게 된다. */
-	n = kzalloc(sizeof(*n) + new_level * sizeof(struct skiplist_node *), GFP_KERNEL);
+	 * 몇 배) 잡아서 매번 불필요하게 큰 메모리를 낭비하게 된다.
+	 *
+	 * GFP_ATOMIC인 이유: upsert()는 mapping_put()을 통해 bio 완료 콜백
+	 * (atomic/softirq 컨텍스트, c->lock 스핀락 보유 중)에서도 호출된다.
+	 * GFP_KERNEL은 메모리 회수를 위해 sleep할 수 있어 그런 컨텍스트에서
+	 * 쓰면 "sleeping while atomic" 데드락/행이 발생한다. */
+	n = kzalloc(sizeof(*n) + new_level * sizeof(struct skiplist_node *), GFP_ATOMIC);
 	if (!n)
 		return -ENOMEM;
 
