@@ -9,10 +9,14 @@ int skiplist_init(struct skiplist *sl)
 	 *하므로 있을 수 있는 최대 층수(SKIPLIST_MAX_LEVEL)만큼 forward[]를 항상
 	 * 다 갖고 있어야 한다 — 나중에 어떤 노드가 몇 층으로 뽑히든 head는 그 층의
 	 * 시작점으로 바로 쓸 수 있어야 하기 때문. kzalloc이라 forward[]는 전부
-	 * NULL로 시작 = 아직 어느 층에도 데이터 노드가 없는 빈 리스트 상태. */
+	 * NULL로 시작 = 아직 어느 층에도 데이터 노드가 없는 빈 리스트 상태.
+	 *
+	 * GFP_ATOMIC인 이유: 처음엔 ctr()(process context)에서만 불렸지만,
+	 * 6단계부터 memtable flush 트리거 시 wal_put_done(atomic context)에서도
+	 * 새 memtable을 만들려고 이 함수를 부른다 — skiplist_upsert와 같은 이유. */
 	sl->head = kzalloc(sizeof(*sl->head) +
 			    SKIPLIST_MAX_LEVEL * sizeof(struct skiplist_node *),
-			    GFP_KERNEL);
+			    GFP_ATOMIC);
 	if (!sl->head)
 		return -ENOMEM;
 
