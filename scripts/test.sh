@@ -5,7 +5,14 @@
 #              1  → test-m1.sh    (M1 random-to-sequential translation)
 #              2  → test-m2.sh    (M2 mkfs+mount round-trip)
 #              3  → test-crash.sh (crash-recovery via WAL replay)
-#   (no argument) → runs 0, 1, 2, 3 in order
+#              4  → test-checkpoint.sh (WAL checkpoint skip-replay verification)
+#   (no argument) → runs 1, 2, 3, 4 in order
+#
+# Milestone 0(test-basic.sh)은 no-arg 실행에서 제외 — M1부터 target이 위로
+# conventional(non-zoned) 인터페이스를 내주기로 하면서 .report_zones/
+# .iterate_devices를 일부러 뺐는데, test-basic.sh는 그 이전 동작(zone
+# passthrough)을 확인하는 스크립트라 지금 설계와 안 맞음. `test.sh 0`으로
+# 직접 지정하면 참고용으로 여전히 돌릴 수 있음.
 #
 # Automatically brings up /dev/nullb0 if it is not present.
 # Env: UNDERLYING (default /dev/nullb0), all nullblk-up.sh env vars forwarded.
@@ -20,8 +27,8 @@ UNDERLYING=${UNDERLYING:-/dev/nullb0}
 # ── argument check ────────────────────────────────────────────────────────────
 if [ $# -gt 1 ]; then
     echo "Usage: sudo bash scripts/test.sh [<milestone>]" >&2
-    echo "  milestone: 0 (M0), 1 (M1), 2 (M2), 3 (crash-recovery)" >&2
-    echo "  omit milestone to run 0, 1, 2, 3 in order" >&2
+    echo "  milestone: 0 (M0), 1 (M1), 2 (M2), 3 (crash-recovery), 4 (checkpoint)" >&2
+    echo "  omit milestone to run 1, 2, 3, 4 in order" >&2
     exit 1
 fi
 
@@ -31,18 +38,19 @@ script_for() {
         1) echo "$SCRIPT_DIR/test-m1.sh" ;;
         2) echo "$SCRIPT_DIR/test-m2.sh" ;;
         3) echo "$SCRIPT_DIR/test-crash.sh" ;;
+        4) echo "$SCRIPT_DIR/test-checkpoint.sh" ;;
         *) return 1 ;;
     esac
 }
 
 if [ $# -eq 1 ]; then
     script_for "$1" >/dev/null || {
-        echo "[!] Unknown milestone '$1'. Supported: 0, 1, 2, 3" >&2
+        echo "[!] Unknown milestone '$1'. Supported: 0, 1, 2, 3, 4" >&2
         exit 1
     }
     MILESTONES=("$1")
 else
-    MILESTONES=(0 1 2 3)
+    MILESTONES=(1 2 3 4)
 fi
 
 # ── ensure nullb0 is up ───────────────────────────────────────────────────────
