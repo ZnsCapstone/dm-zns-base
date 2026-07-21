@@ -12,10 +12,53 @@
 #include <linux/device-mapper.h>
 #include <linux/blkdev.h>
 #include <linux/mm.h>
+#include <linux/workqueue.h>
 
 #include "skiplist.h"
 
 #define DM_MSG_PREFIX "zns-base"
+
+/* bio 완료 콜백(softirq/atomic context)에서 다음 bio를 이어붙일 때 반드시
+ * 이 워크큐를 거쳐 process context에서 제출한다 — submit_bio() 자체는
+ * 논블로킹이 아니다: 큐가 congested하면 wbt(write-back throttle) 같은
+ * admission control이 io_schedule()/schedule()을 부를 수 있고, atomic
+ * context에서 그러면 "BUG: scheduling while atomic"으로 죽는다(실제로
+ * 겪음 — wal_put_done의 마지막 submit_bio(orig)가 ksoftirqd를 물고
+ * 들어가 스케줄링을 시도하다 걸림). 공유 system_wq를 안 쓰는 이유는,
+ * 이 워크큐가 I/O로 막힐 수 있는데 그게 다른 커널 서브시스템까지
+ * 굶기게 만들 수 있어서. */
+static struct workqueue_struct *zns_wq;
+
+struct deferred_bio_work {
+	struct work_struct work;
+	struct bio *bio;
+};
+
+static void deferred_bio_submit_fn(struct work_struct *w)
+{
+	struct deferred_bio_work *dw = container_of(w, struct deferred_bio_work, work);
+
+	submit_bio(dw->bio);
+	kfree(dw);
+}
+
+/* 체인의 "다음 bio 제출"은 전부 이 함수를 거친다 — 호출 시점이 atomic
+ * context일 수도, process context일 수도 있지만(같은 함수가 양쪽에서 다
+ * 불림) 어느 쪽이든 안전하도록 항상 워크큐로 넘긴다. */
+static void submit_bio_deferred(struct bio *bio)
+{
+	struct deferred_bio_work *dw = kmalloc(sizeof(*dw), GFP_ATOMIC);
+
+	if (!dw) {
+		/* 이 정도로 메모리가 없으면 시스템이 이미 위험한 상태 —
+		 * 그래도 완전히 누락시키는 것보다 직접 제출을 시도하는 게 낫다 */
+		submit_bio(bio);
+		return;
+	}
+	INIT_WORK(&dw->work, deferred_bio_submit_fn);
+	dw->bio = bio;
+	queue_work(zns_wq, &dw->work);
+}
 
 enum zone_tag {
     ZONE_TAG_FREE = 0,   // 아직 아무도 안 쓰는 zone
@@ -483,7 +526,7 @@ static void submit_wal_async(struct zns_io_ctx *ctx)
 	bio_add_page(wal_bio, page, 512, offset_in_page(rec));
 	wal_bio->bi_end_io = wal_put_done;
 	wal_bio->bi_private = ctx;
-	submit_bio(wal_bio);
+	submit_bio_deferred(wal_bio);
 }
 
 /* ctx->headers[ctx->header_idx]의 zone 태그 헤더를 비동기로 제출. .map()
@@ -522,7 +565,7 @@ static void submit_header_async(struct zns_io_ctx *ctx)
 	bio_add_page(bio, page, 512, offset_in_page(hdr));
 	bio->bi_end_io = header_write_done;
 	bio->bi_private = ctx;
-	submit_bio(bio);
+	submit_bio_deferred(bio);
 }
 
 /* 헤더 하나가 durable하게 쓰인 뒤 호출. 남은 헤더가 있으면 이어서,
@@ -610,7 +653,7 @@ static void wal_put_done(struct bio *wal_bio)
 
 	orig->bi_iter.bi_sector = phys;
 	bio_set_dev(orig, c->dev->bdev);
-	submit_bio(orig);
+	submit_bio_deferred(orig);
 }
 
 /* SSTable 데이터가 durable하게 쓰인 뒤 호출. 성공했으면 WAL에 CHECKPOINT를
@@ -700,7 +743,7 @@ static void submit_checkpoint_async(struct zns_io_ctx *ctx)
 	bio_add_page(bio, page, 512, offset_in_page(rec));
 	bio->bi_end_io = checkpoint_write_done;
 	bio->bi_private = ctx;
-	submit_bio(bio);
+	submit_bio_deferred(bio);
 }
 
 /* CHECKPOINT 기록이 끝난 뒤(성공하든 실패하든) flush 체인의 진짜 마지막 —
@@ -762,7 +805,7 @@ static void submit_sstable_write_async(struct zns_io_ctx *ctx)
 
 	bio->bi_end_io = sstable_flush_done;
 	bio->bi_private = ctx;
-	submit_bio(bio);
+	submit_bio_deferred(bio);
 }
 
 /* memtable 하나를 SSTable 한 세대로 직렬화해서 zone에 기록. wal_put_done
@@ -1154,18 +1197,30 @@ static struct target_type zns_base_target = {
 
 static int __init zns_base_init(void)
 {
-	int ret = dm_register_target(&zns_base_target);
+	int ret;
 
-	if (ret < 0)
+	/* WQ_MEM_RECLAIM: 이 워크큐 자체가 막히면 그 위에서 대기 중인 I/O가
+	 * 영원히 안 풀리므로, 메모리 회수 경로에서도 최소 진행을 보장받아야 함 */
+	zns_wq = alloc_workqueue("dm_zns_base", WQ_MEM_RECLAIM, 0);
+	if (!zns_wq) {
+		DMERR("failed to allocate workqueue");
+		return -ENOMEM;
+	}
+
+	ret = dm_register_target(&zns_base_target);
+	if (ret < 0) {
 		DMERR("target registration failed: %d", ret);
-	else
+		destroy_workqueue(zns_wq);
+	} else {
 		DMINFO("target registered");
+	}
 	return ret;
 }
 
 static void __exit zns_base_exit(void)
 {
 	dm_unregister_target(&zns_base_target);
+	destroy_workqueue(zns_wq);
 	DMINFO("target unregistered");
 }
 
