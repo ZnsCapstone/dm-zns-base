@@ -98,6 +98,10 @@ struct zns_base_c {
 	struct skiplist *memtable;  // LBA -> phys 매핑 (M1의 map[] flat array를 대체)
 	u64              next_seq_no;  // 다음 flush에 붙일 SSTable 세대 번호
 
+	struct sstable_info *sstables;  // 살아있는 SSTable 색인 (append-only, krealloc으로 증가)
+	unsigned int nr_sstables;
+	unsigned int sstables_cap;      // sstables 배열의 현재 용량
+
 	spinlock_t 		lock;
 };
 
@@ -115,6 +119,17 @@ struct sstable_record {
 struct sstable_header {
 	u32 magic;
 	u32 reserved;
+	u64 seq_no;
+	u64 record_count;
+	u64 min_lba;
+	u64 max_lba;
+};
+
+/* 살아있는 SSTable 하나를 메모리에서 빠르게 찾기 위한 색인 — 헤더 내용을
+ * 그대로 캐싱한 것. phys는 그 SSTable 자신의 헤더가 시작하는 절대 섹터(zone
+ * 하나에 여러 SSTable이 순서대로 쌓일 수 있어 zone_id만으론 부족). */
+struct sstable_info {
+	sector_t phys;
 	u64 seq_no;
 	u64 record_count;
 	u64 min_lba;
@@ -277,6 +292,34 @@ static int read_zone_header(struct zns_base_c *c, unsigned int zone_id, struct z
 	return ret;
 }
 
+/* 절대 섹터 phys에서 512B를 동기적으로 읽어 SSTable 헤더를 얻는다.
+ * read_zone_header와 같은 이유로 ctr() 전용(process context). */
+static int read_sstable_header(struct zns_base_c *c, sector_t phys, struct sstable_header *hdr_out)
+{
+	struct sstable_header *buf;
+	struct bio *bio;
+	struct page *page;
+	int ret;
+
+	buf = kzalloc(512, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	bio = bio_alloc(GFP_KERNEL, 1);
+	bio_set_dev(bio, c->dev->bdev);
+	bio->bi_iter.bi_sector = phys;
+	bio->bi_opf = REQ_OP_READ;
+	page = virt_to_page(buf);
+	bio_add_page(bio, page, 512, offset_in_page(buf));
+
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+	if (!ret)
+		*hdr_out = *buf;
+	kfree(buf);
+	return ret;
+}
+
 /* memtable에 lba->phys 기록. 기존 lba를 덮어쓴 거라면 그 옛 phys의 zone은
  * 죽은 공간이 늘어난 것이므로 invalid_count를 올려준다(GC victim 선정 근거).
  * 호출자가 c->lock을 쥐고 있다고 가정. */
@@ -292,11 +335,41 @@ static int mapping_put(struct zns_base_c *c, u64 lba, u64 phys)
 	return 0;
 }
 
-/* memtable에서만 조회(8단계 전까지는 매핑 조회의 전부). 호출자가 c->lock을
- * 쥐고 있다고 가정. */
+/* memtable에서만 조회. .map()의 READ 분기가 이게 miss일 때만 SSTable도
+ * 훑는다(아래 sstable_read_* 체인) — 여긴 순수 memtable 조회 그대로 둔다.
+ * 호출자가 c->lock을 쥐고 있다고 가정. */
 static int mapping_get(struct zns_base_c *c, u64 lba, u64 *phys_out)
 {
 	return skiplist_lookup(c->memtable, lba, phys_out);
+}
+
+/* c->sstables[]에 SSTable 하나를 등록, 필요하면 배열을 2배로 키운다.
+ * 호출자가 c->lock을 쥐고 있어야 한다(런타임 flush 완료 시점) — 단,
+ * ctr()의 복구 스캔 중에는 아직 다른 접근자가 없어 락 없이 불러도 된다.
+ * gfp는 호출 컨텍스트에 맞게: sstable_flush_done(atomic context)에서는
+ * GFP_ATOMIC, ctr()(process context)에서는 GFP_KERNEL. */
+static int sstable_register(struct zns_base_c *c, sector_t phys, u64 seq_no,
+			      u64 record_count, u64 min_lba, u64 max_lba, gfp_t gfp)
+{
+	struct sstable_info *si;
+
+	if (c->nr_sstables == c->sstables_cap) {
+		unsigned int new_cap = c->sstables_cap ? c->sstables_cap * 2 : 16;
+		struct sstable_info *grown = krealloc(c->sstables, new_cap * sizeof(*grown), gfp);
+
+		if (!grown)
+			return -ENOMEM;
+		c->sstables = grown;
+		c->sstables_cap = new_cap;
+	}
+
+	si = &c->sstables[c->nr_sstables++];
+	si->phys = phys;
+	si->seq_no = seq_no;
+	si->record_count = record_count;
+	si->min_lba = min_lba;
+	si->max_lba = max_lba;
+	return 0;
 }
 
 /* zone_id의 섹터 start부터 wp까지 WAL 레코드를 순서대로 읽어 fn(fn_ctx, rec,
@@ -446,16 +519,45 @@ static void replay_wal_zones(struct zns_base_c *c, unsigned int *wal_zones, unsi
 	c->next_seq_no = found ? ckpt_seq + 1 : 0;
 }
 
+/* zone_id 안에 순서대로 쌓여있는 SSTable들을 전부 찾아 c->sstables[]에
+ * 등록한다. zone 하나에 SSTable이 여러 개 쌓일 수 있어(각자 zone 크기보다
+ * 작으면) 헤더 하나를 읽을 때마다 record_count로 다음 SSTable의 시작
+ * 위치를 계산해 이어간다. ctr() 전용 process context. */
+static void scan_sstable_zone(struct zns_base_c *c, unsigned int zone_id, sector_t wp)
+{
+	sector_t cur = 1;  /* 섹터 0은 zone 태그 헤더 */
+
+	while (cur < wp) {
+		sector_t phys = (sector_t)zone_id * c->zp->zone_sectors + cur;
+		struct sstable_header hdr;
+		sector_t data_sectors;
+
+		if (read_sstable_header(c, phys, &hdr) || hdr.magic != SSTABLE_MAGIC)
+			break;  /* 손상되었거나 여기서 SSTable들이 끝남 */
+
+		if (sstable_register(c, phys, hdr.seq_no, hdr.record_count,
+				       hdr.min_lba, hdr.max_lba, GFP_KERNEL))
+			DMERR("SSTable scan: out of memory registering zone %u sector %llu",
+			      zone_id, (unsigned long long)cur);
+
+		data_sectors = round_up(hdr.record_count * sizeof(struct sstable_record), 512) / 512;
+		cur += 1 + data_sectors;
+	}
+}
+
 struct recovery_scan_ctx {
 	struct zns_base_c *c;
 	unsigned int *wal_zones;
 	unsigned int nr_wal_zones;
+	unsigned int *sstable_zones;
+	unsigned int nr_sstable_zones;
 };
 
 /* blkdev_report_zones가 zone마다 호출 — 하드웨어 wp로 쓰인 적 있는 zone인지
- * 판단하고, 태그 헤더가 있으면 zone_tag[]/wp[]를 복원한다. WAL zone은 바로
- * replay하지 않고 id만 모아둔다 — replay_wal_zones가 전체 스캔이 끝난 뒤
- * 체크포인트 위치를 먼저 찾아야 하기 때문. */
+ * 판단하고, 태그 헤더가 있으면 zone_tag[]/wp[]를 복원한다. WAL/SSTable zone은
+ * 바로 처리하지 않고 id만 모아둔다 — WAL은 체크포인트 위치를 먼저 찾아야
+ * 하고, SSTable은 이 스캔 콜백 안에서 추가 I/O(zone당 여러 헤더 읽기)를
+ * 하기보다 스캔이 끝난 뒤 한 번에 처리하는 게 구조가 더 깔끔하기 때문. */
 static int recovery_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
 {
 	struct recovery_scan_ctx *rctx = data;
@@ -482,6 +584,8 @@ static int recovery_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
 
 	if (hdr.tag == ZONE_TAG_WAL)
 		rctx->wal_zones[rctx->nr_wal_zones++] = idx;
+	else if (hdr.tag == ZONE_TAG_SSTABLE)
+		rctx->sstable_zones[rctx->nr_sstable_zones++] = idx;
 
 	return 0;
 }
@@ -670,9 +774,23 @@ static void sstable_flush_done(struct bio *bio)
 	int new_wal_zone;
 	int ret;
 
-	if (status)
+	if (status) {
 		DMERR("SSTable flush write failed (seq=%llu): this generation's data is lost from the SSTable, but remains recoverable from WAL replay",
 		      (unsigned long long)ctx->checkpoint_seq);
+	} else {
+		struct sstable_header *hdr = ctx->sstable_buf;
+		int rret;
+
+		/* 이 시점부터 이 SSTable을 읽기 경로(8단계)에서 찾을 수 있어야
+		 * 한다 — checkpoint를 아직 안 썼어도 데이터 자체는 이미 durable. */
+		spin_lock_irq(&c->lock);
+		rret = sstable_register(c, ctx->sstable_phys, hdr->seq_no, hdr->record_count,
+					  hdr->min_lba, hdr->max_lba, GFP_ATOMIC);
+		spin_unlock_irq(&c->lock);
+		if (rret)
+			DMERR("SSTable flush: failed to register in-memory index (seq=%llu) — unreadable until next restart's recovery scan",
+			      (unsigned long long)ctx->checkpoint_seq);
+	}
 
 	kfree(ctx->sstable_buf);
 	bio_put(bio);
@@ -912,6 +1030,160 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 		submit_sstable_write_async(ctx);
 }
 
+/* buf(record_count개의 정렬된 sstable_record)에서 lba를 이진 탐색.
+ * flush_memtable_async가 정렬 순서로 기록해뒀으므로 성립. */
+static int sstable_binary_search(void *buf, u64 record_count, u64 lba, u64 *phys_out)
+{
+	struct sstable_record *recs = buf;
+	u64 lo = 0, hi = record_count;
+
+	while (lo < hi) {
+		u64 mid = lo + (hi - lo) / 2;
+
+		if (recs[mid].lba == lba) {
+			*phys_out = recs[mid].phys;
+			return 1;
+		} else if (recs[mid].lba < lba) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return 0;
+}
+
+/* .map()의 READ 분기가 memtable을 못 찾았을 때 이어받는 비동기 체인의
+ * 컨텍스트. candidates는 .map()이 미리 걸러둔(block_lba가 min/max_lba
+ * 범위 안인) SSTable들의 스냅샷 — seq_no가 가장 큰 hit을 찾을 때까지 전부
+ * 확인해야 하므로(같은 lba가 여러 SSTable에 걸쳐 있을 수 있음), 첫 hit에서
+ * 멈추지 않고 끝까지 훑어 best_seq/best_phys를 갱신해나간다. */
+struct sstable_read_ctx {
+	struct zns_base_c *c;
+	struct bio *orig_bio;
+	u64 lba;
+	sector_t offset_in_block;
+	struct sstable_info *candidates;
+	unsigned int nr_candidates;
+	unsigned int idx;
+	void *buf;
+	int best_found;
+	u64 best_seq;
+	sector_t best_phys;
+};
+
+static void sstable_read_candidate_done(struct bio *bio);
+
+/* 후보를 다 훑었으면 결과를 원본 bio에 반영하고 체인을 끝낸다. */
+static void sstable_read_finish(struct sstable_read_ctx *rctx)
+{
+	struct bio *orig = rctx->orig_bio;
+
+	if (rctx->best_found) {
+		orig->bi_iter.bi_sector = rctx->best_phys + rctx->offset_in_block;
+		bio_set_dev(orig, rctx->c->dev->bdev);
+		submit_bio_deferred(orig);
+	} else {
+		/* 후보 SSTable들의 min/max_lba 범위엔 들었지만 실제 레코드는
+		 * 없었던 경우 — 한 번도 안 쓰인 블록과 같은 취급(zero-fill) */
+		zero_fill_bio(orig);
+		bio_endio(orig);
+	}
+	kfree(rctx->candidates);
+	kfree(rctx);
+}
+
+/* candidates[idx]의 레코드 전체를 비동기로 읽어온다. .map()(process
+ * context)과 sstable_read_candidate_done(atomic context) 양쪽에서 불리므로
+ * GFP_ATOMIC/submit_bio 원칙은 이 파일의 다른 비동기 함수들과 동일. */
+static void sstable_read_next_candidate(struct sstable_read_ctx *rctx)
+{
+	struct sstable_info *si;
+	struct bio *bio;
+	sector_t nr_sectors;
+	size_t total_bytes;
+	size_t alloc_bytes;
+	unsigned int nr_pages;
+	size_t remaining;
+	unsigned int i;
+
+	while (rctx->idx < rctx->nr_candidates) {
+		si = &rctx->candidates[rctx->idx];
+		if (rctx->lba >= si->min_lba && rctx->lba <= si->max_lba)
+			break;
+		rctx->idx++;  /* 범위 밖 — 이 후보는 애초에 볼 필요 없음 */
+	}
+	if (rctx->idx >= rctx->nr_candidates) {
+		sstable_read_finish(rctx);
+		return;
+	}
+	si = &rctx->candidates[rctx->idx];
+
+	nr_sectors = round_up(si->record_count * sizeof(struct sstable_record), 512) / 512;
+	total_bytes = (size_t)nr_sectors * 512;
+	alloc_bytes = round_up(total_bytes, PAGE_SIZE);
+
+	rctx->buf = kzalloc(alloc_bytes, GFP_ATOMIC);
+	if (!rctx->buf) {
+		/* 이 후보를 못 읽으면 그냥 다음 후보로 — 정확도가 조금 떨어질 수
+		 * 있지만(이 후보에 더 최신 값이 있었을 가능성) 메모리 부족 상황의
+		 * 열화로 수용 */
+		rctx->idx++;
+		sstable_read_next_candidate(rctx);
+		return;
+	}
+
+	nr_pages = DIV_ROUND_UP(alloc_bytes, PAGE_SIZE);
+	bio = bio_alloc(GFP_ATOMIC, nr_pages);
+	if (!bio) {
+		kfree(rctx->buf);
+		rctx->buf = NULL;
+		rctx->idx++;
+		sstable_read_next_candidate(rctx);
+		return;
+	}
+	bio_set_dev(bio, rctx->c->dev->bdev);
+	bio->bi_iter.bi_sector = si->phys + 1;  /* SSTable 자신의 헤더(1섹터) 다음이 레코드 */
+	bio->bi_opf = REQ_OP_READ;
+
+	remaining = total_bytes;
+	for (i = 0; i < nr_pages; i++) {
+		struct page *page = virt_to_page((char *)rctx->buf + i * PAGE_SIZE);
+		size_t len = remaining < PAGE_SIZE ? remaining : PAGE_SIZE;
+
+		bio_add_page(bio, page, len, 0);
+		remaining -= len;
+	}
+
+	bio->bi_end_io = sstable_read_candidate_done;
+	bio->bi_private = rctx;
+	submit_bio_deferred(bio);
+}
+
+/* 후보 하나의 레코드 읽기가 끝난 뒤 호출 — 이진 탐색해서 hit이면(그리고
+ * 지금까지 중 seq_no가 가장 크면) best_*를 갱신하고, 다음 후보로 넘어간다. */
+static void sstable_read_candidate_done(struct bio *bio)
+{
+	struct sstable_read_ctx *rctx = bio->bi_private;
+	struct sstable_info *si = &rctx->candidates[rctx->idx];
+	blk_status_t status = bio->bi_status;
+	u64 phys;
+
+	if (!status && sstable_binary_search(rctx->buf, si->record_count, rctx->lba, &phys)) {
+		if (!rctx->best_found || si->seq_no > rctx->best_seq) {
+			rctx->best_found = 1;
+			rctx->best_seq = si->seq_no;
+			rctx->best_phys = phys;
+		}
+	}
+
+	kfree(rctx->buf);
+	rctx->buf = NULL;
+	bio_put(bio);
+
+	rctx->idx++;
+	sstable_read_next_candidate(rctx);
+}
+
 static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct zns_base_c *c;
@@ -984,14 +1256,21 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	/* zone 스캔으로 크래시/재로드 이전 상태 복원(zone_tag[]/wp[] + WAL
-	 * checkpoint 위치 파악 후 replay). 완전히 새 디바이스면 모든 zone의
-	 * wp가 0이라 사실상 no-op. */
+	 * checkpoint 위치 파악 후 replay + 살아있는 SSTable들 색인 재구성).
+	 * 완전히 새 디바이스면 모든 zone의 wp가 0이라 사실상 no-op. */
 	{
-		struct recovery_scan_ctx rctx = { .c = c, .nr_wal_zones = 0 };
+		struct recovery_scan_ctx rctx = { .c = c, .nr_wal_zones = 0, .nr_sstable_zones = 0 };
+		unsigned int i2;
 
 		rctx.wal_zones = kcalloc(c->zp->nr_zones, sizeof(unsigned int), GFP_KERNEL);
 		if (!rctx.wal_zones) {
 			ti->error = "out of memory (wal_zones scratch)";
+			return -ENOMEM;
+		}
+		rctx.sstable_zones = kcalloc(c->zp->nr_zones, sizeof(unsigned int), GFP_KERNEL);
+		if (!rctx.sstable_zones) {
+			ti->error = "out of memory (sstable_zones scratch)";
+			kfree(rctx.wal_zones);
 			return -ENOMEM;
 		}
 
@@ -1000,7 +1279,14 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			DMERR("zone report failed during recovery scan: %d", ret);
 
 		replay_wal_zones(c, rctx.wal_zones, rctx.nr_wal_zones);
+		for (i2 = 0; i2 < rctx.nr_sstable_zones; i2++) {
+			unsigned int zone_id = rctx.sstable_zones[i2];
+
+			scan_sstable_zone(c, zone_id, c->zp->wp[zone_id]);
+		}
+
 		kfree(rctx.wal_zones);
+		kfree(rctx.sstable_zones);
 	}
 
 	spin_lock_init(&c->lock);
@@ -1022,6 +1308,7 @@ static void zns_base_dtr(struct dm_target *ti)
 	dm_put_device(ti, c->dev);
 	skiplist_destroy(c->memtable);
 	kfree(c->memtable);
+	kfree(c->sstables);
 	kfree(c->zp->wp);
 	kfree(c->zp->zone_tag);
 	kfree(c->zp->invalid_count);
@@ -1123,18 +1410,74 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 	case REQ_OP_READ: {
 		sector_t phys;
 		int found;
+		unsigned int nr_sst, actual_nr, nmatch, i;
+		struct sstable_info *candidates;
+		struct sstable_read_ctx *rctx;
 
 		spin_lock_irq(&c->lock);
 		found = mapping_get(c, block_lba, &phys);
+		nr_sst = c->nr_sstables;
 		spin_unlock_irq(&c->lock);
-		if (!found) {
+
+		if (found) {
+			/* memtable에 있으면 8단계 전과 동일하게 즉시 처리 —
+			 * SSTable이 하나도 없던 지금까지의 모든 테스트는 항상
+			 * 이 경로만 타서 동작·성능이 그대로 유지된다. */
+			bio->bi_iter.bi_sector = phys + offset_in_block;
+			break;
+		}
+
+		if (nr_sst == 0) {
 			/* 한 번도 안 쓴 블록 — 표준 thin-provisioning 관례대로 zero-fill */
 			zero_fill_bio(bio);
 			bio_endio(bio);
 			return DM_MAPIO_SUBMITTED;
 		}
-		bio->bi_iter.bi_sector = phys + offset_in_block;
-		break;
+
+		/* SSTable 후보 스냅샷 — c->sstables는 krealloc으로 커질 수
+		 * 있어 주소가 바뀔 수 있으므로, 복사는 반드시 락 안에서. */
+		candidates = kmalloc_array(nr_sst, sizeof(*candidates), GFP_NOIO);
+		if (!candidates) {
+			bio->bi_status = BLK_STS_RESOURCE;
+			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
+		spin_lock_irq(&c->lock);
+		actual_nr = min(nr_sst, c->nr_sstables);
+		memcpy(candidates, c->sstables, actual_nr * sizeof(*candidates));
+		spin_unlock_irq(&c->lock);
+
+		nmatch = 0;
+		for (i = 0; i < actual_nr; i++) {
+			if (block_lba >= candidates[i].min_lba && block_lba <= candidates[i].max_lba)
+				candidates[nmatch++] = candidates[i];
+		}
+
+		if (nmatch == 0) {
+			kfree(candidates);
+			zero_fill_bio(bio);
+			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
+
+		rctx = kzalloc(sizeof(*rctx), GFP_NOIO);
+		if (!rctx) {
+			kfree(candidates);
+			bio->bi_status = BLK_STS_RESOURCE;
+			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
+		rctx->c = c;
+		rctx->orig_bio = bio;
+		rctx->lba = block_lba;
+		rctx->offset_in_block = offset_in_block;
+		rctx->candidates = candidates;
+		rctx->nr_candidates = nmatch;
+		rctx->idx = 0;
+		sstable_read_next_candidate(rctx);
+
+		/* SSTable 조회는 비동기 — sstable_read_finish가 원본 bio를 마무리 */
+		return DM_MAPIO_SUBMITTED;
 	}
 	}
 
