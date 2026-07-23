@@ -8,7 +8,6 @@
  * See docs/07-milestones.md.
  */
 
-
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/bio.h>
@@ -18,12 +17,18 @@
 #include <linux/workqueue.h>
 #include <linux/list.h>
 #include <linux/sort.h>
+#include <linux/mempool.h>
+#include <linux/wait.h>
+#include <linux/highmem.h>
+#include <linux/mm.h>
 
 #define DM_MSG_PREFIX "zns-base"
 #define ZNS_BASE_BLOCK_SIZE 4096
+#define ZNS_BASE_SECTOR_SIZE 512
 #define SECTORS_PER_BLOCK 8
 #define MEMTABLE_POOL_SIZE 4
 #define INITIAL_RUN_CAPACITY 4
+#define IO_POOL_SIZE 128
 
 
 struct mapping_entry {
@@ -62,6 +67,17 @@ struct mapping_state {
 	int flush_error;
 };
 
+struct zns_base_chunk {
+	size_t logical_block;
+	unsigned int block_offset_bytes;
+	unsigned int bio_offset_bytes;
+	unsigned int length_bytes;
+};
+
+struct zns_base_io {
+	struct bio *bio;
+	struct list_head node;
+};
 
 struct zns_base_c {
 	struct dm_dev *dev;
@@ -71,9 +87,511 @@ struct zns_base_c {
 	struct mapping_state mapping;
 	size_t nr_logical_blocks;
 
+	struct list_head pending_bios;
+	struct work_struct io_work;
+	bool io_work_scheduled;
+	mempool_t *io_pool;
+	bool stopping;
 
+	wait_queue_head_t spare_waitq;
+
+	// 나중에 io_lock이랑 mapping_lock이랑 나누기.
 	spinlock_t lock;
 };
+
+static int mapping_update(struct zns_base_c *c, size_t logical_block,
+			  sector_t physical_sector);
+static int mapping_lookup(struct zns_base_c *c, size_t logical_block,
+			  sector_t *physical_sector);
+static int mapping_wait_for_write_slot(struct zns_base_c *c);
+
+
+static void zns_base_next_chunk(sector_t current_sector, unsigned int remaining_bytes, 
+				unsigned int bio_offset_bytes,struct zns_base_chunk *chunk)
+{
+  	unsigned int offset_sectors;
+  	unsigned int block_remaining_bytes;
+
+  	offset_sectors = current_sector % SECTORS_PER_BLOCK;
+
+  	chunk->logical_block = current_sector / SECTORS_PER_BLOCK;
+  	chunk->block_offset_bytes =
+  		offset_sectors * ZNS_BASE_SECTOR_SIZE;
+  	chunk->bio_offset_bytes = bio_offset_bytes;
+
+  	block_remaining_bytes =
+  		ZNS_BASE_BLOCK_SIZE - chunk->block_offset_bytes;
+
+  	chunk->length_bytes =
+  		min_t(unsigned int, remaining_bytes, block_remaining_bytes);
+}
+
+static int zns_base_queue_bio(struct zns_base_c *c, struct bio *bio){
+	struct zns_base_io *io;
+	bool schedule = false;
+
+	io = mempool_alloc(c -> io_pool, GFP_ATOMIC);
+	if(!io){
+		return -ENOMEM;
+	}
+
+	io -> bio = bio;
+	INIT_LIST_HEAD(&io -> node);
+
+	spin_lock(&c -> lock);
+
+	if(c -> stopping){
+		spin_unlock(&c -> lock);
+		mempool_free(io, c -> io_pool);
+		return -EIO;
+	}
+
+	list_add_tail(&io -> node, &c -> pending_bios);
+	if(!c -> io_work_scheduled){
+		c -> io_work_scheduled = true;
+		schedule = true;
+	}
+
+	spin_unlock(&c -> lock);
+
+	if(schedule)
+		schedule_work(&c -> io_work);
+
+	return 0;
+}
+
+static int zns_base_submit_clone(struct zns_base_c *c, struct bio *bio, sector_t physical_sector){
+	struct bio *clone;
+	int ret;
+
+	clone = bio_clone_fast(bio, GFP_KERNEL, &fs_bio_set);
+	if(!clone)
+		return -ENOMEM;
+
+	bio_set_dev(clone, c->dev->bdev);
+	clone -> bi_iter.bi_sector = physical_sector;
+
+	ret = submit_bio_wait(clone);
+	bio_put(clone);
+
+	return ret;
+}
+
+static int zns_base_submit_clone_range(struct zns_base_c *c,
+  				       struct bio *bio,
+  				       unsigned int bio_offset_bytes,
+  				       unsigned int length_bytes,
+  				       sector_t physical_sector)
+{
+  	struct bio *clone;
+  	int ret;
+
+  	if (bio_offset_bytes % ZNS_BASE_SECTOR_SIZE ||
+  	    length_bytes % ZNS_BASE_SECTOR_SIZE)
+  		return -EINVAL;
+
+  	clone = bio_clone_fast(bio, GFP_KERNEL, &fs_bio_set);
+  	if (!clone)
+  		return -ENOMEM;
+
+  	/*
+  	 * clone에 원본 bio 전체가 아니라,
+  	 * [bio_offset_bytes, length_bytes] 범위만 남긴다.
+  	 */
+  	bio_trim(clone,
+  		 bio_offset_bytes / ZNS_BASE_SECTOR_SIZE,
+  		 length_bytes / ZNS_BASE_SECTOR_SIZE);
+
+  	bio_set_dev(clone, c->dev->bdev);
+  	clone->bi_iter.bi_sector = physical_sector;
+
+  	ret = submit_bio_wait(clone);
+  	bio_put(clone);
+
+  	return ret;
+}
+
+static int zns_base_submit_page(struct zns_base_c *c,
+  				struct page *page,
+  				unsigned int op,
+  				sector_t physical_sector)
+{
+  	struct bio *page_bio;
+  	int added;
+  	int ret;
+
+  	page_bio = bio_alloc(GFP_KERNEL, 1);
+  	if (!page_bio)
+  		return -ENOMEM;
+
+  	bio_set_dev(page_bio, c->dev->bdev);
+  	bio_set_op_attrs(page_bio, op, 0);
+  	page_bio->bi_iter.bi_sector = physical_sector;
+
+  	added = bio_add_page(page_bio, page, ZNS_BASE_BLOCK_SIZE, 0);
+  	if (added != ZNS_BASE_BLOCK_SIZE) {
+  		bio_put(page_bio);
+  		return -EIO;
+  	}
+
+  	ret = submit_bio_wait(page_bio);
+  	bio_put(page_bio);
+
+  	return ret;
+}
+
+static void zns_base_copy_from_bio(struct bio *bio,
+  				   unsigned int bio_offset_bytes,
+  				   void *dst,
+  				   unsigned int length_bytes)
+{
+  	struct bvec_iter iter;
+  	struct bio_vec bvec;
+  	void *src;
+  	unsigned int bytes;
+  	char *dst_ptr;
+
+  	iter = bio->bi_iter;
+  	bio_advance_iter(bio, &iter, bio_offset_bytes);
+  	dst_ptr = dst;
+
+  	while (length_bytes > 0) {
+  		bvec = bio_iter_iovec(bio, iter);
+  		bytes = min_t(unsigned int, length_bytes, bvec.bv_len);
+
+  		src = kmap_local_page(bvec.bv_page);
+  		memcpy(dst_ptr, (char *)src + bvec.bv_offset, bytes);
+  		kunmap_local(src);
+
+  		dst_ptr += bytes;
+  		bio_advance_iter(bio, &iter, bytes);
+  		length_bytes -= bytes;
+  	}
+}
+
+static void zns_base_zero_bio_range(struct bio *bio,
+  				    unsigned int bio_offset_bytes,
+  				    unsigned int length_bytes)
+{
+  	struct bvec_iter iter;
+  	struct bio_vec bvec;
+  	void *addr;
+  	unsigned int bytes;
+
+  	iter = bio->bi_iter;
+  	bio_advance_iter(bio, &iter, bio_offset_bytes);
+
+  	while (length_bytes > 0) {
+  		bvec = bio_iter_iovec(bio, iter);
+  		bytes = min_t(unsigned int, length_bytes, bvec.bv_len);
+
+  		addr = kmap_local_page(bvec.bv_page);
+  		memset((char *)addr + bvec.bv_offset, 0, bytes);
+  		kunmap_local(addr);
+
+  		bio_advance_iter(bio, &iter, bytes);
+  		length_bytes -= bytes;
+  	}
+}
+
+static int zns_base_read_chunk(struct zns_base_c *c,
+  			       struct bio *bio,
+  			       struct zns_base_chunk *chunk)
+{
+  	sector_t physical_sector;
+  	int ret;
+
+  	spin_lock(&c->lock);
+  	ret = mapping_lookup(c, chunk->logical_block, &physical_sector);
+  	spin_unlock(&c->lock);
+
+  	if (ret == -ENOENT) {
+  		zns_base_zero_bio_range(bio,
+  					chunk->bio_offset_bytes,
+  					chunk->length_bytes);
+  		return 0;
+  	}
+
+  	if (ret)
+  		return ret;
+
+  	physical_sector +=
+  		chunk->block_offset_bytes / ZNS_BASE_SECTOR_SIZE;
+
+  	return zns_base_submit_clone_range(c, bio,
+  					   chunk->bio_offset_bytes,
+  					   chunk->length_bytes,
+  					   physical_sector);
+}
+
+static void zns_base_process_read_bio(struct zns_base_c *c, struct bio *bio)
+{
+  	struct zns_base_chunk chunk;
+  	sector_t current_sector;
+  	unsigned int remaining_bytes;
+  	unsigned int bio_offset_bytes;
+  	int ret;
+
+  	if (bio->bi_iter.bi_size % ZNS_BASE_SECTOR_SIZE) {
+  		bio->bi_status = BLK_STS_NOTSUPP;
+  		bio_endio(bio);
+  		return;
+  	}
+
+  	current_sector = bio->bi_iter.bi_sector;
+  	remaining_bytes = bio->bi_iter.bi_size;
+  	bio_offset_bytes = 0;
+
+  	while (remaining_bytes > 0) {
+  		zns_base_next_chunk(current_sector, remaining_bytes,
+  				    bio_offset_bytes, &chunk);
+
+  		if (chunk.logical_block >= c->nr_logical_blocks) {
+  			bio_io_error(bio);
+  			return;
+  		}
+
+  		ret = zns_base_read_chunk(c, bio, &chunk);
+  		if (ret) {
+  			bio_io_error(bio);
+  			return;
+  		}
+
+  		current_sector +=
+  			chunk.length_bytes / ZNS_BASE_SECTOR_SIZE;
+  		remaining_bytes -= chunk.length_bytes;
+  		bio_offset_bytes += chunk.length_bytes;
+  	}
+
+  	bio_endio(bio);
+}
+
+static int zns_base_write_chunk(struct zns_base_c *c,
+  				struct bio *bio,
+  				struct zns_base_chunk *chunk)
+{
+  	struct page *scratch_page;
+  	sector_t old_physical_sector;
+  	sector_t new_physical_sector;
+  	void *scratch_addr;
+  	bool full_block;
+  	int ret;
+
+  	full_block = chunk->block_offset_bytes == 0 &&
+  		     chunk->length_bytes == ZNS_BASE_BLOCK_SIZE;
+  	scratch_page = NULL;
+
+  	if (!full_block) {
+  		scratch_page = alloc_page(GFP_KERNEL);
+  		if (!scratch_page)
+  			return -ENOMEM;
+
+  		spin_lock(&c->lock);
+  		ret = mapping_lookup(c, chunk->logical_block,
+  				     &old_physical_sector);
+  		spin_unlock(&c->lock);
+
+  		if (ret == -ENOENT) {
+  			clear_highpage(scratch_page);
+  		} else if (ret) {
+  			__free_page(scratch_page);
+  			return ret;
+  		} else {
+  			ret = zns_base_submit_page(c, scratch_page,
+  						   REQ_OP_READ,
+  						   old_physical_sector);
+  			if (ret) {
+  				__free_page(scratch_page);
+  				return ret;
+  			}
+  		}
+
+  		scratch_addr = kmap_local_page(scratch_page);
+  		zns_base_copy_from_bio(bio, chunk->bio_offset_bytes,
+  				       (char *)scratch_addr +
+  				       chunk->block_offset_bytes,
+  				       chunk->length_bytes);
+  		kunmap_local(scratch_addr);
+  	}
+
+  	ret = mapping_wait_for_write_slot(c);
+  	if (ret)
+  		goto out_free_page;
+
+  	spin_lock(&c->lock);
+  	if (c->next_write_sector + SECTORS_PER_BLOCK >
+  	    c->nr_logical_blocks * SECTORS_PER_BLOCK) {
+  		spin_unlock(&c->lock);
+  		ret = -ENOSPC;
+  		goto out_free_page;
+  	}
+
+  	new_physical_sector = c->next_write_sector;
+  	spin_unlock(&c->lock);
+
+  	if (full_block) {
+  		ret = zns_base_submit_clone_range(c, bio,
+  						  chunk->bio_offset_bytes,
+  						  chunk->length_bytes,
+  						  new_physical_sector);
+  	} else {
+  		ret = zns_base_submit_page(c, scratch_page,
+  					   REQ_OP_WRITE,
+  					   new_physical_sector);
+  	}
+
+  	if (ret)
+  		goto out_free_page;
+
+  	spin_lock(&c->lock);
+  	ret = mapping_update(c, chunk->logical_block,
+  			     new_physical_sector);
+  	if (!ret)
+  		c->next_write_sector += SECTORS_PER_BLOCK;
+  	spin_unlock(&c->lock);
+
+  out_free_page:
+  	if (scratch_page)
+  		__free_page(scratch_page);
+
+  	return ret;
+}
+
+static void zns_base_process_write_bio(struct zns_base_c *c,
+  				       struct bio *bio)
+{
+  	struct zns_base_chunk chunk;
+  	sector_t current_sector;
+  	unsigned int remaining_bytes;
+  	unsigned int bio_offset_bytes;
+  	int ret;
+
+  	if (bio->bi_iter.bi_size % ZNS_BASE_SECTOR_SIZE) {
+  		bio->bi_status = BLK_STS_NOTSUPP;
+  		bio_endio(bio);
+  		return;
+  	}
+
+  	current_sector = bio->bi_iter.bi_sector;
+  	remaining_bytes = bio->bi_iter.bi_size;
+  	bio_offset_bytes = 0;
+
+  	while (remaining_bytes > 0) {
+  		zns_base_next_chunk(current_sector, remaining_bytes,
+  				    bio_offset_bytes, &chunk);
+
+  		if (chunk.logical_block >= c->nr_logical_blocks) {
+  			bio_io_error(bio);
+  			return;
+  		}
+
+  		ret = zns_base_write_chunk(c, bio, &chunk);
+  		if (ret) {
+  			bio_io_error(bio);
+  			return;
+  		}
+
+  		current_sector +=
+  			chunk.length_bytes / ZNS_BASE_SECTOR_SIZE;
+  		remaining_bytes -= chunk.length_bytes;
+  		bio_offset_bytes += chunk.length_bytes;
+  	}
+
+  	bio_endio(bio);
+}
+
+static bool mapping_write_ready(struct zns_base_c *c){
+	bool ready;
+
+	spin_lock(&c -> lock);
+
+	ready = c -> stopping ||
+			c -> mapping.flush_error ||
+			c -> mapping.active_memtable -> entry_count < c -> mapping.active_memtable -> entry_capacity ||
+			!list_empty(&c -> mapping.spare_memtables);
+		
+	spin_unlock(&c -> lock);
+
+	return ready;
+}
+
+static int mapping_wait_for_write_slot(struct zns_base_c *c){
+	for(;;){
+		spin_lock(&c -> lock);
+
+		if(c -> stopping){
+			spin_unlock(&c -> lock);
+			return -EIO;
+		}
+
+		if(c -> mapping.flush_error){
+			spin_unlock(&c -> lock);
+			return c -> mapping.flush_error;
+		}
+
+		if(c -> mapping.active_memtable -> entry_count < c -> mapping.active_memtable -> entry_capacity ||
+			!list_empty(&c -> mapping.spare_memtables)){
+				spin_unlock(&c -> lock);
+				return 0;
+		}
+
+		spin_unlock(&c -> lock);
+
+		wait_event(c -> spare_waitq, mapping_write_ready(c));
+	}
+}
+
+static void zns_base_process_bio(struct zns_base_c *c, struct bio *bio){
+	int ret;
+
+	/* Student work goes here: translate random writes into sequential ones. */
+
+	if(bio_op(bio) == REQ_OP_FLUSH){
+		ret = zns_base_submit_clone(c, bio, bio -> bi_iter.bi_sector);
+		if(ret)
+			bio_io_error(bio);
+		else
+			bio_endio(bio);		
+		return;
+	}
+	// write bio 처리
+	else if(bio_op(bio) == REQ_OP_WRITE){
+		zns_base_process_write_bio(c, bio);
+		return;
+	}
+	// read bio 처리
+	else if(bio_op(bio) == REQ_OP_READ){
+		zns_base_process_read_bio(c, bio);
+		return;
+	}
+	bio->bi_status = BLK_STS_NOTSUPP;
+	bio_endio(bio);
+}
+
+static void zns_base_io_work(struct work_struct *work){
+	struct zns_base_c *c;
+	struct zns_base_io *io;
+
+	c = container_of(work, struct zns_base_c, io_work);
+
+	for(;;){
+		spin_lock(&c -> lock);
+
+		if(list_empty(&c -> pending_bios)){
+			c -> io_work_scheduled = false;
+			spin_unlock(&c -> lock);
+			return;
+		}
+
+		io = list_first_entry(&c -> pending_bios, struct zns_base_io, node);
+		list_del_init(&io -> node);
+
+		spin_unlock(&c -> lock);
+
+		zns_base_process_bio(c, io -> bio);
+		mempool_free(io, c -> io_pool);
+	}
+}
 
 static void mapping_memtable_free(struct mapping_memtable *memtable) {
 	if(!memtable)
@@ -170,6 +688,8 @@ static void mapping_flush_work(struct work_struct *work) {
 			c -> mapping.flush_error = -ENOMEM;
 			c -> mapping.flush_pending = false;
 			spin_unlock(&c -> lock);
+
+			wake_up_all(&c -> spare_waitq);
 			return;
 		}
 
@@ -194,6 +714,8 @@ static void mapping_flush_work(struct work_struct *work) {
 			c -> mapping.flush_pending = false;
 			spin_unlock(&c -> lock);
 
+			wake_up_all(&c -> spare_waitq);
+
 			return;
 		}
 
@@ -207,6 +729,8 @@ static void mapping_flush_work(struct work_struct *work) {
 		c -> mapping.spare_count++;
 
 		spin_unlock(&c -> lock);
+
+		wake_up_all(&c -> spare_waitq);
 	}
 }
 
@@ -446,6 +970,23 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	c -> next_write_sector = 0;
 
+	INIT_LIST_HEAD(&c -> pending_bios);
+	init_waitqueue_head(&c -> spare_waitq);
+	c -> io_work_scheduled = false;
+	c -> stopping = false;
+
+	c -> io_pool = mempool_create_kmalloc_pool(IO_POOL_SIZE, sizeof(struct zns_base_io));
+
+	if(!c -> io_pool){
+		ti -> error = "failed to allocate I/O context pool";
+		mapping_destroy(c);
+		dm_put_device(ti, c -> dev);
+		kfree(c);
+		return -ENOMEM; 
+	}
+
+	INIT_WORK(&c -> io_work, zns_base_io_work);
+
 	ti->private = c;
 	ti->num_flush_bios = 1;
 	// ti->num_discard_bios = 1;
@@ -457,6 +998,33 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 static void zns_base_dtr(struct dm_target *ti)
 {
 	struct zns_base_c *c = ti->private;
+	struct zns_base_io *io;
+
+	spin_lock(&c -> lock);
+	c -> stopping = true;
+	spin_unlock(&c -> lock);
+
+	wake_up_all(&c -> spare_waitq);
+
+	cancel_work_sync(&c -> io_work);
+
+	for(;;){
+		spin_lock(&c -> lock);
+		if(list_empty(&c -> pending_bios)){
+			c -> io_work_scheduled = false;
+			spin_unlock(&c -> lock);
+			break;
+		}
+		io = list_first_entry(&c -> pending_bios, struct zns_base_io, node);
+		list_del_init(&io -> node);
+		spin_unlock(&c -> lock);
+
+		bio_io_error(io -> bio);
+		mempool_free(io, c -> io_pool);
+	}
+
+	mempool_destroy(c -> io_pool);
+	c -> io_pool = NULL;
 
 	mapping_destroy(c);
 	dm_put_device(ti, c->dev);
@@ -467,109 +1035,20 @@ static void zns_base_dtr(struct dm_target *ti)
 
 static int zns_base_map(struct dm_target *ti, struct bio *bio)
 {
-	struct zns_base_c *c = ti->private;
-	size_t logical_block_num;
-  	sector_t physical_sector;
+	struct zns_base_c *c = ti -> private;
 	int ret;
 
-	/* Student work goes here: translate random writes into sequential ones. */
-
-	// write bio 처리
-	if(bio_op(bio) == REQ_OP_WRITE){
-		//4kb검사. 나중에 지우기.
-		if(bio -> bi_iter.bi_sector % SECTORS_PER_BLOCK != 0 || bio -> bi_iter.bi_size != ZNS_BASE_BLOCK_SIZE){
-			bio->bi_status = BLK_STS_NOTSUPP; // 이 bio는 지원하지 않는 요청으로 표시
-			bio_endio(bio); // bio 끝냄
-			return DM_MAPIO_SUBMITTED; // DM에게 내가 처리했다 라고 알리는것.
-		}
-		logical_block_num = bio -> bi_iter.bi_sector / SECTORS_PER_BLOCK;
-
-		if(logical_block_num >= c -> nr_logical_blocks){
-			bio_io_error(bio);
-			return DM_MAPIO_SUBMITTED;
-		}
-		// 여기까지가 4kb 검사
-
-		spin_lock(&c -> lock);
-		if(c -> next_write_sector + SECTORS_PER_BLOCK > ti -> len){
-			spin_unlock(&c -> lock);
-			bio->bi_status = BLK_STS_NOSPC;
-			bio_endio(bio);
-			return DM_MAPIO_SUBMITTED;
-		}
-
-		/*
-		- 단순 MVP 정책: flush_error != 0이면 이후 write를 bio_io_error()로 실패시킨다.
-		- 재시도 정책: worker가 일정 조건에서 flush를 다시 시도한다.
-		- 더 발전된 정책: 메모리 압박이 해소될 때까지 대기하거나, spare pool을 관리한다.
-		현재는 단순 MVP로 구현
-		*/
-		if(c -> mapping.flush_error){
-			spin_unlock(&c -> lock);
-			bio_io_error(bio);
-			return DM_MAPIO_SUBMITTED;
-		}
-
-		physical_sector = c -> next_write_sector;
-		ret = mapping_update(c, logical_block_num, physical_sector);
-		if (ret == -EAGAIN){
-			spin_unlock(&c -> lock);
-  			return DM_MAPIO_REQUEUE;
-		}
-		else if(ret) {
-			spin_unlock(&c -> lock);
-			bio_io_error(bio);
-  			return DM_MAPIO_SUBMITTED;
-		}
-		c -> next_write_sector += SECTORS_PER_BLOCK;
-		spin_unlock(&c -> lock);
-		bio -> bi_iter.bi_sector = physical_sector;
-	}
-	// read bio 처리
-	else if(bio_op(bio) == REQ_OP_READ){
-		//4kb검사. 나중에 지우기.
-		if(bio -> bi_iter.bi_sector % SECTORS_PER_BLOCK != 0 || bio -> bi_iter.bi_size != ZNS_BASE_BLOCK_SIZE){
-			bio->bi_status = BLK_STS_NOTSUPP; // 이 bio는 지원하지 않는 요청으로 표시
-			bio_endio(bio); // bio 끝냄
-			return DM_MAPIO_SUBMITTED; // DM에게 내가 처리했다 라고 알리는것.
-		}
-		logical_block_num = bio -> bi_iter.bi_sector / SECTORS_PER_BLOCK;
-
-		if(logical_block_num >= c -> nr_logical_blocks){
-			bio_io_error(bio);
-			return DM_MAPIO_SUBMITTED;
-		}
-		// 여기까지가 4kb 검사
-
-		spin_lock(&c -> lock);
-		ret = mapping_lookup(c, logical_block_num, &physical_sector);
-		if(ret == -ENOENT){
-			spin_unlock(&c -> lock);
-			zero_fill_bio(bio);
-			bio_endio(bio);
-			return DM_MAPIO_SUBMITTED;
-		}
-		else if(ret){
-			spin_unlock(&c -> lock);
-			bio_io_error(bio);
-			return DM_MAPIO_SUBMITTED;
-		}
-		spin_unlock(&c -> lock);
-		bio -> bi_iter.bi_sector = physical_sector;
-	}
-	else if(bio_op(bio) == REQ_OP_FLUSH){
-		bio_set_dev(bio, c->dev->bdev);
-		return DM_MAPIO_REMAPPED;
-	}
-	else{ // discard는 m3에서 구현
-		bio->bi_status = BLK_STS_NOTSUPP;
+	if(bio_op(bio) != REQ_OP_READ && bio_op(bio) != REQ_OP_WRITE && bio_op(bio) != REQ_OP_FLUSH){
+		bio -> bi_status = BLK_STS_NOTSUPP;
 		bio_endio(bio);
 		return DM_MAPIO_SUBMITTED;
 	}
 
-	// 이 bio 요청이 내려갈 대상 block device를 아래쪽 underlying device로 바꾸는 코드.
-	bio_set_dev(bio, c->dev->bdev);
-	return DM_MAPIO_REMAPPED;
+	ret = zns_base_queue_bio(c, bio);
+	if(ret)
+		bio_io_error(bio);
+
+	return DM_MAPIO_SUBMITTED;
 }
 
 static struct target_type zns_base_target = {
