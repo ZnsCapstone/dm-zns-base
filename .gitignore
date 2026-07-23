@@ -9,9 +9,17 @@
 .tmp_versions/
 modules.order
 Module.symvers
+compile_commands.json
 
 # Editor / OS
 .vscode/
 .idea/
 *.swp
 .DS_Store
+.clangd
+.cache/
+
+# Local-only reference material (not part of the distributed project)
+CLAUDE.md
+OT.pdf
+report/
