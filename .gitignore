@@ -19,3 +19,4 @@ Module.symvers
 m1-implement.md
 Q&A.md
 final-implement.md
+sstable-wal-implement.md

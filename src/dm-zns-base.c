@@ -21,6 +21,8 @@
 #include <linux/wait.h>
 #include <linux/highmem.h>
 #include <linux/mm.h>
+#include <linux/blkdev.h>
+#include <linux/atomic.h>
 
 #define DM_MSG_PREFIX "zns-base"
 #define ZNS_BASE_BLOCK_SIZE 4096
@@ -29,6 +31,10 @@
 #define MEMTABLE_POOL_SIZE 4
 #define INITIAL_RUN_CAPACITY 4
 #define IO_POOL_SIZE 128
+#define GC_RESERVE_ZONES 2
+#define GC_LOW_WATERMARK 3
+#define GC_TARGET_FREE_ZONES 5
+#define ZNS_BASE_NO_ZONE ((unsigned int)-1)
 
 
 struct mapping_entry {
@@ -67,6 +73,39 @@ struct mapping_state {
 	int flush_error;
 };
 
+enum zns_base_zone_state {
+  	ZNS_BASE_ZONE_FREE,
+  	ZNS_BASE_ZONE_ACTIVE,
+  	ZNS_BASE_ZONE_FULL,
+	ZNS_BASE_ZONE_GC_DEST,
+  	ZNS_BASE_ZONE_GC_VICTIM,
+};
+
+struct zns_base_zone_slot {
+  	size_t logical_block;
+  	bool valid;
+};
+
+struct zns_base_zone {
+  	sector_t start_sector;
+  	sector_t capacity_sectors;
+  	sector_t write_pointer;
+  	unsigned int nr_blocks;
+  	unsigned int valid_blocks;
+	struct zns_base_zone_slot *slots;
+  	enum zns_base_zone_state state;
+
+	atomic_t inflight_reads;
+	wait_queue_head_t read_waitq;
+};
+
+struct zns_base_zone_state_table {
+  	struct zns_base_zone *zones;
+  	unsigned int nr_zones;
+  	unsigned int active_zone_idx;
+	unsigned int gc_dest_zone_idx;
+};
+
 struct zns_base_chunk {
 	size_t logical_block;
 	unsigned int block_offset_bytes;
@@ -82,28 +121,53 @@ struct zns_base_io {
 struct zns_base_c {
 	struct dm_dev *dev;
 
-	//sector_t는 Linux 커널에서 블록 디바이스의 sector 번호를 저장할 때 쓰는 정수 타입이다.
-	sector_t next_write_sector; // 실제 아래쪽 zoned device의 physical sector 번호를 뜻한다.
+	struct zns_base_zone_state_table zone_state;
+
 	struct mapping_state mapping;
 	size_t nr_logical_blocks;
 
 	struct list_head pending_bios;
+	
+	struct workqueue_struct *io_wq;
+	struct workqueue_struct *gc_wq;
+	
 	struct work_struct io_work;
+	struct work_struct gc_work;
+
 	bool io_work_scheduled;
+	bool gc_scheduled;
+	bool gc_running;
+	int gc_error;
+
 	mempool_t *io_pool;
 	bool stopping;
 
 	wait_queue_head_t spare_waitq;
+	wait_queue_head_t gc_waitq;
 
 	// 나중에 io_lock이랑 mapping_lock이랑 나누기.
 	spinlock_t lock;
 };
 
-static int mapping_update(struct zns_base_c *c, size_t logical_block,
-			  sector_t physical_sector);
-static int mapping_lookup(struct zns_base_c *c, size_t logical_block,
-			  sector_t *physical_sector);
+static int mapping_update(struct zns_base_c *c, size_t logical_block, sector_t physical_sector);
+static int mapping_lookup(struct zns_base_c *c, size_t logical_block, struct mapping_entry *entry);
+static int mapping_update_if_match(struct zns_base_c *c, size_t logical_block,
+  				   sector_t expected_physical_sector, u64 expected_seq, sector_t new_physical_sector);
 static int mapping_wait_for_write_slot(struct zns_base_c *c);
+static int zns_base_allocate_block(struct zns_base_c *c, sector_t *physical_sector);
+static int zns_base_commit_block(struct zns_base_c *c, sector_t physical_sector);
+static int zns_base_get_zone_slot(struct zns_base_c *c,sector_t physical_sector,
+  				  struct zns_base_zone **zone_out, unsigned int *slot_out);
+static void zns_base_gc_work(struct work_struct *work);
+static void zns_base_schedule_gc(struct zns_base_c *c);
+static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *victim,
+  				  unsigned int victim_slot);
+static int zns_base_reset_victim(struct zns_base_c *c, struct zns_base_zone *victim);
+static unsigned int zns_base_count_free_zones(struct zns_base_c *c);
+static int zns_base_select_victim(struct zns_base_c *c, struct zns_base_zone **victim_out);
+static void zns_base_release_victim(struct zns_base_c *c, struct zns_base_zone *victim);
+static bool zns_base_gc_space_ready(struct zns_base_c *c);
+static int zns_base_wait_for_gc_space(struct zns_base_c *c);
 
 
 static void zns_base_next_chunk(sector_t current_sector, unsigned int remaining_bytes, 
@@ -155,7 +219,7 @@ static int zns_base_queue_bio(struct zns_base_c *c, struct bio *bio){
 	spin_unlock(&c -> lock);
 
 	if(schedule)
-		schedule_work(&c -> io_work);
+		queue_work(c -> io_wq, &c -> io_work);
 
 	return 0;
 }
@@ -294,15 +358,39 @@ static void zns_base_zero_bio_range(struct bio *bio,
   	}
 }
 
-static int zns_base_read_chunk(struct zns_base_c *c,
-  			       struct bio *bio,
+static void zns_base_zone_read_get(struct zns_base_zone *zone)
+{
+  	atomic_inc(&zone->inflight_reads);
+}
+
+static void zns_base_zone_read_put(struct zns_base_zone *zone)
+{
+  	if (atomic_dec_and_test(&zone->inflight_reads))
+  		wake_up_all(&zone->read_waitq);
+}
+
+static int zns_base_read_chunk(struct zns_base_c *c, struct bio *bio,
   			       struct zns_base_chunk *chunk)
 {
+	struct zns_base_zone *zone;
+	struct mapping_entry entry;
+	unsigned int slot;
+	bool zone_pinned;
   	sector_t physical_sector;
   	int ret;
+	
+	zone_pinned = false;
 
   	spin_lock(&c->lock);
-  	ret = mapping_lookup(c, chunk->logical_block, &physical_sector);
+  	ret = mapping_lookup(c, chunk->logical_block, &entry);
+	if (!ret) {
+		physical_sector = entry.physical_sector;
+		ret = zns_base_get_zone_slot(c, physical_sector, &zone, &slot);
+		if (!ret) {
+			zns_base_zone_read_get(zone);
+			zone_pinned = true;
+		}
+	}
   	spin_unlock(&c->lock);
 
   	if (ret == -ENOENT) {
@@ -318,10 +406,14 @@ static int zns_base_read_chunk(struct zns_base_c *c,
   	physical_sector +=
   		chunk->block_offset_bytes / ZNS_BASE_SECTOR_SIZE;
 
-  	return zns_base_submit_clone_range(c, bio,
+  	ret = zns_base_submit_clone_range(c, bio,
   					   chunk->bio_offset_bytes,
   					   chunk->length_bytes,
   					   physical_sector);
+	if (zone_pinned)
+		zns_base_zone_read_put(zone);
+
+	return ret;
 }
 
 static void zns_base_process_read_bio(struct zns_base_c *c, struct bio *bio)
@@ -367,19 +459,26 @@ static void zns_base_process_read_bio(struct zns_base_c *c, struct bio *bio)
 }
 
 static int zns_base_write_chunk(struct zns_base_c *c,
-  				struct bio *bio,
-  				struct zns_base_chunk *chunk)
+  				struct bio *bio, struct zns_base_chunk *chunk)
 {
-  	struct page *scratch_page;
-  	sector_t old_physical_sector;
   	sector_t new_physical_sector;
+	struct mapping_entry old_entry;
+	struct zns_base_zone *old_zone;
+  	struct zns_base_zone *new_zone;
+  	struct page *scratch_page;
   	void *scratch_addr;
   	bool full_block;
+	unsigned int old_slot;
+  	unsigned int new_slot;
+  	bool had_old_mapping;
+	bool old_zone_pinned;
   	int ret;
 
   	full_block = chunk->block_offset_bytes == 0 &&
   		     chunk->length_bytes == ZNS_BASE_BLOCK_SIZE;
   	scratch_page = NULL;
+	had_old_mapping = false;
+	old_zone_pinned = false;
 
   	if (!full_block) {
   		scratch_page = alloc_page(GFP_KERNEL);
@@ -387,24 +486,44 @@ static int zns_base_write_chunk(struct zns_base_c *c,
   			return -ENOMEM;
 
   		spin_lock(&c->lock);
-  		ret = mapping_lookup(c, chunk->logical_block,
-  				     &old_physical_sector);
-  		spin_unlock(&c->lock);
 
-  		if (ret == -ENOENT) {
-  			clear_highpage(scratch_page);
-  		} else if (ret) {
-  			__free_page(scratch_page);
-  			return ret;
-  		} else {
-  			ret = zns_base_submit_page(c, scratch_page,
-  						   REQ_OP_READ,
-  						   old_physical_sector);
-  			if (ret) {
-  				__free_page(scratch_page);
-  				return ret;
-  			}
-  		}
+		ret = mapping_lookup(c, chunk->logical_block, &old_entry);
+
+		if (ret == -ENOENT) {
+			clear_highpage(scratch_page);
+			ret = 0;
+		} 
+		else if (!ret) {
+			ret = zns_base_get_zone_slot(c, old_entry.physical_sector,
+										&old_zone, &old_slot);
+
+			if (!ret &&
+				(!old_zone->slots[old_slot].valid ||
+				old_zone->slots[old_slot].logical_block !=
+				chunk->logical_block))
+				ret = -EIO;
+
+			if (!ret) {
+				zns_base_zone_read_get(old_zone);
+				old_zone_pinned = true;
+			}
+		}
+
+		spin_unlock(&c->lock);
+
+		if (ret)
+			goto out_free_page;
+
+		if (old_zone_pinned) {
+			ret = zns_base_submit_page(c, scratch_page, REQ_OP_READ,
+										old_entry.physical_sector);
+
+			zns_base_zone_read_put(old_zone);
+			old_zone_pinned = false;
+
+			if (ret)
+				goto out_free_page;
+		}
 
   		scratch_addr = kmap_local_page(scratch_page);
   		zns_base_copy_from_bio(bio, chunk->bio_offset_bytes,
@@ -418,16 +537,60 @@ static int zns_base_write_chunk(struct zns_base_c *c,
   	if (ret)
   		goto out_free_page;
 
-  	spin_lock(&c->lock);
-  	if (c->next_write_sector + SECTORS_PER_BLOCK >
-  	    c->nr_logical_blocks * SECTORS_PER_BLOCK) {
+	for (;;) {
+		spin_lock(&c->lock);
+		ret = zns_base_allocate_block(c, &new_physical_sector);
+		spin_unlock(&c->lock);
+
+		if (ret != -EAGAIN)
+			break;
+
+		ret = zns_base_wait_for_gc_space(c);
+		if (ret)
+			goto out_free_page;
+	}
+
+	if (ret)
+		goto out_free_page;
+
+	spin_lock(&c->lock);
+
+  	ret = mapping_lookup(c, chunk->logical_block, &old_entry);
+  	if (ret == -ENOENT) {
+  		had_old_mapping = false;
+  		ret = 0;
+  	} else if (ret) {
   		spin_unlock(&c->lock);
-  		ret = -ENOSPC;
   		goto out_free_page;
+  	} else {
+  		had_old_mapping = true;
   	}
 
-  	new_physical_sector = c->next_write_sector;
+  	if (!ret)
+  		ret = zns_base_get_zone_slot(c, new_physical_sector,
+  					     &new_zone, &new_slot);
+
+  	if (!ret && had_old_mapping)
+  		ret = zns_base_get_zone_slot(c, old_entry.physical_sector,
+  					     &old_zone, &old_slot);
+
+  	/*
+  	 * 새 PBA는 아직 사용되지 않은 slot이어야 하고,
+  	 * 기존 mapping이 있다면 old slot은 valid여야 한다.
+  	 */
+  	if (!ret && new_zone->slots[new_slot].valid)
+  		ret = -EIO;
+
+  	if (!ret && had_old_mapping &&
+  	    (!old_zone->slots[old_slot].valid ||
+  	     old_zone->slots[old_slot].logical_block !=
+  	     chunk->logical_block))
+  		ret = -EIO;
+
   	spin_unlock(&c->lock);
+
+  	if (ret)
+  		goto out_free_page;
 
   	if (full_block) {
   		ret = zns_base_submit_clone_range(c, bio,
@@ -444,12 +607,30 @@ static int zns_base_write_chunk(struct zns_base_c *c,
   		goto out_free_page;
 
   	spin_lock(&c->lock);
-  	ret = mapping_update(c, chunk->logical_block,
-  			     new_physical_sector);
-  	if (!ret)
-  		c->next_write_sector += SECTORS_PER_BLOCK;
-  	spin_unlock(&c->lock);
 
+	/* lower write가 성공했으므로 underlying WP와 맞춰 먼저 증가시킨다. */
+	ret = zns_base_commit_block(c, new_physical_sector);
+	if (!ret)
+		ret = mapping_update(c, chunk->logical_block,
+					new_physical_sector);
+
+	if (!ret) {
+  		new_zone->slots[new_slot].logical_block =
+  			chunk->logical_block;
+  		new_zone->slots[new_slot].valid = true;
+  		new_zone->valid_blocks++;
+
+  		if (had_old_mapping) {
+  			old_zone->slots[old_slot].valid = false;
+  			old_zone->valid_blocks--;
+  		}
+  	}
+
+	spin_unlock(&c->lock);
+
+	if (!ret)
+  		zns_base_schedule_gc(c);
+	
   out_free_page:
   	if (scratch_page)
   		__free_page(scratch_page);
@@ -591,6 +772,71 @@ static void zns_base_io_work(struct work_struct *work){
 		zns_base_process_bio(c, io -> bio);
 		mempool_free(io, c -> io_pool);
 	}
+}
+
+static void zns_base_gc_work(struct work_struct *work)
+{
+  	struct zns_base_c *c;
+	struct zns_base_zone *victim;
+  	unsigned int slot;
+  	int ret;
+
+  	c = container_of(work, struct zns_base_c, gc_work);
+
+  	spin_lock(&c->lock);
+  	c->gc_running = true;
+	c->gc_error = 0;
+  	spin_unlock(&c->lock);
+
+  	ret = 0;
+
+  	for (;;) {
+  		spin_lock(&c->lock);
+
+  		if (c->stopping ||
+  		    zns_base_count_free_zones(c) >=
+  		    GC_TARGET_FREE_ZONES) {
+  			spin_unlock(&c->lock);
+  			break;
+  		}
+
+  		spin_unlock(&c->lock);
+
+  		ret = zns_base_select_victim(c, &victim);
+  		if (ret == -ENOENT) {
+  			ret = -ENOSPC;
+  			break;
+  		}
+
+  		for (slot = 0; slot < victim->nr_blocks; slot++) {
+  			ret = zns_base_gc_move_block(c, victim, slot);
+  			if (ret)
+  				break;
+  		}
+
+  		if (ret) {
+  			zns_base_release_victim(c, victim);
+  			break;
+  		}
+
+  		ret = zns_base_reset_victim(c, victim);
+  		if (ret) {
+  			zns_base_release_victim(c, victim);
+  			break;
+  		}
+  	}
+
+  	spin_lock(&c->lock);
+
+  	if (ret && !c->stopping)
+  		c->gc_error = ret;
+
+  	c->gc_running = false;
+  	c->gc_scheduled = false;
+
+  	spin_unlock(&c->lock);
+
+  	wake_up_all(&c->gc_waitq);
 }
 
 static void mapping_memtable_free(struct mapping_memtable *memtable) {
@@ -892,7 +1138,7 @@ static int mapping_update(struct zns_base_c *c, size_t logical_block,
 
 //binary search로 바꾸기 
 static int mapping_lookup(struct zns_base_c *c, size_t logical_block,
-			  sector_t *physical_sector)
+			  struct mapping_entry *entry)
 {
 	/* TODO: replace direct c->map[] read path with this helper. */
 	/*
@@ -906,7 +1152,7 @@ static int mapping_lookup(struct zns_base_c *c, size_t logical_block,
 	active_memtable = c -> mapping.active_memtable;
 	for(i = active_memtable -> entry_count; i > 0; i--){
 		if(active_memtable -> entries[i - 1].logical_block == logical_block){
-			*physical_sector = active_memtable -> entries[i - 1].physical_sector;
+			*entry = active_memtable -> entries[i - 1];
 			return 0;
 		}
 	}
@@ -914,7 +1160,7 @@ static int mapping_lookup(struct zns_base_c *c, size_t logical_block,
 	list_for_each_entry_reverse(memtable, &c -> mapping.frozen_memtables, node){
 		for(i = memtable -> entry_count; i > 0; i--){
 			if(memtable -> entries[i - 1].logical_block == logical_block){
-				*physical_sector = memtable -> entries[i - 1].physical_sector;
+				*entry = memtable -> entries[i - 1];
 				return 0;
 			}
 		}
@@ -924,7 +1170,7 @@ static int mapping_lookup(struct zns_base_c *c, size_t logical_block,
 		run = &c -> mapping.runs[i - 1];
 		for(j = run -> entry_count; j > 0; j--){
 			if(run -> entries[j - 1].logical_block == logical_block){
-				*physical_sector = run -> entries[j - 1].physical_sector;
+				*entry = run -> entries[j - 1];
 				return 0;
 			}
 		}
@@ -932,6 +1178,683 @@ static int mapping_lookup(struct zns_base_c *c, size_t logical_block,
 	return -ENOENT;
 }
 
+static int mapping_update_if_match(struct zns_base_c *c, size_t logical_block,
+  				   sector_t expected_physical_sector, u64 expected_seq, sector_t new_physical_sector)
+{
+  	struct mapping_entry current_entry;
+  	int ret;
+
+  	ret = mapping_lookup(c, logical_block, &current_entry);
+  	if (ret == -ENOENT)
+  		return -ESTALE;
+
+  	if (ret)
+  		return ret;
+
+  	if (current_entry.physical_sector != expected_physical_sector ||
+  	    current_entry.seq != expected_seq)
+  		return -ESTALE;
+
+  	return mapping_update(c, logical_block, new_physical_sector);
+}
+
+static int zns_base_get_zone_slot(struct zns_base_c *c,
+  				  sector_t physical_sector,
+  				  struct zns_base_zone **zone_out,
+  				  unsigned int *slot_out)
+{
+  	struct zns_base_zone *zone;
+  	sector_t zone_end;
+  	unsigned int i;
+
+  	for (i = 0; i < c->zone_state.nr_zones; i++) {
+  		zone = &c->zone_state.zones[i];
+  		zone_end = zone->start_sector + zone->capacity_sectors;
+
+  		if (physical_sector < zone->start_sector ||
+  		    physical_sector + SECTORS_PER_BLOCK > zone_end)
+  			continue;
+
+  		if ((physical_sector - zone->start_sector) %
+  		    SECTORS_PER_BLOCK != 0)
+  			return -EINVAL;
+
+  		*zone_out = zone;
+  		*slot_out = (physical_sector - zone->start_sector) /
+  			    SECTORS_PER_BLOCK;
+  		return 0;
+  	}
+
+  	return -EINVAL;
+}
+
+static int zns_base_report_zone(struct blk_zone *zone,
+  				unsigned int idx, void *data)
+{
+  	struct zns_base_c *c = data;
+  	struct zns_base_zone *z;
+
+  	if (idx >= c->zone_state.nr_zones)
+  		return -EINVAL;
+
+  	if (zone->type != BLK_ZONE_TYPE_SEQWRITE_REQ)
+  		return -EINVAL;
+
+  	if (zone->capacity == 0 ||
+  	    zone->capacity % SECTORS_PER_BLOCK != 0)
+  		return -EINVAL;
+
+  	/*
+  	 * 현재 mapping은 RAM에만 있다.
+  	 * 따라서 이전 실행에서 이미 write된 zone은 복구할 수 없다.
+  	 */
+  	if (zone->wp != zone->start)
+  		return -EBUSY;
+
+  	z = &c->zone_state.zones[idx];
+  	z->start_sector = zone->start;
+  	z->capacity_sectors = zone->capacity;
+  	z->write_pointer = zone->start;
+  	z->nr_blocks = zone->capacity / SECTORS_PER_BLOCK;
+  	z->valid_blocks = 0;
+  	z->state = ZNS_BASE_ZONE_FREE;
+	atomic_set(&z->inflight_reads, 0);
+	init_waitqueue_head(&z->read_waitq);
+
+  	return 0;
+}
+
+static void zns_base_zone_destroy(struct zns_base_c *c)
+{
+	unsigned int i;
+
+	for(i = 0; i < c -> zone_state.nr_zones; i++)
+		kvfree(c -> zone_state.zones[i].slots);
+	
+  	kvfree(c->zone_state.zones);
+  	c->zone_state.zones = NULL;
+  	c->zone_state.nr_zones = 0;
+  	c->zone_state.active_zone_idx = 0;
+	c->zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;
+}
+
+static int zns_base_zone_init(struct zns_base_c *c)
+{
+  	struct request_queue *queue;
+  	unsigned int nr_zones;
+	unsigned int i;
+  	int ret;
+
+  	if (!bdev_is_zoned(c->dev->bdev))
+  		return -EINVAL;
+
+  	queue = bdev_get_queue(c->dev->bdev);
+  	if (!queue)
+  		return -ENODEV;
+
+  	nr_zones = blk_queue_nr_zones(queue);
+  	if (!nr_zones || !bdev_zone_sectors(c->dev->bdev))
+  		return -EINVAL;
+
+  	c->zone_state.zones = kvcalloc(nr_zones,
+  				       sizeof(*c->zone_state.zones),
+  				       GFP_KERNEL);
+  	if (!c->zone_state.zones)
+  		return -ENOMEM;
+
+  	c->zone_state.nr_zones = nr_zones;
+  	c->zone_state.active_zone_idx = 0;
+	c -> zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;
+
+  	ret = blkdev_report_zones(c->dev->bdev, 0, nr_zones,
+  				  zns_base_report_zone, c);
+  	if (ret < 0) {
+  		kvfree(c->zone_state.zones);
+  		c->zone_state.zones = NULL;
+  		c->zone_state.nr_zones = 0;
+  		return ret;
+  	}
+
+  	if (ret != nr_zones) {
+  		kvfree(c->zone_state.zones);
+  		c->zone_state.zones = NULL;
+  		c->zone_state.nr_zones = 0;
+  		return -EINVAL;
+  	}
+
+	for (i = 0; i < nr_zones; i++) {
+		c->zone_state.zones[i].slots =
+			kvcalloc(c->zone_state.zones[i].nr_blocks,
+				sizeof(struct zns_base_zone_slot),
+				GFP_KERNEL);
+
+		if (!c->zone_state.zones[i].slots) {
+			zns_base_zone_destroy(c);
+			return -ENOMEM;
+		}
+	}
+
+  	c->zone_state.zones[0].state = ZNS_BASE_ZONE_ACTIVE;
+  	return 0;
+}
+
+static unsigned int zns_base_count_free_zones(struct zns_base_c *c)
+{
+  	unsigned int i;
+  	unsigned int free_count = 0;
+
+  	for (i = 0; i < c->zone_state.nr_zones; i++) {
+  		if (c->zone_state.zones[i].state == ZNS_BASE_ZONE_FREE)
+  			free_count++;
+  	}
+
+  	return free_count;
+}
+
+static bool zns_base_gc_space_ready(struct zns_base_c *c)
+{
+  	bool ready;
+
+  	spin_lock(&c->lock);
+
+  	ready = c->stopping ||
+  		c->gc_error ||
+  		zns_base_count_free_zones(c) > GC_RESERVE_ZONES;
+
+  	spin_unlock(&c->lock);
+
+  	return ready;
+}
+
+static int zns_base_wait_for_gc_space(struct zns_base_c *c)
+{
+  	for (;;) {
+  		spin_lock(&c->lock);
+
+  		if (c->stopping) {
+  			spin_unlock(&c->lock);
+  			return -EIO;
+  		}
+
+  		if (c->gc_error) {
+  			int ret = c->gc_error;
+
+  			spin_unlock(&c->lock);
+  			return ret;
+  		}
+
+  		if (zns_base_count_free_zones(c) > GC_RESERVE_ZONES) {
+  			spin_unlock(&c->lock);
+  			return 0;
+  		}
+
+  		spin_unlock(&c->lock);
+
+  		/* lock 밖에서 GC를 예약해야 한다. */
+  		zns_base_schedule_gc(c);
+
+  		/*
+  		 * reset 성공, GC 실패, dtr 종료 중 하나가 발생하면
+  		 * 깨어나서 위 조건을 다시 검사한다.
+  		 */
+  		wait_event(c->gc_waitq, zns_base_gc_space_ready(c));
+  	}
+}
+
+static bool zns_base_gc_needed(struct zns_base_c *c)
+{
+  	return zns_base_count_free_zones(c) <= GC_LOW_WATERMARK;
+}
+
+static void zns_base_schedule_gc(struct zns_base_c *c)
+{
+  	bool queue_gc = false;
+
+  	spin_lock(&c->lock);
+
+  	if (!c->stopping &&
+  	    !c->gc_scheduled &&
+  	    zns_base_gc_needed(c)) {
+  		c->gc_scheduled = true;
+  		queue_gc = true;
+  	}
+
+  	spin_unlock(&c->lock);
+
+  	if (queue_gc)
+  		queue_work(c->gc_wq, &c->gc_work);
+}
+
+static int zns_base_select_victim(struct zns_base_c *c,
+  				  struct zns_base_zone **victim_out)
+{
+  	struct zns_base_zone *victim = NULL;
+  	struct zns_base_zone *zone;
+  	unsigned int i;
+
+  	spin_lock(&c->lock);
+
+  	for (i = 0; i < c->zone_state.nr_zones; i++) {
+  		zone = &c->zone_state.zones[i];
+
+  		/*
+  		 * FULL이 아닌 zone은 모두 제외된다.
+  		 * 따라서 ACTIVE, FREE, GC_DEST, GC_VICTIM은
+  		 * 자동으로 후보에서 제외된다.
+  		 */
+  		if (zone->state != ZNS_BASE_ZONE_FULL)
+  			continue;
+
+  		/*
+  		 * 모든 block이 valid이면 옮겨도 FREE zone이
+  		 * 늘어나지 않으므로 GC victim으로 고르지 않는다.
+  		 */
+  		if (zone->valid_blocks >= zone->nr_blocks)
+  			continue;
+
+  		if (!victim ||
+  		    zone->valid_blocks < victim->valid_blocks)
+  			victim = zone;
+  	}
+
+  	if (!victim) {
+  		spin_unlock(&c->lock);
+  		return -ENOENT;
+  	}
+
+  	/*
+  	 * 선택과 상태 변경을 같은 lock 안에서 처리한다.
+  	 * 이후 다른 GC 작업이 같은 zone을 victim으로
+  	 * 선택하지 못한다.
+  	 */
+  	victim->state = ZNS_BASE_ZONE_GC_VICTIM;
+  	*victim_out = victim;
+
+  	spin_unlock(&c->lock);
+
+  	return 0;
+}
+
+static int zns_base_get_gc_destination(struct zns_base_c *c, struct zns_base_zone **destination_out)
+{
+  	struct zns_base_zone *zone;
+  	sector_t zone_end;
+  	unsigned int i;
+
+  	spin_lock(&c->lock);
+
+  	/*
+  	 * 기존 GC destination이 있고 4KiB를 더 쓸 수 있으면
+  	 * 그대로 계속 사용한다.
+  	 */
+  	if (c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE) {
+  		zone = &c->zone_state.zones[c->zone_state.gc_dest_zone_idx];
+  		zone_end = zone->start_sector + zone->capacity_sectors;
+
+  		if (zone->state != ZNS_BASE_ZONE_GC_DEST) {
+  			spin_unlock(&c->lock);
+  			return -EIO;
+  		}
+
+  		if (zone->write_pointer + SECTORS_PER_BLOCK <= zone_end) {
+  			*destination_out = zone;
+  			spin_unlock(&c->lock);
+  			return 0;
+  		}
+
+  		/*
+  		 * GC destination이 꽉 찼다.
+  		 * 일반 write용 ACTIVE로 바꾸지 않고 FULL로 둔다.
+  		 */
+  		zone->state = ZNS_BASE_ZONE_FULL;
+  		c->zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;
+  	}
+
+  	/*
+  	 * 새 FREE zone을 GC 전용 destination으로 확보한다.
+  	 * GC는 reserve zone도 목적지로 사용할 수 있어야 한다.
+  	 */
+  	for (i = 0; i < c->zone_state.nr_zones; i++) {
+  		zone = &c->zone_state.zones[i];
+
+  		if (zone->state != ZNS_BASE_ZONE_FREE)
+  			continue;
+
+  		zone->state = ZNS_BASE_ZONE_GC_DEST;
+  		c->zone_state.gc_dest_zone_idx = i;
+  		*destination_out = zone;
+
+  		spin_unlock(&c->lock);
+  		return 0;
+  	}
+
+  	spin_unlock(&c->lock);
+  	return -ENOSPC;
+}
+
+static int zns_base_allocate_gc_block(struct zns_base_c *c, sector_t *physical_sector,
+  				      struct zns_base_zone **zone_out, unsigned int *slot_out)
+{
+  	struct zns_base_zone *zone;
+  	sector_t zone_end;
+  	int ret;
+
+  	ret = zns_base_get_gc_destination(c, &zone);
+  	if (ret)
+  		return ret;
+
+  	spin_lock(&c->lock);
+
+  	zone_end = zone->start_sector + zone->capacity_sectors;
+
+  	if (zone->state != ZNS_BASE_ZONE_GC_DEST ||
+  	    zone->write_pointer + SECTORS_PER_BLOCK > zone_end) {
+  		spin_unlock(&c->lock);
+  		return -EIO;
+  	}
+
+  	*physical_sector = zone->write_pointer;
+
+  	ret = zns_base_get_zone_slot(c, *physical_sector, zone_out, slot_out);
+  	if (!ret && (*zone_out)->slots[*slot_out].valid)
+  		ret = -EIO;
+
+  	spin_unlock(&c->lock);
+
+  	return ret;
+}
+
+static int zns_base_commit_gc_block(struct zns_base_c *c, struct zns_base_zone *zone,
+  				    sector_t physical_sector)
+{
+  	sector_t zone_end;
+
+  	zone_end = zone->start_sector + zone->capacity_sectors;
+
+  	if (zone->state != ZNS_BASE_ZONE_GC_DEST)
+  		return -EIO;
+
+  	if (zone->write_pointer != physical_sector)
+  		return -EIO;
+
+  	zone->write_pointer += SECTORS_PER_BLOCK;
+
+  	if (zone->write_pointer > zone_end)
+  		return -EIO;
+
+  	if (zone->write_pointer == zone_end) {
+  		zone->state = ZNS_BASE_ZONE_FULL;
+  		c->zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;
+  	}
+
+  	return 0;
+}
+
+static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *victim,
+  				  unsigned int victim_slot)
+{
+  	struct mapping_entry expected_entry;
+  	struct zns_base_zone *new_zone;
+  	struct page *page;
+  	sector_t old_physical_sector;
+  	sector_t new_physical_sector;
+  	size_t logical_block;
+  	unsigned int new_slot;
+  	int ret;
+
+  	/*
+  	 * victim slot과 현재 mapping의 snapshot을 잡는다.
+  	 * lower I/O 중에는 lock을 잡지 않는다.
+  	 */
+  	spin_lock(&c->lock);
+
+  	if (victim->state != ZNS_BASE_ZONE_GC_VICTIM ||
+  	    victim_slot >= victim->nr_blocks ||
+  	    !victim->slots[victim_slot].valid) {
+  		spin_unlock(&c->lock);
+  		return 0;
+  	}
+
+  	logical_block = victim->slots[victim_slot].logical_block;
+  	old_physical_sector = victim->start_sector +
+  		((sector_t)victim_slot * SECTORS_PER_BLOCK);
+
+  	ret = mapping_lookup(c, logical_block, &expected_entry);
+
+  	/*
+  	 * reverse map slot은 valid지만 mapping이 이미 다른 PBA를
+  	 * 가리키면, 이 slot은 stale data다. 복사할 필요가 없다.
+  	 */
+  	if (ret == -ENOENT ||
+  	    (!ret &&
+  	     expected_entry.physical_sector != old_physical_sector)) {
+  		victim->slots[victim_slot].valid = false;
+  		victim->valid_blocks--;
+  		spin_unlock(&c->lock);
+  		return 0;
+  	}
+
+  	if (ret) {
+  		spin_unlock(&c->lock);
+  		return ret;
+  	}
+
+  	spin_unlock(&c->lock);
+
+  	/*
+  	 * GC mapping publish도 MemTable 공간이 필요하다.
+  	 */
+  	ret = mapping_wait_for_write_slot(c);
+  	if (ret)
+  		return ret;
+
+  	ret = zns_base_allocate_gc_block(c, &new_physical_sector,
+  					 &new_zone, &new_slot);
+  	if (ret)
+  		return ret;
+
+  	page = alloc_page(GFP_KERNEL);
+  	if (!page)
+  		return -ENOMEM;
+
+  	ret = zns_base_submit_page(c, page, REQ_OP_READ,
+  				   old_physical_sector);
+  	if (ret)
+  		goto out_free_page;
+
+  	ret = zns_base_submit_page(c, page, REQ_OP_WRITE,
+  				   new_physical_sector);
+  	if (ret)
+  		goto out_free_page;
+
+  	/*
+  	 * lower write 성공 뒤에만 write pointer, mapping,
+  	 * reverse map을 publish한다.
+  	 */
+  	spin_lock(&c->lock);
+
+  	ret = zns_base_commit_gc_block(c, new_zone,
+  				       new_physical_sector);
+  	if (ret){
+		spin_unlock(&c->lock);
+		goto out_free_page;
+	}
+
+  	/*
+  	 * foreground write가 같은 LBA를 갱신했는지 확인한다.
+  	 */
+  	if (!victim->slots[victim_slot].valid){
+  		ret = -ESTALE;
+		
+	}
+	else if(victim->slots[victim_slot].logical_block != logical_block) {
+  		ret = -EIO;
+  	} 
+	else {
+  		ret = mapping_update_if_match(
+  			c, logical_block,
+  			expected_entry.physical_sector,
+  			expected_entry.seq,
+  			new_physical_sector);
+  	}
+
+  	if (!ret) {
+  		new_zone->slots[new_slot].logical_block = logical_block;
+  		new_zone->slots[new_slot].valid = true;
+  		new_zone->valid_blocks++;
+
+  		victim->slots[victim_slot].valid = false;
+  		victim->valid_blocks--;
+  	} else if (ret == -ESTALE) {
+  		/*
+  		 * 새 PBA는 이미 physical zone에 기록됐지만
+  		 * mapping에 연결하지 않는다.
+  		 */
+  		if (victim->slots[victim_slot].valid &&
+  		    victim->slots[victim_slot].logical_block ==
+  		    logical_block) {
+  			victim->slots[victim_slot].valid = false;
+  			victim->valid_blocks--;
+  		}
+
+  		ret = 0;
+  	}
+
+	spin_unlock(&c -> lock);
+
+  out_free_page:
+  	__free_page(page);
+  	return ret;
+}
+
+static int zns_base_reset_victim(struct zns_base_c *c,
+  				 struct zns_base_zone *victim)
+{
+  	int ret;
+
+  	spin_lock(&c->lock);
+
+  	if (victim->state != ZNS_BASE_ZONE_GC_VICTIM ||
+  	    victim->valid_blocks != 0) {
+  		spin_unlock(&c->lock);
+  		return -EIO;
+  	}
+
+  	spin_unlock(&c->lock);
+
+  	/*
+  	 * lower read가 완전히 끝난 뒤에만 reset한다.
+  	 * 여기서는 spinlock을 잡으면 안 된다.
+  	 */
+  	wait_event(victim->read_waitq,
+  		   atomic_read(&victim->inflight_reads) == 0);
+
+  	ret = blkdev_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET,
+  			       victim->start_sector,
+  			       victim->capacity_sectors,
+  			       GFP_KERNEL);
+  	if (ret)
+  		return ret;
+
+  	/*
+  	 * victim은 아직 GC_VICTIM 상태이므로 다른 write가
+  	 * 이 zone을 사용하지 않는다. reset된 slot metadata를 비운다.
+  	 */
+  	memset(victim->slots, 0,
+  	       victim->nr_blocks * sizeof(*victim->slots));
+
+  	spin_lock(&c->lock);
+
+  	victim->write_pointer = victim->start_sector;
+  	victim->valid_blocks = 0;
+  	victim->state = ZNS_BASE_ZONE_FREE;
+
+  	spin_unlock(&c->lock);
+
+  	wake_up_all(&c->gc_waitq);
+  	return 0;
+}
+
+static void zns_base_release_victim(struct zns_base_c *c,
+  				    struct zns_base_zone *victim)
+{
+  	spin_lock(&c->lock);
+
+  	if (victim->state == ZNS_BASE_ZONE_GC_VICTIM)
+  		victim->state = ZNS_BASE_ZONE_FULL;
+
+  	spin_unlock(&c->lock);
+}
+
+static int zns_base_activate_next_zone(struct zns_base_c *c)
+{
+  	unsigned int i;
+  	struct zns_base_zone *zone;
+
+	if (zns_base_count_free_zones(c) <= GC_RESERVE_ZONES)
+  		return -EAGAIN;
+
+  	for (i = 0; i < c->zone_state.nr_zones; i++) {
+  		zone = &c->zone_state.zones[i];
+
+  		if (zone->state != ZNS_BASE_ZONE_FREE)
+  			continue;
+
+  		zone->state = ZNS_BASE_ZONE_ACTIVE;
+  		c->zone_state.active_zone_idx = i;
+  		return 0;
+  	}
+
+  	return -ENOSPC;
+}
+
+static int zns_base_allocate_block(struct zns_base_c *c,
+					  sector_t *physical_sector)
+{
+  	struct zns_base_zone *zone;
+  	sector_t zone_end;
+  	int ret;
+
+  	zone = &c->zone_state.zones[c->zone_state.active_zone_idx];
+  	zone_end = zone->start_sector + zone->capacity_sectors;
+
+  	if (zone->state != ZNS_BASE_ZONE_ACTIVE ||
+  	    zone->write_pointer + SECTORS_PER_BLOCK > zone_end) {
+  		zone->state = ZNS_BASE_ZONE_FULL;
+
+		ret = zns_base_activate_next_zone(c);
+  		if (ret)
+  			return ret;
+
+  		zone = &c->zone_state.zones[c->zone_state.active_zone_idx];
+  	}
+
+  	*physical_sector = zone->write_pointer;
+  	return 0;
+}
+
+static int zns_base_commit_block(struct zns_base_c *c,
+					sector_t physical_sector)
+{
+  	struct zns_base_zone *zone;
+  	sector_t zone_end;
+
+  	zone = &c->zone_state.zones[c->zone_state.active_zone_idx];
+  	zone_end = zone->start_sector + zone->capacity_sectors;
+
+  	if (zone->write_pointer != physical_sector)
+  		return -EIO;
+
+  	zone->write_pointer += SECTORS_PER_BLOCK;
+
+  	if (zone->write_pointer > zone_end)
+  		return -EIO;
+
+  	if (zone->write_pointer == zone_end)
+  		zone->state = ZNS_BASE_ZONE_FULL;
+
+  	return 0;
+}
 
 static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
@@ -968,17 +1891,60 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return ret;
 	}
 
-	c -> next_write_sector = 0;
+	ret = zns_base_zone_init(c);
+	if (ret) {
+		ti->error = "failed to initialize zone metadata";
+		mapping_destroy(c);
+		dm_put_device(ti, c->dev);
+		kfree(c);
+		return ret;
+	}
 
 	INIT_LIST_HEAD(&c -> pending_bios);
 	init_waitqueue_head(&c -> spare_waitq);
+	init_waitqueue_head(&c -> gc_waitq);
+
 	c -> io_work_scheduled = false;
+	c -> gc_scheduled = false;
+	c -> gc_running = false;
+	c->gc_error = 0;
 	c -> stopping = false;
+
+	c->io_wq = alloc_workqueue("zns-base-io",
+  			    WQ_MEM_RECLAIM, 1);
+
+	if (!c->io_wq) {
+		ti->error = "failed to allocate foreground I/O workqueue";
+		zns_base_zone_destroy(c);
+		mapping_destroy(c);
+		dm_put_device(ti, c->dev);
+		kfree(c);
+		return -ENOMEM;
+	}
+
+	c->gc_wq = alloc_workqueue("zns-base-gc",
+					WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
+	if (!c->gc_wq) {
+		ti->error = "failed to allocate GC workqueue";
+		destroy_workqueue(c->io_wq);
+		c->io_wq = NULL;
+		zns_base_zone_destroy(c);
+		mapping_destroy(c);
+		dm_put_device(ti, c->dev);
+		kfree(c);
+		return -ENOMEM;
+	}
 
 	c -> io_pool = mempool_create_kmalloc_pool(IO_POOL_SIZE, sizeof(struct zns_base_io));
 
 	if(!c -> io_pool){
 		ti -> error = "failed to allocate I/O context pool";
+		destroy_workqueue(c->gc_wq);
+		c->gc_wq = NULL;
+		destroy_workqueue(c->io_wq);
+		c->io_wq = NULL;
+
+		zns_base_zone_destroy(c);
 		mapping_destroy(c);
 		dm_put_device(ti, c -> dev);
 		kfree(c);
@@ -986,6 +1952,7 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	INIT_WORK(&c -> io_work, zns_base_io_work);
+	INIT_WORK(&c -> gc_work, zns_base_gc_work);
 
 	ti->private = c;
 	ti->num_flush_bios = 1;
@@ -1005,8 +1972,10 @@ static void zns_base_dtr(struct dm_target *ti)
 	spin_unlock(&c -> lock);
 
 	wake_up_all(&c -> spare_waitq);
+	wake_up_all(&c -> gc_waitq);
 
 	cancel_work_sync(&c -> io_work);
+	cancel_work_sync(&c -> gc_work);
 
 	for(;;){
 		spin_lock(&c -> lock);
@@ -1026,6 +1995,12 @@ static void zns_base_dtr(struct dm_target *ti)
 	mempool_destroy(c -> io_pool);
 	c -> io_pool = NULL;
 
+	destroy_workqueue(c -> gc_wq);
+	c -> gc_wq = NULL;
+	destroy_workqueue(c -> io_wq);
+	c -> io_wq = NULL;
+
+	zns_base_zone_destroy(c);
 	mapping_destroy(c);
 	dm_put_device(ti, c->dev);
 	kfree(c);
