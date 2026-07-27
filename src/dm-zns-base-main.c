@@ -27,6 +27,11 @@ static struct workqueue_struct *zns_wq;
 /* compaction 전용 워크큐 — bio 제출과 큐를 분리해 서로 지연을 안 주게 함 */
 static struct workqueue_struct *zns_compaction_wq;
 
+/* GC 전용 워크큐 — compaction과 별개로 둬서 둘이 서로를 못 기다리게 함
+ * (같은 워크큐를 썼으면 max_active=1이라 GC가 compaction 끝날 때까지, 혹은
+ * 그 반대로 기다려야 했을 것). */
+static struct workqueue_struct *zns_gc_wq;
+
 struct deferred_bio_work {
 	struct work_struct work;
 	struct bio *bio;
@@ -83,6 +88,19 @@ static unsigned int compaction_k = 4;
 module_param(compaction_k, uint, 0444);
 MODULE_PARM_DESC(compaction_k, "number of oldest SSTables merged per compaction run");
 
+/* 여유(FREE) zone 개수가 이 값 이하로 떨어지면 GC 트리거 — USER_DATA zone을
+ * 소비할 때마다 확인(zns_base_map의 WRITE 분기 끝). */
+static unsigned int gc_low_watermark = 2;
+module_param(gc_low_watermark, uint, 0444);
+MODULE_PARM_DESC(gc_low_watermark, "free zone count that triggers GC");
+
+/* free zone 중 마지막 이만큼은 GC_DATA 태그에만 내준다 — GC 자신도 재배치할
+ * zone이 필요한데 USER_DATA/WAL이 여유 zone을 전부 먹으면 GC가 회수를 못 해
+ * 자기순환 데드락에 빠진다. 이 예비분으로 GC는 항상 재배치할 곳을 확보. */
+static unsigned int gc_reserved_zones = 2;
+module_param(gc_reserved_zones, uint, 0444);
+MODULE_PARM_DESC(gc_reserved_zones, "free zones reserved exclusively for GC relocation");
+
 // zone pool
 struct zone_pool {
 	sector_t zone_sectors;
@@ -121,6 +139,7 @@ struct zns_base_c {
 	unsigned int sstables_cap;      // sstables 배열의 현재 용량
 
 	struct work_struct compaction_work;  // compaction_wq에 큐잉되는 백그라운드 작업
+	struct work_struct gc_work;          // gc_wq에 큐잉되는 백그라운드 작업
 
 	spinlock_t 		lock;
 };
@@ -221,10 +240,25 @@ struct zone_header {
 };
 
 /* FREE 태그 zone 하나를 찾아 tag로 배정. wp를 1로 시작하는 이유: 섹터 0은
- * 태그 헤더용으로 예약(실제 헤더는 submit_header_async가 비동기로 씀). */
+ * 태그 헤더용으로 예약(실제 헤더는 submit_header_async가 비동기로 씀).
+ *
+ * GC_DATA가 아닌 태그는 free zone이 gc_reserved_zones개 이하로 남으면
+ * 더 이상 못 가져간다 — 이 마지막 예비분은 GC 자신의 재배치용으로만
+ * 남겨둔다(위 gc_reserved_zones 설명 참고, 자기순환 데드락 방지). */
 static unsigned int zone_pool_acquire_free(struct zone_pool *zp, enum zone_tag tag)
 {
 	unsigned int z;
+
+	if (tag != ZONE_TAG_GC_DATA) {
+		unsigned int free_count = 0;
+
+		for (z = 0; z < zp->nr_zones; z++)
+			if (zp->zone_tag[z] == ZONE_TAG_FREE)
+				free_count++;
+		if (free_count <= gc_reserved_zones)
+			return ZONE_NONE;
+	}
+
 	for (z = 0; z < zp->nr_zones; z++) {
 		if (zp->zone_tag[z] == ZONE_TAG_FREE) {
 			zp->zone_tag[z] = tag;
@@ -284,6 +318,14 @@ static int zone_reset_hw(struct zns_base_c *c, unsigned int zone_id)
  * 호출자가 c->lock을 쥐고 있어야 한다. */
 static void zone_pool_mark_free(struct zone_pool *zp, unsigned int zone_id)
 {
+	/* 대기열이 안 비었다는 건 "아직 안 나간 쓰기가 남은 zone을 회수하려 한다"는
+	 * 뜻 — 회수 대상 판정(dispatch_wp == zone 시작 + wp)이 어딘가에서 빠졌다는
+	 * 신호이고, 그대로 두면 그 waiter들이 옛 좌표계의 phys를 든 채 다음
+	 * 세대의 dispatch_wp와 비교되어 영원히 안 풀리거나 엉뚱한 자리에 발사된다. */
+	if (!list_empty(&zp->dispatch_waiters[zone_id]))
+		DMERR("zone %u reclaimed while dispatch waiters remain — those writes will never complete (reclaim guard missed)",
+		      zone_id);
+
 	zp->wp[zone_id] = 0;
 	/* dispatch_wp는 절대 섹터 좌표계 — 그 zone 자신의 절대 시작 섹터로
 	 * 되돌려야 한다(ctr()의 초기화와 같은 이유, zone_dispatch_gate 참고). */
@@ -374,6 +416,24 @@ static void zone_dispatch_write(struct zns_base_c *c, sector_t phys, sector_t nr
 static void dispatch_fire_complete(void *arg)
 {
 	complete((struct completion *)arg);
+}
+
+static void dispatch_fire_noop(void *arg)
+{
+	/* 취소된 예약 — 실제로 나갈 bio가 없으므로 자리만 넘긴다 */
+}
+
+/* zone_pool_alloc으로 배정은 받았지만 결국 못 내보내게 된 phys를 게이트에서
+ * 건너뛰게 한다. 이걸 안 하면 dispatch_wp가 그 자리에서 영원히 멈춰, 그 zone에
+ * 오는 이후 모든 쓰기가 대기열에 갇혀 절대 완료되지 않는다(= 그 zone을 쓰는
+ * 모든 I/O가 영구 행). 배정 후 실패하는 모든 경로에서 반드시 호출할 것.
+ * 자기 차례면 즉시 dispatch_wp를 넘기고, 아직 앞선 쓰기가 안 나갔으면
+ * "발사돼도 아무것도 안 하는" 대기자로 줄에 서서 순서를 이어준다. */
+static void zone_dispatch_cancel(struct zns_base_c *c, sector_t phys, sector_t nr)
+{
+	if (zone_dispatch_gate(c, phys, nr, dispatch_fire_noop, NULL))
+		DMERR("zone dispatch: out of memory cancelling reservation (zone %u, phys %llu) — this zone's dispatch queue will stall",
+		      zone_of(c->zp, phys), (unsigned long long)phys);
 }
 
 /* zone_dispatch_gate의 블로킹 버전 — compaction처럼 동기(submit_bio_wait)
@@ -749,22 +809,25 @@ static void submit_wal_async(struct zns_io_ctx *ctx)
 	struct wal_record *rec;
 	struct bio *wal_bio;
 	struct page *page;
+	/* bio_endio 이후엔 못 읽으므로 미리 확보 — 실패 경로에서 이 데이터
+	 * 예약분을 취소할 때 필요하다. */
+	sector_t data_nr = bio_sectors(ctx->orig_bio);
 
 	/* 섹터 하나(512B) 전체를 kzalloc — 레코드는 앞 32바이트뿐이지만
 	 * 디바이스에 512B보다 작은 단위로는 쓸 수 없어 나머지는 패딩. */
 	rec = kzalloc(512, GFP_ATOMIC);
-	if (!rec) {
-		ctx->orig_bio->bi_status = BLK_STS_RESOURCE;
-		bio_endio(ctx->orig_bio);
-		kfree(ctx);
-		return;
-	}
+	if (!rec)
+		goto fail;
 	rec->type = WAL_REC_PUT;
 	rec->put.lba = ctx->lba;
 	rec->put.phys = ctx->phys;
 	ctx->wal_buf = rec;
 
 	wal_bio = bio_alloc(GFP_ATOMIC, 1);
+	if (!wal_bio) {
+		kfree(rec);
+		goto fail;
+	}
 	bio_set_dev(wal_bio, c->dev->bdev);
 	wal_bio->bi_iter.bi_sector = ctx->wal_phys;
 	wal_bio->bi_opf = REQ_OP_WRITE;
@@ -773,6 +836,16 @@ static void submit_wal_async(struct zns_io_ctx *ctx)
 	wal_bio->bi_end_io = wal_put_done;
 	wal_bio->bi_private = ctx;
 	zone_dispatch_write(c, ctx->wal_phys, 1, wal_bio);
+	return;
+
+fail:
+	/* 이미 배정받은 WAL/데이터 phys를 게이트에서 건너뛰게 해줘야 해당
+	 * zone들의 dispatch가 여기서 영구히 멈추지 않는다. */
+	zone_dispatch_cancel(c, ctx->wal_phys, 1);
+	zone_dispatch_cancel(c, ctx->phys, data_nr);
+	ctx->orig_bio->bi_status = BLK_STS_RESOURCE;
+	bio_endio(ctx->orig_bio);
+	kfree(ctx);
 }
 
 /* ctx->headers[ctx->header_idx]의 zone 태그 헤더를 비동기로 제출. .map()
@@ -787,21 +860,18 @@ static void submit_header_async(struct zns_io_ctx *ctx)
 	struct page *page;
 
 	hdr = kzalloc(512, GFP_ATOMIC);
-	if (!hdr) {
-		/* 헤더 하나를 못 써도 이 zone의 복원(replay)만 못 하게 될 뿐이라
-		 * 다음 단계로 그냥 진행 */
-		ctx->header_idx++;
-		if (ctx->header_idx < ctx->nr_headers)
-			submit_header_async(ctx);
-		else
-			ctx->on_headers_done(ctx);
-		return;
-	}
+	if (!hdr)
+		goto skip_header;
 	hdr->magic = ZONE_HEADER_MAGIC;
 	hdr->tag = h->tag;
 	ctx->hdr_buf = hdr;
 
 	bio = bio_alloc(GFP_ATOMIC, 1);
+	if (!bio) {
+		kfree(hdr);
+		ctx->hdr_buf = NULL;
+		goto skip_header;
+	}
 	bio_set_dev(bio, c->dev->bdev);
 	bio->bi_iter.bi_sector = (sector_t)h->zone_id * c->zp->zone_sectors;
 	bio->bi_opf = REQ_OP_WRITE;
@@ -812,6 +882,19 @@ static void submit_header_async(struct zns_io_ctx *ctx)
 	/* 헤더는 항상 그 zone의 오프셋 0 — 같은 zone의 다른 WAL/data write보다
 	 * 먼저 dispatch돼야 하므로 zone_dispatch_write를 거친다. */
 	zone_dispatch_write(c, bio->bi_iter.bi_sector, 1, bio);
+	return;
+
+skip_header:
+	/* 헤더 하나를 못 써도 이 zone의 복원(replay)만 못 하게 될 뿐이라 다음
+	 * 단계로 그냥 진행한다 — 단, 섹터 0은 zone_pool_acquire_free가 이미
+	 * 예약(wp=1)해뒀으므로 반드시 취소해줘야 한다. 안 그러면 dispatch_wp가
+	 * zone 시작에서 못 움직여 그 zone 전체가 처음부터 영구히 막힌다. */
+	zone_dispatch_cancel(c, (sector_t)h->zone_id * c->zp->zone_sectors, 1);
+	ctx->header_idx++;
+	if (ctx->header_idx < ctx->nr_headers)
+		submit_header_async(ctx);
+	else
+		ctx->on_headers_done(ctx);
 }
 
 /* 헤더 하나가 durable하게 쓰인 뒤 호출. 남은 헤더가 있으면 이어서,
@@ -1656,8 +1739,13 @@ static void compaction_work_fn(struct work_struct *work)
 			unsigned int zid = zone_of(c->zp, snapshot[i].phys);
 
 			sstable_remove_by_phys(c, snapshot[i].phys);
+			/* 마지막 조건: 아직 발행 안 된 배정분이 남은 zone은 회수
+			 * 대상에서 제외 — gc_select_victim과 같은 이유(배정만 되고
+			 * 아직 안 나간 쓰기가 있는 zone을 reset하면 그 쓰기가 유실되고
+			 * dispatch도 영구히 멈춘다). */
 			if (zones_to_check && c->zp->sstable_live_count[zid] == 0
-			    && zid != c->zp->active_zone[ZONE_TAG_SSTABLE])
+			    && zid != c->zp->active_zone[ZONE_TAG_SSTABLE]
+			    && c->zp->dispatch_wp[zid] == (sector_t)zid * c->zp->zone_sectors + c->zp->wp[zid])
 				zones_to_check[nr_zones_to_check++] = zid;
 		}
 		spin_unlock_irq(&c->lock);
@@ -1690,6 +1778,492 @@ out_free_sources:
 	kfree(discarded);
 out_free_snapshot:
 	kfree(snapshot);
+}
+
+/* ============================================================================
+ * GC (10단계) — 가득 찬 데이터 zone 중 무효 비율이 가장 높은 것을 회수
+ * ============================================================================ */
+
+/* [데이터 흐름] GC가 victim에서 살아있는 lba를 찾을 때 (lba, 지금 phys)만
+ * 담아두는 스냅샷 원소 — memtable/SSTable 스캔 결과를 공용으로 담는다. */
+struct gc_candidate {
+	u64 lba;
+	sector_t phys;
+};
+
+/* [락] 호출자가 c->lock을 쥐고 있어야 한다. */
+static unsigned int gc_count_free_zones(struct zone_pool *zp)
+{
+	unsigned int z, count = 0;
+
+	for (z = 0; z < zp->nr_zones; z++)
+		if (zp->zone_tag[z] == ZONE_TAG_FREE)
+			count++;
+	return count;
+}
+
+/* free zone이 gc_low_watermark 이하로 떨어지면 GC를 큐잉 — zone_pool_alloc
+ * 으로 free zone을 소비할 수 있는 지점(.map()의 WRITE 분기)에서 호출. */
+static void maybe_trigger_gc(struct zns_base_c *c)
+{
+	bool should_gc;
+
+	spin_lock_irq(&c->lock);
+	should_gc = gc_count_free_zones(c->zp) <= gc_low_watermark;
+	spin_unlock_irq(&c->lock);
+
+	if (should_gc)
+		queue_work(zns_gc_wq, &c->gc_work);
+}
+
+/* 닫힌 데이터 zone(USER_DATA/GC_DATA) 중 invalid_count가 가장 큰 것을
+ * victim으로 선정. GC_DATA도 대상 — 재배치한 데이터도 다시 덮어써지면 죽는다.
+ * SSTable/WAL zone은 compaction 전담이라 제외.
+ * 각 continue 조건의 근거는 report/bugfix-log.md 참고.
+ * [락] 이 함수 자체가 잠금. */
+static unsigned int gc_select_victim(struct zns_base_c *c)
+{
+	unsigned int z, victim = ZONE_NONE;
+	unsigned int best_invalid = 0;
+
+	spin_lock_irq(&c->lock);
+	for (z = 0; z < c->zp->nr_zones; z++) {
+		enum zone_tag tag = c->zp->zone_tag[z];
+
+		if (tag != ZONE_TAG_USER_DATA && tag != ZONE_TAG_GC_DATA)
+			continue;
+		/* 아직 쓰는 중인 활성 zone은 대상 아님. "닫힘"을 wp==zone_sectors로
+		 * 판정하면 안 됨 — rollover가 항상 몇 섹터 남기고 넘어가 절대 안 참. */
+		if (z == c->zp->active_zone[tag])
+			continue;
+		if (c->zp->invalid_count[z] == 0)
+			continue;  /* 100% live zone은 회수해도 순증가 0이라 제외 */
+		/* 아직 발행 안 된 배정분이 남은 zone은 건드리면 안 됨 — .map()은 phys를
+		 * 배정만 하고 매핑은 wal_put_done에서야 등록되므로 아래 스캔이 진행 중인
+		 * 쓰기를 못 본다. mapping_put이 dispatch보다 먼저 실행되므로 이 등식이
+		 * "배정분 전부 발행됨 = 전부 memtable에 보임"을 뜻한다(bugfix-log #9). */
+		if (c->zp->dispatch_wp[z] != (sector_t)z * c->zp->zone_sectors + c->zp->wp[z])
+			continue;
+		if (victim == ZONE_NONE || c->zp->invalid_count[z] > best_invalid) {
+			victim = z;
+			best_invalid = c->zp->invalid_count[z];
+		}
+	}
+	spin_unlock_irq(&c->lock);
+	return victim;
+}
+
+/* lba의 현재 진짜 물리 위치를 조회 — memtable 우선, 없으면 SSTable 전체를
+ * 훑어 seq_no 최대. GC가 SSTable에서 찾은 후보가 아직 살아있는지(아니면 이미
+ * 덮어써진 stale entry인지) 검증할 때 쓴다. 못 찾으면 0, 찾으면 1 반환.
+ * [호출 컨텍스트] gc_work_fn 전용 process context(submit_bio_wait 안전). */
+static int gc_lookup_current_phys(struct zns_base_c *c, u64 lba, sector_t *phys_out)
+{
+	struct sstable_info *candidates;
+	unsigned int nr_sst, actual_nr, i;
+	int best_found = 0;
+	u64 best_seq = 0;
+	sector_t best_phys = 0;
+
+	spin_lock_irq(&c->lock);
+	if (mapping_get(c, lba, phys_out)) {
+		spin_unlock_irq(&c->lock);
+		return 1;
+	}
+	nr_sst = c->nr_sstables;
+	spin_unlock_irq(&c->lock);
+
+	if (nr_sst == 0)
+		return 0;
+
+	candidates = kmalloc_array(nr_sst, sizeof(*candidates), GFP_KERNEL);
+	if (!candidates)
+		return 0;
+
+	spin_lock_irq(&c->lock);
+	actual_nr = min(nr_sst, c->nr_sstables);
+	memcpy(candidates, c->sstables, actual_nr * sizeof(*candidates));
+	spin_unlock_irq(&c->lock);
+
+	for (i = 0; i < actual_nr; i++) {
+		struct sstable_info *si = &candidates[i];
+		size_t total_bytes, alloc_bytes;
+		unsigned int nr_pages, p;
+		struct bio *bio;
+		void *buf;
+		size_t remaining;
+		u64 phys;
+		int ret;
+
+		if (lba < si->min_lba || lba > si->max_lba)
+			continue;
+		if (best_found && si->seq_no < best_seq)
+			continue;  /* 이미 더 최신 걸 찾았으면 더 오래된 건 안 읽어도 됨 */
+
+		total_bytes = si->record_count * sizeof(struct sstable_record);
+		alloc_bytes = round_up(total_bytes, PAGE_SIZE);
+		nr_pages = DIV_ROUND_UP(alloc_bytes, PAGE_SIZE);
+
+		buf = kzalloc(alloc_bytes, GFP_KERNEL);
+		if (!buf)
+			continue;
+
+		bio = bio_alloc(GFP_KERNEL, nr_pages);
+		bio_set_dev(bio, c->dev->bdev);
+		bio->bi_iter.bi_sector = si->phys + 1;
+		bio->bi_opf = REQ_OP_READ;
+		remaining = total_bytes;
+		for (p = 0; p < nr_pages; p++) {
+			struct page *page = virt_to_page((char *)buf + p * PAGE_SIZE);
+			size_t len = remaining < PAGE_SIZE ? remaining : PAGE_SIZE;
+
+			bio_add_page(bio, page, len, 0);
+			remaining -= len;
+		}
+		ret = submit_bio_wait(bio);
+		bio_put(bio);
+
+		if (!ret && sstable_binary_search(buf, si->record_count, lba, &phys)) {
+			if (!best_found || si->seq_no > best_seq) {
+				best_found = 1;
+				best_seq = si->seq_no;
+				best_phys = phys;
+			}
+		}
+		kfree(buf);
+	}
+
+	kfree(candidates);
+	if (best_found)
+		*phys_out = best_phys;
+	return best_found;
+}
+
+/* lba의 실제 4KB 데이터를 old_phys에서 읽어 GC 전용 active zone(GC_DATA)에
+ * 새로 쓰고 mapping_put으로 갱신. compaction과 달리 매핑 레코드가 아니라 진짜
+ * 사용자 데이터를 옮긴다. zone 쓰기는 zone_dispatch_wait_turn으로 순서 게이트를
+ * 거친다.
+ * [반환값] 0 성공, 음수면 이번 GC 라운드 전체 중단(호출자가 victim zone을
+ * reset하지 않음 — 아직 못 옮긴 데이터가 있을 수 있으므로 안전 후퇴).
+ * [호출 컨텍스트] gc_work_fn 전용 process context(submit_bio_wait 안전). */
+static int gc_relocate_one(struct zns_base_c *c, u64 lba, sector_t old_phys)
+{
+	void *buf;
+	struct bio *bio;
+	sector_t new_phys;
+	int new_zone = -1;
+	int ret;
+
+	buf = kzalloc(BLOCK_SECTORS * 512, GFP_KERNEL);
+	if (!buf) {
+		DMERR("gc: out of memory relocating lba=%llu, aborting this round",
+		      (unsigned long long)lba);
+		return -ENOMEM;
+	}
+
+	bio = bio_alloc(GFP_KERNEL, 1);
+	bio_set_dev(bio, c->dev->bdev);
+	bio->bi_iter.bi_sector = old_phys;
+	bio->bi_opf = REQ_OP_READ;
+	bio_add_page(bio, virt_to_page(buf), BLOCK_SECTORS * 512, 0);
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+	if (ret) {
+		DMERR("gc: failed to read lba=%llu at phys=%llu (%d), aborting this round",
+		      (unsigned long long)lba, (unsigned long long)old_phys, ret);
+		kfree(buf);
+		return ret;
+	}
+
+	spin_lock_irq(&c->lock);
+	ret = zone_pool_alloc(c->zp, ZONE_TAG_GC_DATA, BLOCK_SECTORS, &new_phys, &new_zone);
+	spin_unlock_irq(&c->lock);
+	if (ret) {
+		DMERR("gc: zone_pool_alloc failed (%d) relocating lba=%llu, aborting this round",
+		      ret, (unsigned long long)lba);
+		kfree(buf);
+		return ret;
+	}
+
+	if (new_zone >= 0) {
+		struct zone_header *zhdr = kzalloc(512, GFP_KERNEL);
+
+		if (!zhdr) {
+			DMERR("gc: out of memory writing zone header (zone %d): recovery for this zone will be broken", new_zone);
+			/* 예약된 섹터 0을 취소하지 않으면 바로 아래
+			 * zone_dispatch_wait_turn(new_phys)이 영원히 블로킹되어
+			 * GC 워커 자체가 멈춘다(→ flush_work/cancel_work_sync 연쇄 행). */
+			zone_dispatch_cancel(c, (sector_t)new_zone * c->zp->zone_sectors, 1);
+		} else {
+			struct bio *hbio = bio_alloc(GFP_KERNEL, 1);
+
+			zhdr->magic = ZONE_HEADER_MAGIC;
+			zhdr->tag = ZONE_TAG_GC_DATA;
+			bio_set_dev(hbio, c->dev->bdev);
+			hbio->bi_iter.bi_sector = (sector_t)new_zone * c->zp->zone_sectors;
+			hbio->bi_opf = REQ_OP_WRITE;
+			bio_add_page(hbio, virt_to_page(zhdr), 512, offset_in_page(zhdr));
+			zone_dispatch_wait_turn(c, hbio->bi_iter.bi_sector, 1);
+			if (submit_bio_wait(hbio))
+				DMERR("gc: zone header write failed (zone %d): recovery for this zone will be broken", new_zone);
+			bio_put(hbio);
+			kfree(zhdr);
+		}
+	}
+
+	bio = bio_alloc(GFP_KERNEL, 1);
+	bio_set_dev(bio, c->dev->bdev);
+	bio->bi_iter.bi_sector = new_phys;
+	bio->bi_opf = REQ_OP_WRITE;
+	bio_add_page(bio, virt_to_page(buf), BLOCK_SECTORS * 512, 0);
+	zone_dispatch_wait_turn(c, new_phys, BLOCK_SECTORS);
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+	kfree(buf);
+	if (ret) {
+		DMERR("gc: failed to write relocated data for lba=%llu (%d), aborting this round",
+		      (unsigned long long)lba, ret);
+		return ret;
+	}
+
+	spin_lock_irq(&c->lock);
+	ret = mapping_put(c, lba, new_phys);
+	spin_unlock_irq(&c->lock);
+	if (ret)
+		DMERR("gc: failed to update mapping for lba=%llu after relocation (%d), aborting this round",
+		      (unsigned long long)lba, ret);
+	return ret;
+}
+
+/* 10단계 GC 본체 — victim 하나를 회수.
+ * victim 선정 → victim zone에 걸친 살아있는 LBA를 memtable(검증 없이 재배치)과
+ * SSTable(gc_lookup_current_phys로 stale 아닌 것만)에서 찾아 gc_relocate_one으로
+ * 옮김 → 전부 성공했을 때만 zone_reset_hw + zone_pool_mark_free로 회수(compaction과
+ * 같은 이유 — 회수는 안전 확인 후 마지막에만).
+ * [반환값] true 회수 성공(zone 하나 free), false 회수할 victim 없음 또는 재배치
+ * 실패(zone reset 안 함, 안전 후퇴) — gc_work_fn이 이걸로 루프 종료를 판단.
+ * [호출 컨텍스트] gc_work_fn(zns_gc_wq 워커) 전용, process context.
+ * [락] 스냅샷/조회/커밋 각각 짧게 잠금, 실제 I/O는 락 밖.
+ * [미해결 race] 재배치 중 사용자가 같은 lba를 덮어쓰면 GC가 옛 값으로
+ * mapping_put을 해 새 값을 되돌릴 수 있다 — 통합 회수-안전 메커니즘 필요
+ * (compaction의 동시 읽기 race와 같은 성격, report/bugfix-log.md 참고). */
+static bool gc_reclaim_one_victim(struct zns_base_c *c)
+{
+	unsigned int victim;
+	sector_t vstart, vend;
+	struct gc_candidate *mt_candidates = NULL;
+	unsigned int nr_mt = 0, mt_cap = 0;
+	struct sstable_info *snapshot = NULL;
+	unsigned int snap_count = 0;
+	struct skiplist_node *node;
+	unsigned int i;
+	bool ok = true;
+	bool reclaimed = false;
+
+	victim = gc_select_victim(c);
+	if (victim == ZONE_NONE)
+		return false;  /* 회수할 만한 zone이 없음 */
+
+	vstart = (sector_t)victim * c->zp->zone_sectors;
+	vend = vstart + c->zp->zone_sectors;
+
+	/* 1) memtable 스냅샷 — 순회 중 mapping_put으로 리스트가 바뀌는 걸
+	 * 피하려고 (lba, phys)만 배열로 복사해둔 뒤 락을 놓는다. */
+	spin_lock_irq(&c->lock);
+	for (node = c->memtable->head->forward[0]; node; node = node->forward[0]) {
+		if (node->phys < vstart || node->phys >= vend)
+			continue;
+		if (nr_mt == mt_cap) {
+			unsigned int new_cap = mt_cap ? mt_cap * 2 : 16;
+			struct gc_candidate *grown = krealloc(mt_candidates,
+							new_cap * sizeof(*grown), GFP_ATOMIC);
+			if (!grown) {
+				ok = false;
+				break;
+			}
+			mt_candidates = grown;
+			mt_cap = new_cap;
+		}
+		mt_candidates[nr_mt].lba = node->lba;
+		mt_candidates[nr_mt].phys = node->phys;
+		nr_mt++;
+	}
+	spin_unlock_irq(&c->lock);
+
+	if (!ok) {
+		DMERR("gc: out of memory snapshotting memtable, aborting this round");
+		goto out_free_mt;
+	}
+
+	for (i = 0; i < nr_mt && ok; i++)
+		ok = (gc_relocate_one(c, mt_candidates[i].lba, mt_candidates[i].phys) == 0);
+
+	if (!ok) {
+		DMERR("gc: relocation failed, aborting this round without resetting victim zone %u", victim);
+		goto out_free_mt;
+	}
+
+	/* 2) SSTable 스냅샷 — 각자 레코드를 읽어 victim zone에 걸친 것만 후보로,
+	 * gc_lookup_current_phys로 "아직도 살아있는 진짜 현재 위치"인지 검증한
+	 * 것만 재배치(그렇지 않으면 이미 다른 곳에서 덮어써진 stale entry). */
+	spin_lock_irq(&c->lock);
+	snap_count = c->nr_sstables;
+	if (snap_count) {
+		snapshot = kmalloc_array(snap_count, sizeof(*snapshot), GFP_ATOMIC);
+		if (!snapshot) {
+			spin_unlock_irq(&c->lock);
+			DMERR("gc: out of memory snapshotting SSTable index, aborting this round");
+			goto out_free_mt;
+		}
+		memcpy(snapshot, c->sstables, snap_count * sizeof(*snapshot));
+	}
+	spin_unlock_irq(&c->lock);
+
+	for (i = 0; i < snap_count && ok; i++) {
+		struct sstable_info *si = &snapshot[i];
+		size_t total_bytes = si->record_count * sizeof(struct sstable_record);
+		size_t alloc_bytes = round_up(total_bytes, PAGE_SIZE);
+		unsigned int nr_pages = DIV_ROUND_UP(alloc_bytes, PAGE_SIZE);
+		struct sstable_record *recs;
+		struct bio *bio;
+		void *buf;
+		size_t remaining;
+		unsigned int p, r;
+		int ret;
+
+		buf = kzalloc(alloc_bytes, GFP_KERNEL);
+		if (!buf) {
+			DMERR("gc: out of memory reading SSTable (seq=%llu), skipping its entries this round",
+			      (unsigned long long)si->seq_no);
+			continue;
+		}
+		bio = bio_alloc(GFP_KERNEL, nr_pages);
+		bio_set_dev(bio, c->dev->bdev);
+		bio->bi_iter.bi_sector = si->phys + 1;
+		bio->bi_opf = REQ_OP_READ;
+		remaining = total_bytes;
+		for (p = 0; p < nr_pages; p++) {
+			struct page *page = virt_to_page((char *)buf + p * PAGE_SIZE);
+			size_t len = remaining < PAGE_SIZE ? remaining : PAGE_SIZE;
+
+			bio_add_page(bio, page, len, 0);
+			remaining -= len;
+		}
+		ret = submit_bio_wait(bio);
+		bio_put(bio);
+		if (ret) {
+			DMERR("gc: failed to read SSTable (seq=%llu, err=%d), skipping its entries this round",
+			      (unsigned long long)si->seq_no, ret);
+			kfree(buf);
+			continue;
+		}
+
+		recs = buf;
+		for (r = 0; r < si->record_count; r++) {
+			sector_t phys = recs[r].phys;
+			sector_t cur_phys;
+
+			if (phys < vstart || phys >= vend)
+				continue;
+			if (!gc_lookup_current_phys(c, recs[r].lba, &cur_phys) || cur_phys != phys)
+				continue;  /* 이미 다른 곳에서 덮어써진 stale entry — 재배치 불필요 */
+			if (gc_relocate_one(c, recs[r].lba, phys)) {
+				ok = false;
+				break;
+			}
+		}
+		kfree(buf);
+	}
+
+	if (!ok) {
+		DMERR("gc: relocation failed, aborting this round without resetting victim zone %u", victim);
+		goto out_free_snapshot;
+	}
+
+	/* 전부 성공 — victim zone에 더 이상 살아있는 데이터가 없다고 확신할
+	 * 수 있으므로 실제로 회수 */
+	if (zone_reset_hw(c, victim)) {
+		DMERR("gc: hardware zone reset failed for zone %u — zone leaked until manually recovered", victim);
+	} else {
+		spin_lock_irq(&c->lock);
+		zone_pool_mark_free(c->zp, victim);
+		spin_unlock_irq(&c->lock);
+		DMINFO("gc: reclaimed zone %u (%u memtable entries relocated)", victim, nr_mt);
+		reclaimed = true;
+	}
+
+out_free_snapshot:
+	kfree(snapshot);
+out_free_mt:
+	kfree(mt_candidates);
+	return reclaimed;
+}
+
+/* zone_pool_alloc을 시도하고, 여유 zone이 없어 실패하면 GC를 한 라운드 돌려
+ * zone을 확보한 뒤 재시도. GC는 백그라운드 비동기라 zone 소진 시점과 회수 시점
+ * 사이의 시차 동안 도착한 쓰기가 억울하게 ENOSPC를 맞는 걸 막는다. free zone이
+ * 전혀 안 늘면 더 해줄 게 없다는 뜻이라 그 시점의 실패를 반환.
+ *
+ * GC 실행은 gc_reclaim_one_victim 직접 호출이 아니라 queue_work+flush_work로
+ * 우회한다 — .map()의 WRITE 분기가 iodepth만큼 동시에 이 경로를 타므로, 직접
+ * 부르면 zns_gc_wq의 max_active=1("GC는 한 번에 하나")이 깨져 여러 스레드가
+ * 같은 victim을 동시에 건드린다(report/bugfix-log.md).
+ * [호출 컨텍스트] .map() WRITE 분기, process context 전용(flush_work가 블로킹).
+ * [반환값] 0 성공, 그 외 zone_pool_alloc 에러코드(보통 -ENOSPC). */
+static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag, sector_t nr,
+					   sector_t *phys_out, int *new_zone_out)
+{
+	int ret;
+	unsigned int attempts;
+	unsigned int prev_free = UINT_MAX;
+
+	spin_lock_irq(&c->lock);
+	ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out);
+	spin_unlock_irq(&c->lock);
+
+	for (attempts = 0; ret && attempts < c->zp->nr_zones; attempts++) {
+		unsigned int free_now;
+
+		queue_work(zns_gc_wq, &c->gc_work);
+		flush_work(&c->gc_work);
+
+		spin_lock_irq(&c->lock);
+		free_now = gc_count_free_zones(c->zp);
+		ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out);
+		spin_unlock_irq(&c->lock);
+
+		if (ret && free_now == prev_free)
+			break;  /* GC를 돌렸는데도 free zone이 안 늘었음 — 더 시도해봤자 소용없음 */
+		prev_free = free_now;
+	}
+	return ret;
+}
+
+/* zns_gc_wq 워커 진입점 — free zone이 watermark 이하인 동안 gc_reclaim_one_victim
+ * 을 반복(한 트리거당 zone 하나만 회수하면 쓰기 속도를 못 따라잡음). false
+ * 반환(victim 없음/재배치 실패) 시 종료.
+ * per-trigger 상한(nr_zones)은 방어용 — victim 선정 로직에 결함이 생겨 무한
+ * 회수 순환에 빠져도(과거 재부팅으로만 복구된 사건) 워커가 반드시 끝나게 한다.
+ * 정상 동작이면 zone당 최대 한 번 회수라 이 상한에 안 걸린다.
+ * [호출 컨텍스트] zns_gc_wq 워커, process context. */
+static void gc_work_fn(struct work_struct *work)
+{
+	struct zns_base_c *c = container_of(work, struct zns_base_c, gc_work);
+	bool still_low;
+	unsigned int rounds;
+
+	for (rounds = 0; rounds < c->zp->nr_zones; rounds++) {
+		if (!gc_reclaim_one_victim(c))
+			break;
+		spin_lock_irq(&c->lock);
+		still_low = gc_count_free_zones(c->zp) <= gc_low_watermark;
+		spin_unlock_irq(&c->lock);
+		if (!still_low)
+			break;
+	}
+	if (rounds == c->zp->nr_zones)
+		DMERR("gc: hit the per-trigger round cap (%u) — free zones may still be low, will retry on next trigger",
+		      c->zp->nr_zones);
 }
 
 static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
@@ -1824,6 +2398,7 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	INIT_WORK(&c->compaction_work, compaction_work_fn);
+	INIT_WORK(&c->gc_work, gc_work_fn);
 
 	spin_lock_init(&c->lock);
 
@@ -1844,6 +2419,7 @@ static void zns_base_dtr(struct dm_target *ti)
 	/* 아직 큐잉/실행 중인 compaction이 있으면 완전히 끝날 때까지 기다린다
 	 * (안 그러면 아래에서 c를 해제한 뒤 use-after-free) */
 	cancel_work_sync(&c->compaction_work);
+	cancel_work_sync(&c->gc_work);
 
 	dm_put_device(ti, c->dev);
 	skiplist_destroy(c->memtable);
@@ -1910,18 +2486,21 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		int new_data_zone, new_wal_zone;
 		struct zns_io_ctx *ctx;
 
-		spin_lock_irq(&c->lock);
-		ret = zone_pool_alloc(c->zp, ZONE_TAG_USER_DATA, nr, &phys, &new_data_zone);
+		ret = zone_pool_alloc_with_gc_retry(c, ZONE_TAG_USER_DATA, nr, &phys, &new_data_zone);
 		if (ret) {
-			spin_unlock_irq(&c->lock);
 			bio->bi_status = BLK_STS_NOSPC;
 			bio_endio(bio);
 			return DM_MAPIO_SUBMITTED;
 		}
 		/* WAL은 별개 zone(태그)에서 항상 1섹터짜리 고정 레코드 하나만 append */
-		ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, 1, &wal_phys, &new_wal_zone);
-		spin_unlock_irq(&c->lock);
+		ret = zone_pool_alloc_with_gc_retry(c, ZONE_TAG_WAL, 1, &wal_phys, &new_wal_zone);
 		if (ret) {
+			/* 데이터 쪽은 이미 배정됐다 — 취소 안 하면 그 zone의
+			 * dispatch가 여기서 영구히 멈춘다(zone pool이 빠듯한
+			 * GC 테스트에서 실제로 가장 걸리기 쉬운 경로). */
+			if (new_data_zone >= 0)
+				zone_dispatch_cancel(c, (sector_t)new_data_zone * c->zp->zone_sectors, 1);
+			zone_dispatch_cancel(c, phys, nr);
 			bio->bi_status = BLK_STS_NOSPC;
 			bio_endio(bio);
 			return DM_MAPIO_SUBMITTED;
@@ -1929,6 +2508,12 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 
 		ctx = kmalloc(sizeof(*ctx), GFP_NOIO);
 		if (!ctx) {
+			if (new_data_zone >= 0)
+				zone_dispatch_cancel(c, (sector_t)new_data_zone * c->zp->zone_sectors, 1);
+			if (new_wal_zone >= 0)
+				zone_dispatch_cancel(c, (sector_t)new_wal_zone * c->zp->zone_sectors, 1);
+			zone_dispatch_cancel(c, phys, nr);
+			zone_dispatch_cancel(c, wal_phys, 1);
 			bio->bi_status = BLK_STS_RESOURCE;
 			bio_endio(bio);
 			return DM_MAPIO_SUBMITTED;
@@ -1961,6 +2546,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 			submit_wal_async(ctx);
 
 		/* 데이터 bio는 아직 안 내보냄 — wal_put_done이 WAL 완료 후 이어서 처리 */
+		maybe_trigger_gc(c);
 		return DM_MAPIO_SUBMITTED;
 	}
 	case REQ_OP_READ: {
@@ -2117,9 +2703,19 @@ static int __init zns_base_init(void)
 		return -ENOMEM;
 	}
 
+	/* GC도 compaction과 같은 이유로 WQ_MEM_RECLAIM 불필요, max_active=1 */
+	zns_gc_wq = alloc_workqueue("dm_zns_base_gc", 0, 1);
+	if (!zns_gc_wq) {
+		DMERR("failed to allocate gc workqueue");
+		destroy_workqueue(zns_compaction_wq);
+		destroy_workqueue(zns_wq);
+		return -ENOMEM;
+	}
+
 	ret = dm_register_target(&zns_base_target);
 	if (ret < 0) {
 		DMERR("target registration failed: %d", ret);
+		destroy_workqueue(zns_gc_wq);
 		destroy_workqueue(zns_compaction_wq);
 		destroy_workqueue(zns_wq);
 	} else {
@@ -2131,6 +2727,7 @@ static int __init zns_base_init(void)
 static void __exit zns_base_exit(void)
 {
 	dm_unregister_target(&zns_base_target);
+	destroy_workqueue(zns_gc_wq);
 	destroy_workqueue(zns_compaction_wq);
 	destroy_workqueue(zns_wq);
 	DMINFO("target unregistered");
