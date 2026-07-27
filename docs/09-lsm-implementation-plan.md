@@ -21,9 +21,10 @@
 | 8단계 SSTable 읽기 경로 | ✅ 완료 |
 | 9단계 compaction | ✅ 완료 (zone 발행 순서 게이트 동반 수정 — 5번째 사건, `report/bugfix-log.md` 참고) |
 | 10단계 GC | ✅ 완료 (GC 로직 정확성 확정 — `test-gc.sh` 50% 시나리오 통과). 단, M3 원 기준인 80%는 WAL zone 회수(13단계) 전까지 산술적으로 도달 불가 — 아래 10단계 "확인" 참고 |
-| 11단계 통합 회귀 테스트 | ⬜ 미착수 |
+| 11단계 통합 회귀 테스트 | 🚧 진행 중 — `test.sh 1~8` 전부 통과(milestone 스크립트로 누적 중) |
 | 12단계 zone 용량 초과 방어(신규) | ⬜ 미착수 |
-| 13단계 WAL zone 회수(신규) | ⬜ 미착수 — **M3 성공 기준(80%) 달성의 전제조건** |
+| 13단계 WAL zone 회수(신규) | ✅ 완료 — generation 순서 replay로 전환 후 회수 구현, `test-wal-reclaim.sh`(milestone 8: 회수 발생 + 회수 후 크래시 복구) 통과 |
+| 14단계 SSTable I/O 크기 상한(신규) | ✅ 완료 — SSTable이 BIO_MAX_VECS(1MB)를 넘겨 bio가 BUG나던 문제. write는 청크 제출, read는 on-disk binary search로 전환 |
 
 ---
 
@@ -201,7 +202,11 @@ mapping_get(lba):
 
 ---
 
-## 13단계 — WAL zone 회수 (신규, 미착수) — M3 80% 기준의 전제조건
+## 13단계 — WAL zone 회수 (신규) ✅ 완료
+
+**구현 결과 요약**: 아래 계획대로, 두 증분으로 나눠 구현했다. (증분 1) zone 헤더에 generation을 넣고 replay를 물리 순서 대신 generation 순서로 전환 — 회수 전이라 동작은 동일해 전체 테스트 통과로 배관만 먼저 검증(커밋 `01bc5a9`). (증분 2) 체크포인트가 durable해지면(`flush_chain_end`의 in-flight 카운터가 0이 될 때 = 발행된 체크포인트 전부 durable, out-of-order 완료 대비) `split_gen`보다 작은 gen의 WAL zone을 전용 워크큐에서 회수. `dispatch_wp == 시작+wp` 가드로 진행 중 쓰기가 남은 zone은 제외. `test-wal-reclaim.sh`(milestone 8: 실제 회수 발생 + 회수로 zone 순서가 뒤섞인 뒤 크래시 복구 hash 일치)로 검증.
+
+아래는 착수 전 계획(기록용) — 대부분 그대로 구현됐고, "부수 개선(WAL batching)"만 M4로 남겨둠.
 
 **착수 조건: 10단계가 50% 시나리오로 통과해서 GC 로직이 맞다는 게 확정된 뒤.** 그 전에 시작하면 "GC가 틀린 건지 공간이 없는 건지"가 다시 섞여서 안 보인다.
 
@@ -220,6 +225,19 @@ mapping_get(lba):
 **부수 개선(선택)**: WAL 레코드는 32B인데 512B 섹터를 통째로 쓰고 있어 **480B(94%)가 패딩으로 낭비**된다. 한 섹터에 16개를 묶으면 오버헤드가 12.5% → 0.78%로 떨어진다. 다만 이건 `CLAUDE.md`에서 M4로 미뤄둔 group commit 이야기라, 13단계에서는 회수만 하고 batching은 별도로 두는 게 범위상 깔끔하다.
 
 **확인**: `scripts/test-gc.sh`를 `FILL_PERCENT=80`으로 돌려 M3 원 기준을 만족하는지. 더불어 `test-crash.sh`가 여전히 통과하는지 반드시 같이 확인(WAL 회수는 crash recovery의 정확성에 직결).
+
+---
+
+## 14단계 — SSTable I/O 크기 상한 (신규) ✅ 완료
+
+13단계 검증 중(낮은 `flush_threshold` + 대용량) compaction이 병합 SSTable을 **하나의 bio로** 쓰다 `nr_vecs > BIO_MAX_VECS`(256페이지=1MB)로 커널 BUG를 냈다(Oops). 병합은 반복될수록 결과가 커지는데(tiered, 크기 상한 없음) bio 한 개는 1MB까지만 담을 수 있어서다. read 경로(`.map`/gc/compaction)도 "SSTable 전체를 통짜 bio + 통짜 할당으로 읽는" 같은 패턴이라 잠재적으로 같은 버그 + 거대 GFP_ATOMIC 할당 + read amplification을 가졌다.
+
+**수정**:
+- **write**(flush/compaction 병합): 버퍼는 `kvmalloc`(수 MB면 vmalloc 폴백), bio는 `sstable_io_sync`(sync) 또는 청크 체인(`submit_sstable_write_async`→`sstable_write_chunk_done`, async)으로 ≤`BIO_MAX_VECS` 페이지씩 순차 제출.
+- **read point lookup**(`.map` READ, gc_lookup): on-disk binary search — 레코드가 고정 16B(512B당 32개)라 필요한 512B 섹터 몇 개만 읽어 O(log n). `.map`은 async라 probe→콜백→다음 probe 상태기계(`sstable_read_probe`/`sstable_probe_done`)로 구현.
+- **read full scan**(compaction merge source, gc victim scan): `kvmalloc` + `sstable_io_sync` 청크 read(전체 레코드가 필요하므로 통짜 대신 청크로).
+
+**남은 한계**: flush 버퍼는 여전히 atomic context(`wal_put_done` 콜백)에서 `kzalloc(GFP_ATOMIC)`로 잡으므로 `flush_threshold`가 매우 크면(수백만) 그 할당 자체가 실패할 수 있다(그 경우 이 세대 flush를 포기하고 데이터는 WAL에 남아 복구 가능 — 크래시 아님). 근본적으론 flush 직렬화를 process context로 옮기거나 memtable을 여러 SSTable로 쪼개는 게 맞지만 현 범위 밖.
 
 ---
 
