@@ -113,6 +113,8 @@ struct zone_pool {
 	unsigned int *invalid_count; 				// zone_id별 무효(죽은) 섹터 수 — GC(M3) victim 선정 근거
 	unsigned int *sstable_live_count; 			// zone_id별 그 zone에 저장된 살아있는 SSTable 개수 — 0이 되면 compaction이 zone을 회수 가능
 	unsigned int active_zone[ZONE_TAG_COUNT]; 	// 태그별 현재 활성 zone
+	u64 *wal_gen; 							// WAL zone에 한해서만 의미 있는 배정 순번(generation) — replay 순서 판정용
+	u64 wal_next_gen; 						// 다음 WAL zone에 부여할 generation (단조 증가, c->lock 하에 증가)
 };
 
 /* zone_dispatch_write() 대기열에 들어가는 항목 하나 — "phys부터 nr섹터를
@@ -179,15 +181,17 @@ struct sstable_info {
 #define WAL_REC_PUT        1
 #define WAL_REC_CHECKPOINT 2
 
-/* 32B 고정(512B/4096B에 나머지 없이 나눠떨어짐). split_phys는 이 체크포인트가
- * 찍힌 "스왑 시점"의 다음 WAL 쓰기 위치(전역 물리 섹터) — replay가 이 값보다
- * 앞선 PUT 레코드는 이미 SSTable에 반영됐다고 보고 건너뛴다. */
+/* 고정 크기(512/4096에 나머지 없이 나눠떨어짐). 체크포인트는 스왑 시점의
+ * WAL 스트림 위치를 (split_gen, split_off) = (활성 WAL zone의 generation,
+ * 그 zone 내 다음 쓰기 오프셋)로 남긴다 — replay가 이 지점보다 앞선 PUT은
+ * 이미 SSTable에 반영됐다고 보고 건너뛴다. 절대 섹터가 아니라 논리 순번을
+ * 쓰는 이유는 WAL zone 회수 후 zone_id 순서 ≠ 기록 순서가 되기 때문. */
 struct wal_record {
 	u32 type;
 	u32 reserved;
 	union {
         struct { u64 lba; u64 phys; } put;
-        struct { u64 seq_no; u64 split_phys; } checkpoint;
+        struct { u64 seq_no; u64 split_gen; u64 split_off; } checkpoint;
     };
 };
 
@@ -195,6 +199,7 @@ struct wal_record {
 struct pending_header {
 	unsigned int zone_id;
 	unsigned int tag;  /* enum zone_tag */
+	u64 gen;           /* WAL zone이면 그 generation, 아니면 0 */
 };
 
 /* .map() WRITE 경로와 SSTable flush 경로가 "(필요하면) 헤더 쓰기 → 본 작업"
@@ -227,7 +232,8 @@ struct zns_io_ctx {
 	sector_t sstable_phys;
 	sector_t sstable_nr_sectors;
 	u64 checkpoint_seq;
-	sector_t checkpoint_split_phys;
+	u64 checkpoint_split_gen;   /* 스왑 시점 활성 WAL zone의 generation */
+	sector_t checkpoint_split_off;  /* 그 zone 내 다음 WAL 쓰기 오프셋 */
 };
 
 /* zone이 새로 태그를 배정받을 때 섹터 0에 기록하는 헤더 — zone_tag[]/wp[]는
@@ -237,6 +243,10 @@ struct zns_io_ctx {
 struct zone_header {
 	u32 magic;
 	u32 tag;  /* enum zone_tag */
+	u64 gen;  /* WAL zone의 배정 순번(generation) — replay 순서 판정용.
+		   * WAL 외 태그에선 무의미(0). WAL zone을 회수하기 시작하면
+		   * zone_id 순서가 곧 기록 순서라는 보장이 깨지므로, 물리 위치
+		   * 대신 이 논리 순번으로 "누가 더 최근 WAL인지"를 판단한다. */
 };
 
 /* FREE 태그 zone 하나를 찾아 tag로 배정. wp를 1로 시작하는 이유: 섹터 0은
@@ -285,6 +295,8 @@ static int zone_pool_alloc(struct zone_pool *zp, enum zone_tag tag, sector_t nr,
 		if (z == ZONE_NONE)
 			return -ENOSPC;
 		zp->active_zone[tag] = z;
+		if (tag == ZONE_TAG_WAL)
+			zp->wal_gen[z] = zp->wal_next_gen++;
 		if (new_zone_out)
 			*new_zone_out = z;
 	}
@@ -294,6 +306,8 @@ static int zone_pool_alloc(struct zone_pool *zp, enum zone_tag tag, sector_t nr,
 		if (z == ZONE_NONE)
 			return -ENOSPC;
 		zp->active_zone[tag] = z;
+		if (tag == ZONE_TAG_WAL)
+			zp->wal_gen[z] = zp->wal_next_gen++;
 		if (new_zone_out)
 			*new_zone_out = z;
 	}
@@ -642,11 +656,12 @@ static void wal_zone_for_each_record(struct zns_base_c *c, unsigned int zone_id,
 struct checkpoint_scan_state {
 	int found;
 	u64 seq_no;
-	sector_t split_phys;
+	u64 split_gen;
+	sector_t split_off;
 };
 
 /* wal_zone_for_each_record 콜백 — CHECKPOINT만 골라 마지막(=가장 최근) 것의
- * seq_no/split_phys를 남긴다. PUT은 적용하지 않고 그냥 지나친다. */
+ * seq_no/split_gen/split_off를 남긴다. PUT은 적용하지 않고 그냥 지나친다. */
 static void checkpoint_scan_cb(void *fn_ctx, struct wal_record *rec, sector_t sector)
 {
 	struct checkpoint_scan_state *st = fn_ctx;
@@ -654,7 +669,8 @@ static void checkpoint_scan_cb(void *fn_ctx, struct wal_record *rec, sector_t se
 	if (rec->type == WAL_REC_CHECKPOINT) {
 		st->found = 1;
 		st->seq_no = rec->checkpoint.seq_no;
-		st->split_phys = rec->checkpoint.split_phys;
+		st->split_gen = rec->checkpoint.split_gen;
+		st->split_off = rec->checkpoint.split_off;
 	}
 }
 
@@ -671,17 +687,32 @@ static void wal_replay_cb(void *fn_ctx, struct wal_record *rec, sector_t sector)
 	}
 }
 
-/* wal_zones[]에 모인 WAL zone들을(zone_id 오름차순 = 할당 순서) 재생한다.
- * 1단계: 최신 zone부터 거꾸로 훑어 마지막 CHECKPOINT를 찾으면 멈춤. 2단계:
- * split_phys(체크포인트가 남긴 스왑 시점의 전역 물리 섹터) 이전 데이터만
- * 가진 zone은 스킵, 걸쳐있는 zone은 그 지점부터, 이후는 전부 재생. */
+/* wal_zones[]에 모인 WAL zone들을 재생한다. 배열은 zone_id 순으로 들어오지만,
+ * WAL zone 회수 후에는 zone_id 순서 ≠ 기록 순서라 여기서 generation
+ * (wal_gen[zone_id]) 오름차순으로 정렬해 논리 순서를 복원한다.
+ * 1단계: generation 큰 zone부터 거꾸로 훑어 마지막 CHECKPOINT를 찾으면 멈춤.
+ * 2단계: 각 zone을 (그 zone의 gen, 오프셋)이 체크포인트의 (split_gen, split_off)
+ * 이전이면 스킵, 같은 gen이면 split_off부터, 이후 gen이면 전부 — generation
+ * 오름차순으로 재생해야 같은 lba의 최신 값이 memtable에 최종 반영된다. */
 static void replay_wal_zones(struct zns_base_c *c, unsigned int *wal_zones, unsigned int count)
 {
-	sector_t split_phys = 0;
+	u64 split_gen = 0;
+	sector_t split_off = 0;
 	u64 ckpt_seq = 0;
 	int found = 0;
-	int i;
+	int i, j;
 
+	/* generation 오름차순 정렬 — count는 zone 수라 작아서 삽입정렬로 충분. */
+	for (i = 1; i < (int)count; i++) {
+		unsigned int key = wal_zones[i];
+		u64 key_gen = c->zp->wal_gen[key];
+
+		for (j = i - 1; j >= 0 && c->zp->wal_gen[wal_zones[j]] > key_gen; j--)
+			wal_zones[j + 1] = wal_zones[j];
+		wal_zones[j + 1] = key;
+	}
+
+	/* 1단계: generation 큰 것부터 거꾸로 — 마지막 체크포인트를 찾으면 멈춤. */
 	for (i = (int)count - 1; i >= 0; i--) {
 		unsigned int zone_id = wal_zones[i];
 		struct checkpoint_scan_state st = { 0 };
@@ -690,28 +721,33 @@ static void replay_wal_zones(struct zns_base_c *c, unsigned int *wal_zones, unsi
 		if (st.found) {
 			found = 1;
 			ckpt_seq = st.seq_no;
-			split_phys = st.split_phys;
+			split_gen = st.split_gen;
+			split_off = st.split_off;
 			break;
 		}
 	}
 
 	if (found)
-		DMINFO("WAL replay: last checkpoint seq=%llu (split_phys=%llu) — skipping WAL entries before it",
-		       (unsigned long long)ckpt_seq, (unsigned long long)split_phys);
+		DMINFO("WAL replay: last checkpoint seq=%llu (split_gen=%llu, split_off=%llu) — skipping WAL entries before it",
+		       (unsigned long long)ckpt_seq, (unsigned long long)split_gen,
+		       (unsigned long long)split_off);
 	else
 		DMINFO("WAL replay: no checkpoint found — replaying all %u WAL zone(s) in full", count);
 
+	/* 2단계: generation 오름차순으로 재생. */
 	for (i = 0; i < (int)count; i++) {
 		unsigned int zone_id = wal_zones[i];
-		sector_t zone_start_phys = (sector_t)zone_id * c->zp->zone_sectors;
+		u64 gen = c->zp->wal_gen[zone_id];
 		sector_t wp = c->zp->wp[zone_id];
 		sector_t start = 1;
 
-		if (zone_start_phys + wp <= split_phys)
-			continue;  /* 이 zone 전체가 split 이전 — 통째로 스킵 */
-
-		if (zone_start_phys < split_phys)
-			start = split_phys - zone_start_phys;  /* split이 걸쳐있는 zone */
+		if (found) {
+			if (gen < split_gen)
+				continue;              /* 이 zone 전체가 체크포인트 이전 */
+			if (gen == split_gen)
+				start = split_off;     /* 걸쳐있는 zone — split 지점부터 */
+			/* gen > split_gen이면 전부 재생(start=1) */
+		}
 
 		wal_zone_for_each_record(c, zone_id, start, wp, wal_replay_cb, c);
 	}
@@ -781,14 +817,21 @@ static int recovery_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
 	 * 영원히 기다리게 된다. */
 	c->zp->dispatch_wp[idx] = (sector_t)idx * c->zp->zone_sectors + real_wp;
 
-	/* 아직 안 꽉 찬 zone이면 그 태그의 활성 zone으로 채택 */
+	/* 아직 안 꽉 찬 zone이면 그 태그의 활성 zone으로 채택 (태그별 non-full
+	 * zone은 유일하므로 zone_id 순서와 무관하게 이 판정이 옳다). */
 	if (real_wp < c->zp->zone_sectors)
 		c->zp->active_zone[hdr.tag] = idx;
 
-	if (hdr.tag == ZONE_TAG_WAL)
+	if (hdr.tag == ZONE_TAG_WAL) {
+		/* generation 복원 — 새 WAL zone이 이어서 더 큰 gen을 받도록
+		 * wal_next_gen도 max(gen)+1로 끌어올린다. */
+		c->zp->wal_gen[idx] = hdr.gen;
+		if (hdr.gen >= c->zp->wal_next_gen)
+			c->zp->wal_next_gen = hdr.gen + 1;
 		rctx->wal_zones[rctx->nr_wal_zones++] = idx;
-	else if (hdr.tag == ZONE_TAG_SSTABLE)
+	} else if (hdr.tag == ZONE_TAG_SSTABLE) {
 		rctx->sstable_zones[rctx->nr_sstable_zones++] = idx;
+	}
 
 	return 0;
 }
@@ -799,7 +842,7 @@ static void sstable_flush_done(struct bio *bio);
 static void submit_checkpoint_async(struct zns_io_ctx *ctx);
 static void checkpoint_write_done(struct bio *bio);
 static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memtable,
-				   u64 seq_no, sector_t wal_split_phys);
+				   u64 seq_no, u64 split_gen, sector_t split_off);
 
 /* WAL PUT 레코드(512B, 앞 32B만 유효) 비동기 제출. process/atomic context
  * 양쪽에서 불리므로 GFP_ATOMIC 필수(GFP_NOIO도 sleep 가능해 안전하지 않음). */
@@ -864,6 +907,7 @@ static void submit_header_async(struct zns_io_ctx *ctx)
 		goto skip_header;
 	hdr->magic = ZONE_HEADER_MAGIC;
 	hdr->tag = h->tag;
+	hdr->gen = h->gen;  /* WAL zone이면 generation, 아니면 0 */
 	ctx->hdr_buf = hdr;
 
 	bio = bio_alloc(GFP_ATOMIC, 1);
@@ -930,7 +974,8 @@ static void wal_put_done(struct bio *wal_bio)
 	sector_t phys = ctx->phys;
 	struct skiplist *flushed_memtable = NULL;
 	u64 flushed_seq = 0;
-	sector_t flushed_wal_split = 0;
+	u64 flushed_split_gen = 0;
+	sector_t flushed_split_off = 0;
 	int ret;
 
 	kfree(ctx->wal_buf);
@@ -957,9 +1002,11 @@ static void wal_put_done(struct bio *wal_bio)
 			flushed_seq = c->next_seq_no++;
 			/* 이 순간 이후 WAL에 쌓이는 레코드는 새 memtable 몫 —
 			 * replay가 "스왑 시점 기준 이전/이후"로 정확히 나누도록
-			 * 체크포인트에 이 위치를 실어둔다. */
-			flushed_wal_split = (sector_t)wal_zone * c->zp->zone_sectors
-					    + c->zp->wp[wal_zone];
+			 * 체크포인트에 이 위치를 (generation, 오프셋)로 실어둔다.
+			 * 절대 섹터가 아니라 논리 순번을 쓰는 이유는 WAL zone 회수
+			 * 후 zone_id 순서 ≠ 기록 순서가 되기 때문. */
+			flushed_split_gen = c->zp->wal_gen[wal_zone];
+			flushed_split_off = c->zp->wp[wal_zone];
 			c->memtable = new_memtable;
 		} else {
 			/* 못 만들면 이번 flush는 건너뛴다 — 다음 put에서 다시 시도됨 */
@@ -977,7 +1024,8 @@ static void wal_put_done(struct bio *wal_bio)
 	/* flush는 fire-and-forget — WAL에 이미 durable하게 기록됐으므로 데이터
 	 * bio가 flush 완료를 기다릴 필요 없다. */
 	if (flushed_memtable)
-		flush_memtable_async(c, flushed_memtable, flushed_seq, flushed_wal_split);
+		flush_memtable_async(c, flushed_memtable, flushed_seq,
+				     flushed_split_gen, flushed_split_off);
 
 	orig->bi_iter.bi_sector = phys;
 	bio_set_dev(orig, c->dev->bdev);
@@ -1059,8 +1107,8 @@ static void sstable_flush_done(struct bio *bio)
 		submit_checkpoint_async(ctx);
 }
 
-/* CHECKPOINT(seq_no, split_phys) 레코드를 비동기로 append — flush 체인의
- * 마지막 단계, GFP_ATOMIC 원칙은 submit_wal_async와 동일. */
+/* CHECKPOINT(seq_no, split_gen, split_off) 레코드를 비동기로 append — flush
+ * 체인의 마지막 단계, GFP_ATOMIC 원칙은 submit_wal_async와 동일. */
 static void submit_checkpoint_async(struct zns_io_ctx *ctx)
 {
 	struct zns_base_c *c = ctx->c;
@@ -1079,7 +1127,8 @@ static void submit_checkpoint_async(struct zns_io_ctx *ctx)
 	}
 	rec->type = WAL_REC_CHECKPOINT;
 	rec->checkpoint.seq_no = ctx->checkpoint_seq;
-	rec->checkpoint.split_phys = ctx->checkpoint_split_phys;
+	rec->checkpoint.split_gen = ctx->checkpoint_split_gen;
+	rec->checkpoint.split_off = ctx->checkpoint_split_off;
 	ctx->wal_buf = rec;
 
 	bio = bio_alloc(GFP_ATOMIC, 1);
@@ -1107,9 +1156,10 @@ static void checkpoint_write_done(struct bio *bio)
 		DMERR("checkpoint write failed (seq=%llu): replay will just do extra work next time, no data lost",
 		      (unsigned long long)ctx->checkpoint_seq);
 	else
-		DMINFO("checkpoint written (seq=%llu, split_phys=%llu)",
+		DMINFO("checkpoint written (seq=%llu, split_gen=%llu, split_off=%llu)",
 		       (unsigned long long)ctx->checkpoint_seq,
-		       (unsigned long long)ctx->checkpoint_split_phys);
+		       (unsigned long long)ctx->checkpoint_split_gen,
+		       (unsigned long long)ctx->checkpoint_split_off);
 
 	skiplist_destroy(ctx->old_memtable);
 	kfree(ctx->old_memtable);
@@ -1156,10 +1206,10 @@ static void submit_sstable_write_async(struct zns_io_ctx *ctx)
 
 /* memtable 하나를 SSTable 한 세대로 직렬화해서 zone에 기록. wal_put_done
  * (atomic context)에서 호출되므로 전부 GFP_ATOMIC. old_memtable은 이미
- * c->memtable에서 떼어져 나온 상태라 락 없이 순회해도 안전. wal_split_phys는
+ * c->memtable에서 떼어져 나온 상태라 락 없이 순회해도 안전. split_gen/off는
  * ctx에 실어 뒷단 체크포인트 레코드에 쓴다. */
 static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memtable,
-				   u64 seq_no, sector_t wal_split_phys)
+				   u64 seq_no, u64 split_gen, sector_t split_off)
 {
 	struct sstable_header *hdr;
 	struct sstable_record *rec;
@@ -1240,7 +1290,8 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 	ctx->sstable_phys = phys;
 	ctx->sstable_nr_sectors = nr_sectors;
 	ctx->checkpoint_seq = seq_no;
-	ctx->checkpoint_split_phys = wal_split_phys;
+	ctx->checkpoint_split_gen = split_gen;
+	ctx->checkpoint_split_off = split_off;
 
 	ctx->nr_headers = 0;
 	if (new_sstable_zone >= 0) {
@@ -2328,6 +2379,13 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return -ENOMEM;
 	}
 
+	c->zp->wal_gen = kcalloc(c->zp->nr_zones, sizeof(u64), GFP_KERNEL);
+	if (!c->zp->wal_gen) {
+		ti->error = "out of memory (wal_gen)";
+		return -ENOMEM;
+	}
+	c->zp->wal_next_gen = 0;
+
 	c->zp->dispatch_wp = kcalloc(c->zp->nr_zones, sizeof(sector_t), GFP_KERNEL);
 	if (!c->zp->dispatch_wp) {
 		ti->error = "out of memory (dispatch_wp)";
@@ -2427,6 +2485,7 @@ static void zns_base_dtr(struct dm_target *ti)
 	kfree(c->sstables);
 	kfree(c->zp->wp);
 	kfree(c->zp->zone_tag);
+	kfree(c->zp->wal_gen);
 	kfree(c->zp->invalid_count);
 	kfree(c->zp->sstable_live_count);
 	if (c->zp->dispatch_waiters) {
@@ -2530,11 +2589,14 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		if (new_data_zone >= 0) {
 			ctx->headers[ctx->nr_headers].zone_id = new_data_zone;
 			ctx->headers[ctx->nr_headers].tag = ZONE_TAG_USER_DATA;
+			ctx->headers[ctx->nr_headers].gen = 0;  /* WAL 아님 */
 			ctx->nr_headers++;
 		}
 		if (new_wal_zone >= 0) {
 			ctx->headers[ctx->nr_headers].zone_id = new_wal_zone;
 			ctx->headers[ctx->nr_headers].tag = ZONE_TAG_WAL;
+			/* 방금 배정된 zone이라 wal_gen[new_wal_zone]은 안정된 값 */
+			ctx->headers[ctx->nr_headers].gen = c->zp->wal_gen[new_wal_zone];
 			ctx->nr_headers++;
 		}
 		ctx->header_idx = 0;
