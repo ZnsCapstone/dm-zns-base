@@ -306,6 +306,14 @@ static int zone_pool_alloc(struct zone_pool *zp, enum zone_tag tag, sector_t nr,
 	if (new_zone_out)
 		*new_zone_out = -1;
 
+	/* 한 요청이 zone 하나에 절대 안 들어가면(nr이 header 뺀 최대 용량 초과)
+	 * 즉시 실패한다 — 안 그러면 아래 while 루프가 free zone을 하나씩 받아
+	 * 태그만 붙이고 못 쓴 채 버리길 반복해, 요청 하나가 pool 전체를
+	 * 낭비시킨다(zone_pool_acquire_free가 ZONE_NONE 낼 때까지). 섹터 0은
+	 * 헤더용이라 zone당 실제 쓸 수 있는 건 zone_sectors-1 섹터. */
+	if (nr > zp->zone_sectors - 1)
+		return -ENOSPC;
+
 	if (z == ZONE_NONE) {
 		z = zone_pool_acquire_free(zp, tag, gc_ctx);
 		if (z == ZONE_NONE)
