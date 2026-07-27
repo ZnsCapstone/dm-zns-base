@@ -266,14 +266,16 @@ struct zone_header {
 /* FREE 태그 zone 하나를 찾아 tag로 배정. wp를 1로 시작하는 이유: 섹터 0은
  * 태그 헤더용으로 예약(실제 헤더는 submit_header_async가 비동기로 씀).
  *
- * GC_DATA가 아닌 태그는 free zone이 gc_reserved_zones개 이하로 남으면
- * 더 이상 못 가져간다 — 이 마지막 예비분은 GC 자신의 재배치용으로만
- * 남겨둔다(위 gc_reserved_zones 설명 참고, 자기순환 데드락 방지). */
-static unsigned int zone_pool_acquire_free(struct zone_pool *zp, enum zone_tag tag)
+ * gc_ctx=false(일반 쓰기/flush/compaction)면 free zone이 gc_reserved_zones개
+ * 이하로 남았을 때 더 못 가져간다 — 이 예비분은 GC 전용이다. GC는 재배치
+ * 데이터(GC_DATA)뿐 아니라 그 재배치를 크래시-안전하게 만드는 WAL 기록에도
+ * zone이 필요하므로, GC 경로는 gc_ctx=true로 이 예비분까지 쓸 수 있다(안 그러면
+ * free zone이 부족할 때 GC가 회수 자체를 못 하는 자기순환 데드락). */
+static unsigned int zone_pool_acquire_free(struct zone_pool *zp, enum zone_tag tag, bool gc_ctx)
 {
 	unsigned int z;
 
-	if (tag != ZONE_TAG_GC_DATA) {
+	if (!gc_ctx) {
 		unsigned int free_count = 0;
 
 		for (z = 0; z < zp->nr_zones; z++)
@@ -297,7 +299,7 @@ static unsigned int zone_pool_acquire_free(struct zone_pool *zp, enum zone_tag t
  * new_zone_out에 이번에 새로 배정된 zone id를 담아준다(없으면 -1) —
  * 호출자가 락 밖에서 그 zone에 태그 헤더를 써야 하기 때문. */
 static int zone_pool_alloc(struct zone_pool *zp, enum zone_tag tag, sector_t nr,
-			    sector_t *phys_out, int *new_zone_out)
+			    sector_t *phys_out, int *new_zone_out, bool gc_ctx)
 {
 	unsigned int z = zp->active_zone[tag];
 
@@ -305,7 +307,7 @@ static int zone_pool_alloc(struct zone_pool *zp, enum zone_tag tag, sector_t nr,
 		*new_zone_out = -1;
 
 	if (z == ZONE_NONE) {
-		z = zone_pool_acquire_free(zp, tag);
+		z = zone_pool_acquire_free(zp, tag, gc_ctx);
 		if (z == ZONE_NONE)
 			return -ENOSPC;
 		zp->active_zone[tag] = z;
@@ -316,7 +318,7 @@ static int zone_pool_alloc(struct zone_pool *zp, enum zone_tag tag, sector_t nr,
 	}
 
 	while (zp->wp[z] + nr > zp->zone_sectors) {
-		z = zone_pool_acquire_free(zp, tag);
+		z = zone_pool_acquire_free(zp, tag, gc_ctx);
 		if (z == ZONE_NONE)
 			return -ENOSPC;
 		zp->active_zone[tag] = z;
@@ -1237,7 +1239,7 @@ static void sstable_flush_complete(struct zns_io_ctx *ctx, blk_status_t status)
 	}
 
 	spin_lock_irq(&c->lock);
-	ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, 1, &wal_phys, &new_wal_zone);
+	ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, 1, &wal_phys, &new_wal_zone, false);
 	spin_unlock_irq(&c->lock);
 	if (ret) {
 		DMERR("checkpoint alloc failed (%d, seq=%llu): replay will just do extra work next time, no data lost",
@@ -1471,7 +1473,7 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 	}
 
 	spin_lock_irq(&c->lock);
-	ret = zone_pool_alloc(c->zp, ZONE_TAG_SSTABLE, nr_sectors, &phys, &new_sstable_zone);
+	ret = zone_pool_alloc(c->zp, ZONE_TAG_SSTABLE, nr_sectors, &phys, &new_sstable_zone, false);
 	spin_unlock_irq(&c->lock);
 	if (ret) {
 		DMERR("SSTable flush: zone_pool_alloc failed (%d, seq=%llu), dropping this generation (data remains in WAL)",
@@ -1884,7 +1886,7 @@ static void compaction_work_fn(struct work_struct *work)
 	memcpy(out_rec, merged, merged_count * sizeof(struct sstable_record));
 
 	spin_lock_irq(&c->lock);
-	ret = zone_pool_alloc(c->zp, ZONE_TAG_SSTABLE, nr_sectors, &new_phys, &new_zone);
+	ret = zone_pool_alloc(c->zp, ZONE_TAG_SSTABLE, nr_sectors, &new_phys, &new_zone, false);
 	spin_unlock_irq(&c->lock);
 	if (ret) {
 		DMERR("compaction: zone_pool_alloc failed (%d), aborting this run — old SSTables remain valid", ret);
@@ -2120,6 +2122,111 @@ static int gc_lookup_current_phys(struct zns_base_c *c, u64 lba, sector_t *phys_
 	return best_found;
 }
 
+/* GC가 512B 버퍼를 phys에 쓰고 durable해질 때까지 블로킹하는 헬퍼.
+ * ★ 반드시 async gate(zone_dispatch_write)로 제출한다 ★ — GC의 WAL 쓰기는
+ * .map과 공유하는 WAL zone으로 가는데, zone_dispatch_wait_turn을 쓰면 그것이
+ * dispatch_wp를 전진시키며 GC를 깨우기만 하고 실제 submit_bio_wait은 그 뒤에
+ * 일어나, 그 사이 드레인되는 뒤따르는 async 쓰기가 디바이스에서 먼저 나가
+ * 순차쓰기 위반(EIO)이 난다(5번째 사건과 동형). async gate로 내보내면 실제
+ * 제출이 zns_wq에서 dispatch 순서대로 일어나고, completion으로 durable까지
+ * 대기한다. [반환값] 0 성공, -EIO 실패. process context 전용. */
+struct gc_gate_write {
+	struct completion done;
+	blk_status_t status;
+};
+
+static void gc_gate_write_end(struct bio *bio)
+{
+	struct gc_gate_write *w = bio->bi_private;
+
+	w->status = bio->bi_status;
+	bio_put(bio);
+	complete(&w->done);
+}
+
+static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512)
+{
+	struct gc_gate_write w;
+	struct bio *bio = bio_alloc(GFP_KERNEL, 1);
+
+	if (!bio) {
+		zone_dispatch_cancel(c, phys, 1);
+		return -ENOMEM;
+	}
+	init_completion(&w.done);
+	w.status = 0;
+	bio_set_dev(bio, c->dev->bdev);
+	bio->bi_iter.bi_sector = phys;
+	bio->bi_opf = REQ_OP_WRITE;
+	bio_add_page(bio, virt_to_page(buf512), 512, offset_in_page(buf512));
+	bio->bi_end_io = gc_gate_write_end;
+	bio->bi_private = &w;
+	zone_dispatch_write(c, phys, 1, bio);  /* async, dispatch 순서대로 제출 */
+	wait_for_completion(&w.done);
+	return w.status ? -EIO : 0;
+}
+
+/* GC 재배치를 크래시에 안전하게 만드는 WAL PUT append.
+ * gc_relocate_one은 데이터를 new_phys에 durable하게 쓴 뒤 mapping_put으로
+ * memtable만 갱신하는데, 그 매핑이 SSTable로 flush되기 전에 크래시가 나면
+ * WAL replay는 옛 위치(old_phys)로 복원하고, 그 옛 위치가 든 victim zone은
+ * 이미 reset돼 데이터가 유실된다. 그래서 일반 쓰기와 똑같이 WAL에
+ * lba->new_phys를 durable하게 남겨, replay가 새 위치로 복원하게 한다.
+ * 반드시 데이터 쓰기가 durable해진 "뒤에" 호출해야 한다. WAL 배정은 GC 전용
+ * 예비 zone도 쓸 수 있게(gc_ctx=true) — 안 그러면 free zone이 부족할 때 GC가
+ * WAL을 못 얻어 회수 자체를 못 하는 데드락에 빠진다.
+ * [반환값] 0 성공. 실패 시 호출자는 이번 라운드를 중단(victim 유지)해야 한다.
+ * [호출 컨텍스트] gc_work_fn 전용 process context. */
+static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys)
+{
+	sector_t wal_phys;
+	int new_wal_zone = -1;
+	struct wal_record *rec;
+	int ret;
+
+	spin_lock_irq(&c->lock);
+	ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, 1, &wal_phys, &new_wal_zone, true);
+	spin_unlock_irq(&c->lock);
+	if (ret)
+		return ret;
+
+	if (new_wal_zone >= 0) {
+		sector_t hdr_phys = (sector_t)new_wal_zone * c->zp->zone_sectors;
+		struct zone_header *zhdr = kzalloc(512, GFP_KERNEL);
+
+		if (!zhdr) {
+			/* 헤더를 못 쓰면 그 zone 섹터 0이 미발행이라, 뒤에 쓸 레코드가
+			 * 디바이스 wp를 위반한다 — 둘 다 취소하고 라운드 중단. */
+			zone_dispatch_cancel(c, hdr_phys, 1);
+			zone_dispatch_cancel(c, wal_phys, 1);
+			return -ENOMEM;
+		}
+		zhdr->magic = ZONE_HEADER_MAGIC;
+		zhdr->tag = ZONE_TAG_WAL;
+		spin_lock_irq(&c->lock);
+		zhdr->gen = c->zp->wal_gen[new_wal_zone];
+		spin_unlock_irq(&c->lock);
+		ret = gc_sync_gate_write(c, hdr_phys, zhdr);
+		kfree(zhdr);
+		if (ret) {
+			zone_dispatch_cancel(c, wal_phys, 1);
+			return ret;
+		}
+	}
+
+	rec = kzalloc(512, GFP_KERNEL);
+	if (!rec) {
+		zone_dispatch_cancel(c, wal_phys, 1);
+		return -ENOMEM;
+	}
+	rec->type = WAL_REC_PUT;
+	rec->put.lba = lba;
+	rec->put.phys = phys;
+	ret = gc_sync_gate_write(c, wal_phys, rec);
+	kfree(rec);
+	return ret;
+}
+
 /* lba의 실제 4KB 데이터를 old_phys에서 읽어 GC 전용 active zone(GC_DATA)에
  * 새로 쓰고 mapping_put으로 갱신. compaction과 달리 매핑 레코드가 아니라 진짜
  * 사용자 데이터를 옮긴다. zone 쓰기는 zone_dispatch_wait_turn으로 순서 게이트를
@@ -2157,7 +2264,7 @@ static int gc_relocate_one(struct zns_base_c *c, u64 lba, sector_t old_phys)
 	}
 
 	spin_lock_irq(&c->lock);
-	ret = zone_pool_alloc(c->zp, ZONE_TAG_GC_DATA, BLOCK_SECTORS, &new_phys, &new_zone);
+	ret = zone_pool_alloc(c->zp, ZONE_TAG_GC_DATA, BLOCK_SECTORS, &new_phys, &new_zone, true);
 	spin_unlock_irq(&c->lock);
 	if (ret) {
 		DMERR("gc: zone_pool_alloc failed (%d) relocating lba=%llu, aborting this round",
@@ -2203,6 +2310,16 @@ static int gc_relocate_one(struct zns_base_c *c, u64 lba, sector_t old_phys)
 	kfree(buf);
 	if (ret) {
 		DMERR("gc: failed to write relocated data for lba=%llu (%d), aborting this round",
+		      (unsigned long long)lba, ret);
+		return ret;
+	}
+
+	/* 데이터가 durable해진 뒤 WAL에 lba->new_phys를 남겨야 크래시 후 replay가
+	 * 옛 위치(곧 reset될 victim) 대신 새 위치로 복원한다. 이게 없으면 재배치
+	 * 매핑이 memtable에만 있어(SSTable flush 전) 크래시 시 유실됐다. */
+	ret = gc_wal_log_put(c, lba, new_phys);
+	if (ret) {
+		DMERR("gc: failed to WAL-log relocation for lba=%llu (%d), aborting this round",
 		      (unsigned long long)lba, ret);
 		return ret;
 	}
@@ -2383,7 +2500,7 @@ static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag
 	unsigned int prev_free = UINT_MAX;
 
 	spin_lock_irq(&c->lock);
-	ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out);
+	ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out, false);
 	spin_unlock_irq(&c->lock);
 
 	for (attempts = 0; ret && attempts < c->zp->nr_zones; attempts++) {
@@ -2394,7 +2511,7 @@ static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag
 
 		spin_lock_irq(&c->lock);
 		free_now = gc_count_free_zones(c->zp);
-		ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out);
+		ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out, false);
 		spin_unlock_irq(&c->lock);
 
 		if (ret && free_now == prev_free)

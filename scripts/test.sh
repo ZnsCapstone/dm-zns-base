@@ -12,7 +12,8 @@
 #                   기준인 80%는 WAL zone 회수(구현계획 13단계) 전까지 산술적으로
 #                   도달 불가, 자세한 계산은 test-gc.sh 헤더 주석 참고)
 #              8  → test-wal-reclaim.sh (WAL zone 회수 + 회수 후 크래시 복구)
-#   (no argument) → runs 1, 2, 3, 4, 5, 6, 7, 8 in order
+#              9  → test-gc-crash.sh (GC 재배치의 크래시 안전성)
+#   (no argument) → runs 1, 2, 3, 4, 5, 6, 7, 8, 9 in order
 #
 # Milestone 0(test-basic.sh)은 no-arg 실행에서 제외 — M1부터 target이 위로
 # conventional(non-zoned) 인터페이스를 내주기로 하면서 .report_zones/
@@ -33,8 +34,8 @@ UNDERLYING=${UNDERLYING:-/dev/nullb0}
 # ── argument check ────────────────────────────────────────────────────────────
 if [ $# -gt 1 ]; then
     echo "Usage: sudo bash scripts/test.sh [<milestone>]" >&2
-    echo "  milestone: 0 (M0), 1 (M1), 2 (M2), 3 (crash-recovery), 4 (checkpoint), 5 (sstable-read), 6 (compaction), 7 (gc), 8 (wal-reclaim)" >&2
-    echo "  omit milestone to run 1, 2, 3, 4, 5, 6, 7, 8 in order" >&2
+    echo "  milestone: 0 (M0), 1 (M1), 2 (M2), 3 (crash-recovery), 4 (checkpoint), 5 (sstable-read), 6 (compaction), 7 (gc), 8 (wal-reclaim), 9 (gc-crash)" >&2
+    echo "  omit milestone to run 1, 2, 3, 4, 5, 6, 7, 8, 9 in order" >&2
     exit 1
 fi
 
@@ -49,18 +50,19 @@ script_for() {
         6) echo "$SCRIPT_DIR/test-compaction.sh" ;;
         7) echo "$SCRIPT_DIR/test-gc.sh" ;;
         8) echo "$SCRIPT_DIR/test-wal-reclaim.sh" ;;
+        9) echo "$SCRIPT_DIR/test-gc-crash.sh" ;;
         *) return 1 ;;
     esac
 }
 
 if [ $# -eq 1 ]; then
     script_for "$1" >/dev/null || {
-        echo "[!] Unknown milestone '$1'. Supported: 0, 1, 2, 3, 4, 5, 6, 7, 8" >&2
+        echo "[!] Unknown milestone '$1'. Supported: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9" >&2
         exit 1
     }
     MILESTONES=("$1")
 else
-    MILESTONES=(1 2 3 4 5 6 7 8)
+    MILESTONES=(1 2 3 4 5 6 7 8 9)
 fi
 
 # ── ensure nullb0 is up ───────────────────────────────────────────────────────
