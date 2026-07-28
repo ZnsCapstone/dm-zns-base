@@ -163,20 +163,22 @@ struct zns_base_c {
 #define SSTABLE_MAGIC 0x53535442U  /* "SSTB" */
 
 /* flush 시 정렬 순서로 이 형태 그대로 기록 — 고정 16B라 offset=i*16으로
- * binary search 가능(8단계에서 사용 예정). */
+ * binary search 가능. ★ 온디스크 포맷이라 필드는 __le(리틀엔디안 고정), 접근 시
+ * cpu_to_le64/le64_to_cpu로 변환한다(이식성 + sparse 검증 가능). */
 struct sstable_record {
-	u64 lba;
-	u64 phys;
+	__le64 lba;
+	__le64 phys;
 };
 
-/* SSTable 한 세대의 첫 섹터에 오는 헤더. min/max_lba는 8단계 조회 필터용. */
+/* SSTable 한 세대의 첫 섹터에 오는 헤더. min/max_lba는 조회 필터용.
+ * ★ 온디스크 포맷 — __le 고정(위 sstable_record 참고). */
 struct sstable_header {
-	u32 magic;
-	u32 reserved;
-	u64 seq_no;
-	u64 record_count;
-	u64 min_lba;
-	u64 max_lba;
+	__le32 magic;
+	__le32 reserved;
+	__le64 seq_no;
+	__le64 record_count;
+	__le64 min_lba;
+	__le64 max_lba;
 };
 
 /* 살아있는 SSTable 하나를 메모리에서 빠르게 찾기 위한 색인 — 헤더 내용을
@@ -199,12 +201,13 @@ struct sstable_info {
  * 그 zone 내 다음 쓰기 오프셋)로 남긴다 — replay가 이 지점보다 앞선 PUT은
  * 이미 SSTable에 반영됐다고 보고 건너뛴다. 절대 섹터가 아니라 논리 순번을
  * 쓰는 이유는 WAL zone 회수 후 zone_id 순서 ≠ 기록 순서가 되기 때문. */
+/* ★ 온디스크 포맷 — __le 고정. 접근 시 cpu_to_le/le_to_cpu로 변환. */
 struct wal_record {
-	u32 type;
-	u32 reserved;
+	__le32 type;
+	__le32 reserved;
 	union {
-        struct { u64 lba; u64 phys; } put;
-        struct { u64 seq_no; u64 split_gen; u64 split_off; } checkpoint;
+        struct { __le64 lba; __le64 phys; } put;
+        struct { __le64 seq_no; __le64 split_gen; __le64 split_off; } checkpoint;
     };
 };
 
@@ -254,10 +257,11 @@ struct zns_io_ctx {
  * 메모리에만 있어서 크래시 시 사라지므로, 재insmod 후 복원의 유일한 단서. */
 #define ZONE_HEADER_MAGIC 0x5A4E5348U  /* "ZNSH" */
 
+/* ★ 온디스크 포맷 — __le 고정. 접근 시 cpu_to_le/le_to_cpu로 변환. */
 struct zone_header {
-	u32 magic;
-	u32 tag;  /* enum zone_tag */
-	u64 gen;  /* WAL zone의 배정 순번(generation) — replay 순서 판정용.
+	__le32 magic;
+	__le32 tag;  /* enum zone_tag */
+	__le64 gen;  /* WAL zone의 배정 순번(generation) — replay 순서 판정용.
 		   * WAL 외 태그에선 무의미(0). WAL zone을 회수하기 시작하면
 		   * zone_id 순서가 곧 기록 순서라는 보장이 깨지므로, 물리 위치
 		   * 대신 이 논리 순번으로 "누가 더 최근 WAL인지"를 판단한다. */
@@ -615,11 +619,11 @@ static int sstable_bsearch_ondisk_sync(struct zns_base_c *c, struct sstable_info
 			last_sector = sec_no;
 		}
 		r = (struct sstable_record *)((char *)sec + off);
-		if (r->lba == lba) {
-			*phys_out = r->phys;
+		if (le64_to_cpu(r->lba) == lba) {
+			*phys_out = le64_to_cpu(r->phys);
 			found = 1;
 			break;
-		} else if (r->lba < lba) {
+		} else if (le64_to_cpu(r->lba) < lba) {
 			lo = mid + 1;
 		} else {
 			hi = mid - 1;
@@ -798,11 +802,11 @@ static void checkpoint_scan_cb(void *fn_ctx, struct wal_record *rec, sector_t se
 {
 	struct checkpoint_scan_state *st = fn_ctx;
 
-	if (rec->type == WAL_REC_CHECKPOINT) {
+	if (le32_to_cpu(rec->type) == WAL_REC_CHECKPOINT) {
 		st->found = 1;
-		st->seq_no = rec->checkpoint.seq_no;
-		st->split_gen = rec->checkpoint.split_gen;
-		st->split_off = rec->checkpoint.split_off;
+		st->seq_no = le64_to_cpu(rec->checkpoint.seq_no);
+		st->split_gen = le64_to_cpu(rec->checkpoint.split_gen);
+		st->split_off = le64_to_cpu(rec->checkpoint.split_off);
 	}
 }
 
@@ -811,10 +815,11 @@ static void wal_replay_cb(void *fn_ctx, struct wal_record *rec, sector_t sector)
 {
 	struct zns_base_c *c = fn_ctx;
 
-	if (rec->type == WAL_REC_PUT) {
+	if (le32_to_cpu(rec->type) == WAL_REC_PUT) {
 		u64 old_phys;
 
-		if (skiplist_upsert(c->memtable, rec->put.lba, rec->put.phys, &old_phys) == 1)
+		if (skiplist_upsert(c->memtable, le64_to_cpu(rec->put.lba),
+				    le64_to_cpu(rec->put.phys), &old_phys) == 1)
 			c->zp->invalid_count[zone_of(c->zp, old_phys)]++;
 	}
 }
@@ -906,15 +911,15 @@ static void scan_sstable_zone(struct zns_base_c *c, unsigned int zone_id, sector
 		struct sstable_header hdr;
 		sector_t data_sectors;
 
-		if (read_sstable_header(c, phys, &hdr) || hdr.magic != SSTABLE_MAGIC)
+		if (read_sstable_header(c, phys, &hdr) || le32_to_cpu(hdr.magic) != SSTABLE_MAGIC)
 			break;  /* 손상되었거나 여기서 SSTable들이 끝남 */
 
-		if (sstable_register(c, phys, hdr.seq_no, hdr.record_count,
-				       hdr.min_lba, hdr.max_lba, GFP_KERNEL))
+		if (sstable_register(c, phys, le64_to_cpu(hdr.seq_no), le64_to_cpu(hdr.record_count),
+				       le64_to_cpu(hdr.min_lba), le64_to_cpu(hdr.max_lba), GFP_KERNEL))
 			DMERR("SSTable scan: out of memory registering zone %u sector %llu",
 			      zone_id, (unsigned long long)cur);
 
-		data_sectors = round_up(hdr.record_count * sizeof(struct sstable_record), 512) / 512;
+		data_sectors = round_up(le64_to_cpu(hdr.record_count) * sizeof(struct sstable_record), 512) / 512;
 		cur += 1 + data_sectors;
 	}
 }
@@ -935,6 +940,8 @@ static int recovery_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
 	struct recovery_scan_ctx *rctx = data;
 	struct zns_base_c *c = rctx->c;
 	struct zone_header hdr;
+	u32 magic, tag;
+	u64 gen;
 	sector_t real_wp;
 	int ret;
 
@@ -942,12 +949,18 @@ static int recovery_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
 		return 0;  /* 한 번도 안 쓰인 zone */
 
 	ret = read_zone_header(c, idx, &hdr);
-	if (ret || hdr.magic != ZONE_HEADER_MAGIC)
+	if (ret)
+		return 0;
+	/* 온디스크는 __le — 여기서 한 번에 CPU 엔디안으로 디코드 */
+	magic = le32_to_cpu(hdr.magic);
+	tag = le32_to_cpu(hdr.tag);
+	gen = le64_to_cpu(hdr.gen);
+	if (magic != ZONE_HEADER_MAGIC)
 		return 0;  /* 헤더 없음/손상 — 이 zone은 복원 대상 아님 */
 
 	real_wp = zone->wp - zone->start;  /* zone 기준 상대 wp */
 
-	c->zp->zone_tag[idx] = hdr.tag;
+	c->zp->zone_tag[idx] = tag;
 	c->zp->wp[idx] = real_wp;
 	/* dispatch_wp도 실제 하드웨어 wp까지 따라잡혀 있어야 한다 — 안 그러면
 	 * 재부팅 후 이 zone의 첫 쓰기가 dispatch_wp의 초기값(zone 시작)을
@@ -957,16 +970,16 @@ static int recovery_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
 	/* 아직 안 꽉 찬 zone이면 그 태그의 활성 zone으로 채택 (태그별 non-full
 	 * zone은 유일하므로 zone_id 순서와 무관하게 이 판정이 옳다). */
 	if (real_wp < c->zp->zone_sectors)
-		c->zp->active_zone[hdr.tag] = idx;
+		c->zp->active_zone[tag] = idx;
 
-	if (hdr.tag == ZONE_TAG_WAL) {
+	if (tag == ZONE_TAG_WAL) {
 		/* generation 복원 — 새 WAL zone이 이어서 더 큰 gen을 받도록
 		 * wal_next_gen도 max(gen)+1로 끌어올린다. */
-		c->zp->wal_gen[idx] = hdr.gen;
-		if (hdr.gen >= c->zp->wal_next_gen)
-			c->zp->wal_next_gen = hdr.gen + 1;
+		c->zp->wal_gen[idx] = gen;
+		if (gen >= c->zp->wal_next_gen)
+			c->zp->wal_next_gen = gen + 1;
 		rctx->wal_zones[rctx->nr_wal_zones++] = idx;
-	} else if (hdr.tag == ZONE_TAG_SSTABLE) {
+	} else if (tag == ZONE_TAG_SSTABLE) {
 		rctx->sstable_zones[rctx->nr_sstable_zones++] = idx;
 	}
 
@@ -1003,9 +1016,9 @@ static void submit_wal_async(struct zns_io_ctx *ctx)
 	rec = kzalloc(512, GFP_ATOMIC);
 	if (!rec)
 		goto fail;
-	rec->type = WAL_REC_PUT;
-	rec->put.lba = ctx->lba;
-	rec->put.phys = ctx->phys;
+	rec->type = cpu_to_le32(WAL_REC_PUT);
+	rec->put.lba = cpu_to_le64(ctx->lba);
+	rec->put.phys = cpu_to_le64(ctx->phys);
 	ctx->wal_buf = rec;
 
 	wal_bio = bio_alloc(GFP_ATOMIC, 1);
@@ -1047,9 +1060,9 @@ static void submit_header_async(struct zns_io_ctx *ctx)
 	hdr = kzalloc(512, GFP_ATOMIC);
 	if (!hdr)
 		goto skip_header;
-	hdr->magic = ZONE_HEADER_MAGIC;
-	hdr->tag = h->tag;
-	hdr->gen = h->gen;  /* WAL zone이면 generation, 아니면 0 */
+	hdr->magic = cpu_to_le32(ZONE_HEADER_MAGIC);
+	hdr->tag = cpu_to_le32(h->tag);
+	hdr->gen = cpu_to_le64(h->gen);  /* WAL zone이면 generation, 아니면 0 */
 	ctx->hdr_buf = hdr;
 
 	bio = bio_alloc(GFP_ATOMIC, 1);
@@ -1222,8 +1235,9 @@ static void sstable_flush_complete(struct zns_io_ctx *ctx, blk_status_t status)
 		/* 이 시점부터 이 SSTable을 읽기 경로에서 찾을 수 있어야 한다 —
 		 * checkpoint를 아직 안 썼어도 데이터 자체는 이미 durable. */
 		spin_lock_irq(&c->lock);
-		rret = sstable_register(c, ctx->sstable_phys, hdr->seq_no, hdr->record_count,
-					  hdr->min_lba, hdr->max_lba, GFP_ATOMIC);
+		rret = sstable_register(c, ctx->sstable_phys, le64_to_cpu(hdr->seq_no),
+					  le64_to_cpu(hdr->record_count),
+					  le64_to_cpu(hdr->min_lba), le64_to_cpu(hdr->max_lba), GFP_ATOMIC);
 		should_compact = !rret && c->nr_sstables >= compaction_k;
 		spin_unlock_irq(&c->lock);
 		if (rret)
@@ -1295,10 +1309,10 @@ static void submit_checkpoint_async(struct zns_io_ctx *ctx)
 		flush_chain_end(c);
 		return;
 	}
-	rec->type = WAL_REC_CHECKPOINT;
-	rec->checkpoint.seq_no = ctx->checkpoint_seq;
-	rec->checkpoint.split_gen = ctx->checkpoint_split_gen;
-	rec->checkpoint.split_off = ctx->checkpoint_split_off;
+	rec->type = cpu_to_le32(WAL_REC_CHECKPOINT);
+	rec->checkpoint.seq_no = cpu_to_le64(ctx->checkpoint_seq);
+	rec->checkpoint.split_gen = cpu_to_le64(ctx->checkpoint_split_gen);
+	rec->checkpoint.split_off = cpu_to_le64(ctx->checkpoint_split_off);
 	ctx->wal_buf = rec;
 
 	bio = bio_alloc(GFP_ATOMIC, 1);
@@ -1464,18 +1478,18 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 	}
 
 	hdr = buf;
-	hdr->magic = SSTABLE_MAGIC;
-	hdr->seq_no = seq_no;
-	hdr->record_count = old_memtable->count;
+	hdr->magic = cpu_to_le32(SSTABLE_MAGIC);
+	hdr->seq_no = cpu_to_le64(seq_no);
+	hdr->record_count = cpu_to_le64(old_memtable->count);
 
 	rec = (struct sstable_record *)((char *)buf + 512);
 	node = old_memtable->head->forward[0];
-	hdr->min_lba = node ? node->lba : 0;
+	hdr->min_lba = cpu_to_le64(node ? node->lba : 0);
 	hdr->max_lba = 0;
 	while (node) {
-		rec[i].lba = node->lba;
-		rec[i].phys = node->phys;
-		hdr->max_lba = node->lba;
+		rec[i].lba = cpu_to_le64(node->lba);
+		rec[i].phys = cpu_to_le64(node->phys);
+		hdr->max_lba = cpu_to_le64(node->lba);
 		node = node->forward[0];
 		i++;
 	}
@@ -1645,15 +1659,15 @@ static void sstable_probe_done(struct bio *bio)
 	}
 	r = (struct sstable_record *)((char *)rctx->sec_buf +
 	    (rctx->bs_mid % per_sec) * sizeof(struct sstable_record));
-	if (r->lba == rctx->lba) {
+	if (le64_to_cpu(r->lba) == rctx->lba) {
 		if (!rctx->best_found || si->seq_no > rctx->best_seq) {
 			rctx->best_found = 1;
 			rctx->best_seq = si->seq_no;
-			rctx->best_phys = r->phys;
+			rctx->best_phys = le64_to_cpu(r->phys);
 		}
 		rctx->idx++;
 		sstable_read_next_candidate(rctx);
-	} else if (r->lba < rctx->lba) {
+	} else if (le64_to_cpu(r->lba) < rctx->lba) {
 		rctx->bs_lo = rctx->bs_mid + 1;
 		sstable_read_probe(rctx);
 	} else {
@@ -1749,9 +1763,9 @@ static u64 merge_sstable_sources(struct compaction_source *srcs, unsigned int nr
 		for (s = 0; s < nr_srcs; s++) {
 			if (srcs[s].idx >= srcs[s].count)
 				continue;
-			if (min_i < 0 || srcs[s].recs[srcs[s].idx].lba < min_lba) {
+			if (min_i < 0 || le64_to_cpu(srcs[s].recs[srcs[s].idx].lba) < min_lba) {
 				min_i = (int)s;
-				min_lba = srcs[s].recs[srcs[s].idx].lba;
+				min_lba = le64_to_cpu(srcs[s].recs[srcs[s].idx].lba);
 			}
 		}
 		if (min_i < 0)
@@ -1762,7 +1776,7 @@ static u64 merge_sstable_sources(struct compaction_source *srcs, unsigned int nr
 		for (s = 0; s < nr_srcs; s++) {
 			if (srcs[s].idx >= srcs[s].count)
 				continue;
-			if (srcs[s].recs[srcs[s].idx].lba != min_lba)
+			if (le64_to_cpu(srcs[s].recs[srcs[s].idx].lba) != min_lba)
 				continue;
 
 			if (best_src < 0 || srcs[s].seq_no > best_seq) {
@@ -1770,15 +1784,15 @@ static u64 merge_sstable_sources(struct compaction_source *srcs, unsigned int nr
 					discarded_out[ndisc++] = best_phys;  /* 이전 최선이 밀려남 */
 				best_src = (int)s;
 				best_seq = srcs[s].seq_no;
-				best_phys = srcs[s].recs[srcs[s].idx].phys;
+				best_phys = le64_to_cpu(srcs[s].recs[srcs[s].idx].phys);
 			} else {
-				discarded_out[ndisc++] = srcs[s].recs[srcs[s].idx].phys;
+				discarded_out[ndisc++] = le64_to_cpu(srcs[s].recs[srcs[s].idx].phys);
 			}
 			srcs[s].idx++;
 		}
 
-		out[out_count].lba = min_lba;
-		out[out_count].phys = best_phys;
+		out[out_count].lba = cpu_to_le64(min_lba);
+		out[out_count].phys = cpu_to_le64(best_phys);
 		out_count++;
 	}
 
@@ -1865,8 +1879,8 @@ static void compaction_work_fn(struct work_struct *work)
 		goto out_free_sources;
 	}
 
-	merged_min_lba = merged[0].lba;
-	merged_max_lba = merged[merged_count - 1].lba;
+	merged_min_lba = le64_to_cpu(merged[0].lba);
+	merged_max_lba = le64_to_cpu(merged[merged_count - 1].lba);
 
 	data_bytes = 512 + round_up(merged_count * sizeof(struct sstable_record), 512);
 	nr_sectors = data_bytes / 512;
@@ -1884,11 +1898,11 @@ static void compaction_work_fn(struct work_struct *work)
 	spin_unlock_irq(&c->lock);
 
 	out_hdr = out_buf;
-	out_hdr->magic = SSTABLE_MAGIC;
-	out_hdr->seq_no = out_seq_no;
-	out_hdr->record_count = merged_count;
-	out_hdr->min_lba = merged_min_lba;
-	out_hdr->max_lba = merged_max_lba;
+	out_hdr->magic = cpu_to_le32(SSTABLE_MAGIC);
+	out_hdr->seq_no = cpu_to_le64(out_seq_no);
+	out_hdr->record_count = cpu_to_le64(merged_count);
+	out_hdr->min_lba = cpu_to_le64(merged_min_lba);
+	out_hdr->max_lba = cpu_to_le64(merged_max_lba);
 
 	out_rec = (struct sstable_record *)((char *)out_buf + 512);
 	memcpy(out_rec, merged, merged_count * sizeof(struct sstable_record));
@@ -1909,8 +1923,8 @@ static void compaction_work_fn(struct work_struct *work)
 		} else {
 			struct bio *hbio = bio_alloc(GFP_KERNEL, 1);
 
-			zhdr->magic = ZONE_HEADER_MAGIC;
-			zhdr->tag = ZONE_TAG_SSTABLE;
+			zhdr->magic = cpu_to_le32(ZONE_HEADER_MAGIC);
+			zhdr->tag = cpu_to_le32(ZONE_TAG_SSTABLE);
 			bio_set_dev(hbio, c->dev->bdev);
 			hbio->bi_iter.bi_sector = (sector_t)new_zone * c->zp->zone_sectors;
 			hbio->bi_opf = REQ_OP_WRITE;
@@ -2209,10 +2223,10 @@ static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys)
 			zone_dispatch_cancel(c, wal_phys, 1);
 			return -ENOMEM;
 		}
-		zhdr->magic = ZONE_HEADER_MAGIC;
-		zhdr->tag = ZONE_TAG_WAL;
+		zhdr->magic = cpu_to_le32(ZONE_HEADER_MAGIC);
+		zhdr->tag = cpu_to_le32(ZONE_TAG_WAL);
 		spin_lock_irq(&c->lock);
-		zhdr->gen = c->zp->wal_gen[new_wal_zone];
+		zhdr->gen = cpu_to_le64(c->zp->wal_gen[new_wal_zone]);
 		spin_unlock_irq(&c->lock);
 		ret = gc_sync_gate_write(c, hdr_phys, zhdr);
 		kfree(zhdr);
@@ -2227,9 +2241,9 @@ static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys)
 		zone_dispatch_cancel(c, wal_phys, 1);
 		return -ENOMEM;
 	}
-	rec->type = WAL_REC_PUT;
-	rec->put.lba = lba;
-	rec->put.phys = phys;
+	rec->type = cpu_to_le32(WAL_REC_PUT);
+	rec->put.lba = cpu_to_le64(lba);
+	rec->put.phys = cpu_to_le64(phys);
 	ret = gc_sync_gate_write(c, wal_phys, rec);
 	kfree(rec);
 	return ret;
@@ -2293,8 +2307,8 @@ static int gc_relocate_one(struct zns_base_c *c, u64 lba, sector_t old_phys)
 		} else {
 			struct bio *hbio = bio_alloc(GFP_KERNEL, 1);
 
-			zhdr->magic = ZONE_HEADER_MAGIC;
-			zhdr->tag = ZONE_TAG_GC_DATA;
+			zhdr->magic = cpu_to_le32(ZONE_HEADER_MAGIC);
+			zhdr->tag = cpu_to_le32(ZONE_TAG_GC_DATA);
 			bio_set_dev(hbio, c->dev->bdev);
 			hbio->bi_iter.bi_sector = (sector_t)new_zone * c->zp->zone_sectors;
 			hbio->bi_opf = REQ_OP_WRITE;
@@ -2450,14 +2464,15 @@ static bool gc_reclaim_one_victim(struct zns_base_c *c)
 
 		recs = buf;
 		for (r = 0; r < si->record_count; r++) {
-			sector_t phys = recs[r].phys;
+			sector_t phys = le64_to_cpu(recs[r].phys);
+			u64 rlba = le64_to_cpu(recs[r].lba);
 			sector_t cur_phys;
 
 			if (phys < vstart || phys >= vend)
 				continue;
-			if (!gc_lookup_current_phys(c, recs[r].lba, &cur_phys) || cur_phys != phys)
+			if (!gc_lookup_current_phys(c, rlba, &cur_phys) || cur_phys != phys)
 				continue;  /* 이미 다른 곳에서 덮어써진 stale entry — 재배치 불필요 */
-			if (gc_relocate_one(c, recs[r].lba, phys)) {
+			if (gc_relocate_one(c, rlba, phys)) {
 				ok = false;
 				break;
 			}
