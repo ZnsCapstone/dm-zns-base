@@ -9,8 +9,13 @@ DM_DEV=/dev/mapper/$DM_NAME
 MOD_NAME=dm-zns-base
 BLOCK_SIZE=4096
 SECTORS_PER_BLOCK=8
-GC_WORKING_SET_MIB=${GC_WORKING_SET_MIB:-128}
+GC_WORKING_SET_MIB=${GC_WORKING_SET_MIB:-0}
 GC_MARKER_MIB=${GC_MARKER_MIB:-4}
+MANIFEST_ZONES=2
+WAL_ZONES=2
+SSTABLE_ZONES=6
+METADATA_ZONES=$((MANIFEST_ZONES + WAL_ZONES + SSTABLE_ZONES))
+GC_RESERVE_ZONES=2
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 SRC_DIR=$(cd "$SCRIPT_DIR/../src" && pwd)
@@ -51,17 +56,27 @@ zone_sectors=$(cat "$queue_dir/chunk_sectors" 2>/dev/null) ||
 	fail "could not read zone size for $UNDERLYING"
 nr_zones=$(cat "$queue_dir/nr_zones" 2>/dev/null) ||
 	fail "could not read zone count for $UNDERLYING"
-physical_mib=$((zone_sectors * nr_zones / 2048))
-gc_marker_offset_mib=$((GC_WORKING_SET_MIB + 16))
-gc_total_mib=${GC_TOTAL_MIB:-$((physical_mib + physical_mib / 2))}
-
 [ "$zone_sectors" -gt 0 ] || fail "$UNDERLYING is not a zoned device"
-[ "$nr_zones" -ge 2 ] || fail "rollover test requires at least two zones"
+[ "$nr_zones" -gt $((METADATA_ZONES + GC_RESERVE_ZONES + 1)) ] ||
+	fail "rollover test requires metadata, GC reserve, and two data zones"
 [ $((zone_sectors % SECTORS_PER_BLOCK)) -eq 0 ] ||
 	fail "zone capacity is not aligned to 4 KiB blocks"
-[ "$gc_total_mib" -gt "$physical_mib" ] ||
-	fail "GC workload must exceed physical capacity"
-[ $((gc_marker_offset_mib + GC_MARKER_MIB)) -lt "$physical_mib" ] ||
+data_zones=$((nr_zones - METADATA_ZONES))
+logical_data_zones=$((data_zones - GC_RESERVE_ZONES))
+sectors=$((logical_data_zones * zone_sectors))
+logical_mib=$((logical_data_zones * zone_sectors / 2048))
+if [ "$GC_WORKING_SET_MIB" -eq 0 ]; then
+	GC_WORKING_SET_MIB=$((logical_mib * 80 / 100))
+fi
+GC_OVERWRITE_MIB=${GC_OVERWRITE_MIB:-$((GC_WORKING_SET_MIB * 12 / 10))}
+gc_marker_offset_mib=$((GC_WORKING_SET_MIB + 16))
+
+[ "$GC_WORKING_SET_MIB" -gt 0 ] || fail "GC working set must be positive"
+[ "$GC_WORKING_SET_MIB" -le "$logical_mib" ] ||
+	fail "GC working set must fit in top logical capacity"
+[ "$GC_OVERWRITE_MIB" -gt "$GC_WORKING_SET_MIB" ] ||
+	fail "GC overwrite amount must exceed the working set"
+[ $((gc_marker_offset_mib + GC_MARKER_MIB)) -lt "$logical_mib" ] ||
 	fail "GC marker range must fit outside the random-write working set"
 
 echo "[*] Building module"
@@ -84,7 +99,6 @@ fi
 echo "[*] insmod $KO_PATH"
 insmod "$KO_PATH" || fail "insmod failed"
 
-sectors=$(blockdev --getsz "$UNDERLYING")
 echo "[*] dmsetup create $DM_NAME"
 echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" ||
 	fail "dmsetup create failed"
@@ -94,11 +108,11 @@ total_bytes=$((block_count * BLOCK_SIZE))
 
 echo
 echo "=== [1/6] underlying zone geometry ==="
-echo "zone sectors=$zone_sectors, zones=$nr_zones, rollover write=$total_bytes bytes"
+echo "zone sectors=$zone_sectors, zones=$nr_zones, data start=$METADATA_ZONES, rollover write=$total_bytes bytes"
 echo "[OK]"
 
 echo
-echo "=== [2/6] write/read across the zone 0 -> zone 1 boundary ==="
+echo "=== [2/6] write/read across the first two data zones ==="
 dd if=/dev/zero bs="$BLOCK_SIZE" count="$block_count" status=none |
 	tr '\000' '\132' > "$TMP_DIR/rollover.bin"
 dd if="$TMP_DIR/rollover.bin" of="$DM_DEV" bs="$BLOCK_SIZE" \
@@ -112,7 +126,7 @@ cmp "$TMP_DIR/rollover.bin" "$TMP_DIR/rollover.read" ||
 echo "[OK]"
 
 echo
-echo "=== [3/6] overwrite maps an old zone 0 block into zone 1 ==="
+echo "=== [3/6] overwrite maps an old block into the next data zone ==="
 dd if=/dev/zero bs="$BLOCK_SIZE" count=1 status=none |
 	tr '\000' '\245' > "$TMP_DIR/overwrite.bin"
 dd if="$TMP_DIR/overwrite.bin" of="$DM_DEV" bs="$BLOCK_SIZE" count=1 \
@@ -133,41 +147,72 @@ cmp "$TMP_DIR/neighbor.expected" "$TMP_DIR/neighbor.read" ||
 echo "[OK]"
 
 echo
-echo "=== [4/6] underlying write pointers show rollover and overwrite ==="
-zone0_wptr_hex=$(zone_wptr 0)
-zone1_wptr_hex=$(zone_wptr "$zone_sectors")
+echo "=== [4/6] metadata is role-isolated; data zones roll over ==="
 
-[ -n "$zone0_wptr_hex" ] || fail "could not parse zone 0 write pointer"
-[ -n "$zone1_wptr_hex" ] || fail "could not parse zone 1 write pointer"
+# A 64 MiB rollover write fills multiple MemTables. Persistent LSM flushes
+# therefore append SSTables and publish a Manifest; this is metadata, not a
+# user-data write leaking into metadata zones.
+manifest_advanced=0
+sstable_advanced=0
+for ((i = 0; i < MANIFEST_ZONES; i++)); do
+	metadata_wptr_hex=$(zone_wptr $((i * zone_sectors)))
+	[ -n "$metadata_wptr_hex" ] || fail "could not parse manifest zone $i write pointer"
+	[ $((metadata_wptr_hex)) -gt 0 ] && manifest_advanced=1
+done
+for ((i = MANIFEST_ZONES + WAL_ZONES; i < METADATA_ZONES; i++)); do
+	metadata_wptr_hex=$(zone_wptr $((i * zone_sectors)))
+	[ -n "$metadata_wptr_hex" ] || fail "could not parse SSTable zone $i write pointer"
+	[ $((metadata_wptr_hex)) -gt 0 ] && sstable_advanced=1
+done
+[ "$manifest_advanced" -eq 1 ] || fail "MemTable flush did not publish a Manifest"
+[ "$sstable_advanced" -eq 1 ] || fail "MemTable flush did not write an SSTable"
 
-zone0_wptr=$((zone0_wptr_hex))
-zone1_wptr=$((zone1_wptr_hex))
-expected_zone0_wptr=$zone_sectors
+# Foreground writes must produce durable WAL pages in the first WAL zone.
+wal_wptr_hex=$(zone_wptr $((MANIFEST_ZONES * zone_sectors)))
+[ -n "$wal_wptr_hex" ] || fail "could not parse WAL zone write pointer"
+[ $((wal_wptr_hex)) -gt 0 ] || fail "WAL zone did not receive WAL records"
+
+data_start_sector=$((METADATA_ZONES * zone_sectors))
+next_data_sector=$((data_start_sector + zone_sectors))
+data0_wptr_hex=$(zone_wptr "$data_start_sector")
+data1_wptr_hex=$(zone_wptr "$next_data_sector")
+
+[ -n "$data0_wptr_hex" ] || fail "could not parse first data zone write pointer"
+[ -n "$data1_wptr_hex" ] || fail "could not parse second data zone write pointer"
+
+data0_wptr=$((data0_wptr_hex))
+data1_wptr=$((data1_wptr_hex))
+expected_data0_wptr=$zone_sectors
 # blkzone report prints the write pointer relative to each zone start.
-expected_zone1_wptr=$((SECTORS_PER_BLOCK * 2))
+expected_data1_wptr=$((SECTORS_PER_BLOCK * 2))
 
-echo "zone 0 wp=$zone0_wptr, expected=$expected_zone0_wptr"
-echo "zone 1 wp=$zone1_wptr, expected=$expected_zone1_wptr"
+echo "data zone $METADATA_ZONES wp=$data0_wptr, expected=$expected_data0_wptr"
+echo "data zone $((METADATA_ZONES + 1)) wp=$data1_wptr, expected=$expected_data1_wptr"
 
-[ "$zone0_wptr" -eq "$expected_zone0_wptr" ] ||
-	fail "zone 0 is not full after rollover write"
-[ "$zone1_wptr" -eq "$expected_zone1_wptr" ] ||
-	fail "zone 1 did not receive rollover and overwrite blocks"
+[ "$data0_wptr" -eq "$expected_data0_wptr" ] ||
+	fail "first data zone is not full after rollover write"
+[ "$data1_wptr" -eq "$expected_data1_wptr" ] ||
+	fail "second data zone did not receive rollover and overwrite blocks"
 echo "[OK]"
 
 echo
-echo "=== [5/6] GC reclaims space during capacity-exceeding random overwrite ==="
+echo "=== [5/6] GC reclaims space during 80% fill and 1.2x random overwrite ==="
 dd if=/dev/urandom of="$TMP_DIR/gc-marker.bin" bs=1M \
 	count="$GC_MARKER_MIB" status=none
 dd if="$TMP_DIR/gc-marker.bin" of="$DM_DEV" bs=1M \
 	seek="$gc_marker_offset_mib" conv=notrunc oflag=direct status=none ||
 	fail "GC marker write failed"
 
-fio --name=gc-overwrite --filename="$DM_DEV" --rw=randwrite \
-	--bs=4k --size="${GC_WORKING_SET_MIB}M" --io_size="${gc_total_mib}M" \
+fio --name=gc-fill --filename="$DM_DEV" --rw=randwrite \
+	--bs=4k --size="${GC_WORKING_SET_MIB}M" --io_size="${GC_WORKING_SET_MIB}M" \
 	--ioengine=libaio --iodepth=32 --direct=1 --group_reporting ||
-	fail "capacity-exceeding random overwrite failed"
-echo "logical overwrite=${gc_total_mib}MiB, physical capacity=${physical_mib}MiB"
+	fail "80% random fill failed"
+
+fio --name=gc-overwrite --filename="$DM_DEV" --rw=randwrite \
+	--bs=4k --size="${GC_WORKING_SET_MIB}M" --io_size="${GC_OVERWRITE_MIB}M" \
+	--ioengine=libaio --iodepth=32 --direct=1 --group_reporting ||
+	fail "1.2x random overwrite failed"
+echo "working set=${GC_WORKING_SET_MIB}MiB (80% of ${logical_mib}MiB), overwrite=${GC_OVERWRITE_MIB}MiB"
 echo "[OK]"
 
 echo

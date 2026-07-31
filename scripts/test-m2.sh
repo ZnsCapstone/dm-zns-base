@@ -13,6 +13,8 @@ SECTOR_SIZE=512
 PARTIAL_READ_LBLOCK=16
 PARTIAL_OVERWRITE_LBLOCK=17
 CROSS_BLOCK_LBLOCK=20
+METADATA_ZONES=10
+GC_RESERVE_ZONES=2
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 SRC_DIR=$(cd "$SCRIPT_DIR/../src" && pwd)
@@ -48,6 +50,17 @@ make_filled_file() {
 
 [ -b "$UNDERLYING" ] || fail "$UNDERLYING is missing. Run scripts/nullblk-up.sh first."
 
+underlying_name=$(basename "$(readlink -f "$UNDERLYING")")
+queue_dir="/sys/block/$underlying_name/queue"
+zone_sectors=$(cat "$queue_dir/chunk_sectors" 2>/dev/null) ||
+	fail "could not read zone size for $UNDERLYING"
+nr_zones=$(cat "$queue_dir/nr_zones" 2>/dev/null) ||
+	fail "could not read zone count for $UNDERLYING"
+[ "$nr_zones" -gt $((METADATA_ZONES + GC_RESERVE_ZONES)) ] ||
+	fail "not enough zones for metadata and GC reserve"
+
+sectors=$(((nr_zones - METADATA_ZONES - GC_RESERVE_ZONES) * zone_sectors))
+
 echo "[*] Building module"
 make -C "$SRC_DIR" >/dev/null || fail "build failed"
 
@@ -58,7 +71,6 @@ if lsmod | grep -q '^dm_zns_base '; then
 fi
 
 if [ "$UNDERLYING" = "/dev/nullb0" ]; then
-	nr_zones=$(cat /sys/block/nullb0/queue/nr_zones)
 	echo "[*] Resetting $UNDERLYING ($nr_zones zones)"
 	blkzone reset -o 0 -c "$nr_zones" "$UNDERLYING" ||
 		fail "failed to reset $UNDERLYING"
@@ -67,7 +79,6 @@ fi
 echo "[*] insmod $KO_PATH"
 insmod "$KO_PATH" || fail "insmod failed"
 
-sectors=$(blockdev --getsz "$UNDERLYING")
 echo "[*] dmsetup create $DM_NAME"
 echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" ||
 	fail "dmsetup create failed"

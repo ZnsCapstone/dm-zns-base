@@ -24,6 +24,8 @@ RANDWRITE_IODEPTH=${RANDWRITE_IODEPTH:-32}
 RANDWRITE_TIMEOUT=${RANDWRITE_TIMEOUT:-90s}
 FSYNC_TEST_OFFSET_MB=${FSYNC_TEST_OFFSET_MB:-384}
 FSYNC_TEST_SIZE_MB=${FSYNC_TEST_SIZE_MB:-16}
+METADATA_ZONES=10
+GC_RESERVE_ZONES=2
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 SRC_DIR=$(cd "$SCRIPT_DIR/../src" && pwd)
@@ -89,6 +91,17 @@ read_range() {
 
 [ -b "$UNDERLYING" ] || fail "$UNDERLYING is missing. Run scripts/nullblk-up.sh first."
 
+underlying_name=$(basename "$(readlink -f "$UNDERLYING")")
+queue_dir="/sys/block/$underlying_name/queue"
+zone_sectors=$(cat "$queue_dir/chunk_sectors" 2>/dev/null) ||
+	fail "could not read zone size for $UNDERLYING"
+nr_zones=$(cat "$queue_dir/nr_zones" 2>/dev/null) ||
+	fail "could not read zone count for $UNDERLYING"
+[ "$nr_zones" -gt $((METADATA_ZONES + GC_RESERVE_ZONES)) ] ||
+	fail "not enough zones for metadata and GC reserve"
+
+sectors=$(((nr_zones - METADATA_ZONES - GC_RESERVE_ZONES) * zone_sectors))
+
 echo "[*] Building module"
 make -C "$SRC_DIR" >/dev/null || fail "build failed"
 
@@ -98,7 +111,6 @@ if lsmod | grep -q '^dm_zns_base '; then
 fi
 
 if [ "$UNDERLYING" = "/dev/nullb0" ]; then
-	nr_zones=$(cat /sys/block/nullb0/queue/nr_zones)
 	echo "[*] Resetting $UNDERLYING ($nr_zones zones)"
 	blkzone reset -o 0 -c "$nr_zones" "$UNDERLYING" ||
 		fail "failed to reset $UNDERLYING"
@@ -107,21 +119,20 @@ fi
 echo "[*] insmod $KO_PATH"
 insmod "$KO_PATH" || fail "insmod failed"
 
-sectors=$(blockdev --getsz "$UNDERLYING")
 echo "[*] dmsetup create $DM_NAME (zns-base on $UNDERLYING, $sectors sectors)"
 echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" || fail "dmsetup create failed"
 
-dm_block=$(basename "$(readlink -f "$DM_DEV")")
+dm_block=$(dmsetup info -C --noheadings -o blkdevname "$DM_NAME" | xargs)
 zoned=$(cat "/sys/block/$dm_block/queue/zoned")
 
 echo
-echo "=== [1/9] top device is conventional ==="
+echo "=== [1/10] top device is conventional ==="
 echo "$DM_DEV -> /dev/$dm_block, zoned=$zoned"
 [ "$zoned" = "none" ] || fail "expected /sys/block/$dm_block/queue/zoned to be none"
 echo "[OK]"
 
 echo
-echo "=== [2/9] first 4 KiB write/read ==="
+echo "=== [2/10] first 4 KiB write/read ==="
 make_block "first-write-logical-block-10" "$TMP_DIR/a.bin"
 write_block "$TMP_DIR/a.bin" 10 || fail "write logical block 10 failed"
 read_block "$TMP_DIR/a.read" 10 || fail "read logical block 10 failed"
@@ -129,7 +140,7 @@ cmp "$TMP_DIR/a.bin" "$TMP_DIR/a.read" || fail "first readback mismatch"
 echo "[OK]"
 
 echo
-echo "=== [3/9] overwrite same logical block ==="
+echo "=== [3/10] overwrite same logical block ==="
 make_block "second-write-logical-block-10" "$TMP_DIR/b.bin"
 write_block "$TMP_DIR/b.bin" 10 || fail "overwrite logical block 10 failed"
 read_block "$TMP_DIR/b.read" 10 || fail "read overwritten logical block 10 failed"
@@ -137,7 +148,7 @@ cmp "$TMP_DIR/b.bin" "$TMP_DIR/b.read" || fail "overwrite readback mismatch"
 echo "[OK]"
 
 echo
-echo "=== [4/9] independent logical blocks ==="
+echo "=== [4/10] independent logical blocks ==="
 for lblock in 0 1 31 32 127; do
 	make_block "logical-block-$lblock" "$TMP_DIR/block-$lblock.bin"
 	write_block "$TMP_DIR/block-$lblock.bin" "$lblock" || fail "write logical block $lblock failed"
@@ -149,21 +160,21 @@ done
 echo "[OK]"
 
 echo
-echo "=== [5/9] MemTable flush, full run readback, and spare reuse ==="
+echo "=== [5/10] MemTable flush, persistent SSTable readback, and spare reuse ==="
 flush_lblock=$((FLUSH_OFFSET_MB * 1024 * 1024 / BLOCK_SIZE))
 make_pattern_file "$TMP_DIR/flush-pattern.bin" "$FLUSH_SIZE_MB"
 
 timeout "$FLUSH_TIMEOUT" fio --name=memtable-flush \
 	--filename="$DM_DEV" --rw=write --bs=$BLOCK_SIZE \
 	--offset="${FLUSH_OFFSET_MB}M" --size="${FLUSH_SIZE_MB}M" \
-	--ioengine=libaio --iodepth=1 --direct=1 \
+	--ioengine=libaio --iodepth=32 --direct=1 \
 	--buffer_pattern=0x5a --group_reporting \
 	>/dev/null || fail "MemTable flush stress write failed or timed out"
 
 read_range "$TMP_DIR/flush-pattern.read" "$FLUSH_OFFSET_MB" "$FLUSH_SIZE_MB" ||
 	fail "full read after MemTable flush stress failed"
 cmp "$TMP_DIR/flush-pattern.bin" "$TMP_DIR/flush-pattern.read" ||
-	fail "full run lookup readback mismatch after MemTable flush stress"
+	fail "persistent SSTable lookup readback mismatch after MemTable flush stress"
 
 make_block "post-flush-overwrite" "$TMP_DIR/flush-overwrite.bin"
 write_block "$TMP_DIR/flush-overwrite.bin" "$((flush_lblock + 123))" ||
@@ -175,37 +186,37 @@ cmp "$TMP_DIR/flush-overwrite.bin" "$TMP_DIR/flush-overwrite.read" ||
 echo "[OK]"
 
 echo
-echo "=== [6/9] newest run wins over an older run ==="
+echo "=== [6/10] newest persistent SSTable wins over an older SSTable ==="
 run_test_lblock=$((RUN_TEST_OFFSET_MB * 1024 * 1024 / BLOCK_SIZE))
 
 make_block "run-old-version" "$TMP_DIR/run-old.bin"
 write_block "$TMP_DIR/run-old.bin" "$run_test_lblock" ||
-	fail "write old run version failed"
+	fail "write old SSTable version failed"
 timeout "$FLUSH_TIMEOUT" fio --name=flush-old-run \
 	--filename="$DM_DEV" --rw=write --bs=$BLOCK_SIZE \
 	--offset=320M --size="${RUN_FILL_SIZE_MB}M" \
 	--ioengine=libaio --iodepth=1 --direct=1 --group_reporting \
-	>/dev/null || fail "failed to flush old run version"
+	>/dev/null || fail "failed to flush old SSTable version"
 sleep "$RUN_FLUSH_WAIT_SECONDS"
 
 make_block "run-new-version" "$TMP_DIR/run-new.bin"
 write_block "$TMP_DIR/run-new.bin" "$run_test_lblock" ||
-	fail "write new run version failed"
+	fail "write new SSTable version failed"
 timeout "$FLUSH_TIMEOUT" fio --name=flush-new-run \
 	--filename="$DM_DEV" --rw=write --bs=$BLOCK_SIZE \
 	--offset=352M --size="${RUN_FILL_SIZE_MB}M" \
 	--ioengine=libaio --iodepth=1 --direct=1 --group_reporting \
-	>/dev/null || fail "failed to flush new run version"
+	>/dev/null || fail "failed to flush new SSTable version"
 sleep "$RUN_FLUSH_WAIT_SECONDS"
 
 read_block "$TMP_DIR/run-new.read" "$run_test_lblock" ||
-	fail "read newest run version failed"
+	fail "read newest SSTable version failed"
 cmp "$TMP_DIR/run-new.bin" "$TMP_DIR/run-new.read" ||
-	fail "older run mapping won over newest run mapping"
+	fail "older SSTable mapping won over newest SSTable mapping"
 echo "[OK]"
 
 echo
-echo "=== [7/9] random 4 KiB writes at iodepth 32 ==="
+echo "=== [7/10] random 4 KiB writes at iodepth 32 ==="
 kernel_errors_before=$(dmesg | grep -c 'blk_update_request: I/O error' || true)
 randwrite_count=$((RANDWRITE_SIZE_MB * 1024 * 1024 / BLOCK_SIZE))
 
@@ -223,7 +234,7 @@ kernel_error_delta=$((kernel_errors_after - kernel_errors_before))
 echo "[OK] $randwrite_count random writes completed without new underlying I/O errors"
 
 echo
-echo "=== [8/9] flush bio pass-through ==="
+echo "=== [8/10] flush bio pass-through ==="
 timeout "$FLUSH_TIMEOUT" fio --name=flush-test \
 	--filename="$DM_DEV" --rw=write --bs=$BLOCK_SIZE \
 	--offset="${FSYNC_TEST_OFFSET_MB}M" --size="${FSYNC_TEST_SIZE_MB}M" \
@@ -232,12 +243,28 @@ timeout "$FLUSH_TIMEOUT" fio --name=flush-test \
 echo "[OK] fsync completed after every 4 KiB write"
 
 echo
-echo "=== [9/9] unmapped read returns zeros ==="
+echo "=== [9/10] unmapped read returns zeros ==="
 dd if=/dev/zero of="$TMP_DIR/unmapped.zero" bs=$BLOCK_SIZE count=1 status=none
 read_block "$TMP_DIR/unmapped.read" 9999 || fail "unmapped read failed"
 cmp "$TMP_DIR/unmapped.zero" "$TMP_DIR/unmapped.read" ||
 	fail "unmapped read was not zero-filled"
 echo "[OK]"
+
+echo
+echo "=== [10/10] target status exposes zone, GC, and metadata state ==="
+status=$(dmsetup status "$DM_NAME") || fail "dmsetup status failed"
+printf '%s\n' "$status" | grep -q 'data_active=' ||
+	fail "status is missing data zone counts"
+printf '%s\n' "$status" | grep -q 'gc_runs=' ||
+	fail "status is missing GC counters"
+printf '%s\n' "$status" | grep -q 'wal_zone=' ||
+	fail "status is missing WAL state"
+printf '%s\n' "$status" | grep -q 'checkpoint_generation=' ||
+	fail "status is missing checkpoint state"
+sstable_count=$(printf '%s\n' "$status" | sed -n 's/.*persistent_sstables=\([0-9][0-9]*\).*/\1/p')
+[ -n "$sstable_count" ] || fail "status is missing persistent SSTable count"
+[ "$sstable_count" -lt 4 ] || fail "SSTable compaction did not reduce the table count: $sstable_count"
+echo "[OK] $status"
 
 echo
 echo "=== ALL M1 CHECKS PASSED ==="
