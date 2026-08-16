@@ -14,6 +14,8 @@
 #include <linux/sort.h>
 #include <linux/list.h>
 #include <linux/completion.h>
+#include <linux/wait.h>
+#include <linux/atomic.h>
 
 #include "skiplist.h"
 
@@ -118,6 +120,8 @@ struct zone_pool {
 	unsigned int active_zone[ZONE_TAG_COUNT]; 	// 태그별 현재 활성 zone
 	u64 *wal_gen; 								// WAL zone에 한해서만 의미 있는 배정 순번(generation) — replay 순서 판정용
 	u64 wal_next_gen; 							// 다음 WAL zone에 부여할 generation (단조 증가, c->lock 하에 증가)
+	atomic_t *inflight_reads;  // zone_id별 진행 중인 읽기 수 — 회수(reset) 전 drain 대기용
+	wait_queue_head_t reclaim_waitq;  // inflight_reads가 0이 되길 기다리는 회수 대기 큐
 };
 
 /* zone_dispatch_write() 대기열에 들어가는 항목 하나 — "phys부터 nr섹터를
@@ -365,6 +369,30 @@ static void zone_pool_mark_free(struct zone_pool *zp, unsigned int zone_id)
 static inline unsigned int zone_of(struct zone_pool *zp, sector_t phys)
 {
 	return phys / zp->zone_sectors;
+}
+
+/* per-bio 데이터 — 이 읽기가 pin한 zone(없으면 -1). zns_base_end_io가 unpin에 씀. */
+struct zns_read_pin {
+	int zone;
+};
+
+/* 회수 안전 참조 카운트 — 진행 중인 읽기가 그 zone을 다 읽을 때까지 GC/compaction의
+ * reset을 미루기 위한 per-zone 카운터. pin(inc)은 읽기가 phys를 확정하는 지점에서
+ * 반드시 c->lock 안에서 해야 회수 측의 "매핑/색인 제거 → drain → reset" 순서와
+ * 맞아 새 읽기가 회수 대상 zone을 못 잡는다(자세한 근거는 report/bugfix-log.md). */
+static inline void zone_read_get(struct zone_pool *zp, unsigned int zid)
+{
+	atomic_inc(&zp->inflight_reads[zid]);
+}
+static inline void zone_read_put(struct zone_pool *zp, unsigned int zid)
+{
+	if (atomic_dec_and_test(&zp->inflight_reads[zid]))
+		wake_up_all(&zp->reclaim_waitq);
+}
+/* reset 직전, 그 zone의 진행 중 읽기가 전부 끝나길 대기 — process context(워커) 전용. */
+static void zone_wait_reads_drained(struct zone_pool *zp, unsigned int zid)
+{
+	wait_event(zp->reclaim_waitq, atomic_read(&zp->inflight_reads[zid]) == 0);
 }
 
 /* zone_id의 dispatch_wp가 phys에 도달하면 fire(arg) 호출, 아니면 대기열에 넣어뒀다가 앞선 쓰기가 dispatch될 때 자동 방출
@@ -656,6 +684,25 @@ static int mapping_put(struct zns_base_c *c, u64 lba, u64 phys)
 static int mapping_get(struct zns_base_c *c, u64 lba, u64 *phys_out)
 {
 	return skiplist_lookup(c->memtable, lba, phys_out);
+}
+
+/* GC 이주 전용 조건부 매핑 갱신 — 이주 사이 사용자가 같은 lba를 덮어써 memtable이
+ * 이미 새 값을 갖게 됐으면(현재값 != expected_old) 갱신을 포기하고 이주본(new_phys)을
+ * 무효로 표시한다(최신값을 옛 값으로 되돌리지 않기 위함). memtable에 lba가 없으면
+ * 현재값이 SSTable의 expected_old이므로 정상 이주로 보고 삽입.
+ * 호출자가 c->lock 보유. [반환값] 0 이주 반영, 1 경합으로 스킵(둘 다 GC엔 정상), <0 오류.
+ * [한계] memtable 갱신만 — 이미 durable한 gc_wal_log_put 레코드는 못 되돌리므로, 스킵
+ * 직전 크래시 시 replay가 이주본을 되살릴 수 있다(완전 해결은 per-entry seq 필요). */
+static int mapping_put_if_match(struct zns_base_c *c, u64 lba,
+				u64 expected_old, u64 new_phys)
+{
+	u64 cur;
+
+	if (mapping_get(c, lba, &cur) && cur != expected_old) {
+		c->zp->invalid_count[zone_of(c->zp, new_phys)]++;
+		return 1;
+	}
+	return mapping_put(c, lba, new_phys);
 }
 
 /* c->sstables[]에 SSTable 하나를 등록, 필요하면 배열을 2배로 키운다.
@@ -1513,10 +1560,26 @@ static void sstable_probe_done(struct bio *bio);
 static void sstable_read_finish(struct sstable_read_ctx *rctx)
 {
 	struct bio *orig = rctx->orig_bio;
+	struct zns_base_c *c = rctx->c;
+	unsigned int i;
 
 	if (rctx->best_found) {
-		orig->bi_iter.bi_sector = rctx->best_phys + rctx->offset_in_block;
-		bio_set_dev(orig, rctx->c->dev->bdev);
+		struct zns_read_pin *pin = dm_per_bio_data(orig, sizeof(*pin));
+		sector_t best_phys = rctx->best_phys;
+		u64 cur;
+
+		/* best_phys(SSTable가 준 위치)를 읽기 직전, 그 사이 GC가 이 lba를 옮겼는지
+		 * 락 안에서 재확인 — 옮겼으면 memtable의 새 위치를 쓴다(TOCTOU). 그리고 실제
+		 * 읽을 데이터 zone을 pin(end_io가 unpin)해 GC가 그 사이 reset 못하게 한다. */
+		spin_lock_irq(&c->lock);
+		if (mapping_get(c, rctx->lba, &cur))
+			best_phys = cur;
+		pin->zone = zone_of(c->zp, best_phys);
+		zone_read_get(c->zp, pin->zone);
+		spin_unlock_irq(&c->lock);
+
+		orig->bi_iter.bi_sector = best_phys + rctx->offset_in_block;
+		bio_set_dev(orig, c->dev->bdev);
 		submit_bio_deferred(orig);
 	} else {
 		/* 후보 SSTable들의 min/max_lba 범위엔 들었지만 실제 레코드는
@@ -1524,6 +1587,9 @@ static void sstable_read_finish(struct sstable_read_ctx *rctx)
 		zero_fill_bio(orig);
 		bio_endio(orig);
 	}
+	/* probe 동안 잡아둔 SSTable zone pin 전부 해제 */
+	for (i = 0; i < rctx->nr_candidates; i++)
+		zone_read_put(c->zp, zone_of(c->zp, rctx->candidates[i].phys));
 	kfree(rctx->sec_buf);
 	kfree(rctx->candidates);
 	kfree(rctx);
@@ -1799,8 +1865,10 @@ static void compaction_work_fn(struct work_struct *work)
 		total_input_records += snapshot[i].record_count;
 	}
 
-	merged = kzalloc(round_up(total_input_records * sizeof(struct sstable_record), 512), GFP_KERNEL);
-	discarded = kmalloc_array(total_input_records ? total_input_records : 1, sizeof(*discarded), GFP_KERNEL);
+	/* process context라 kvmalloc(vmalloc 폴백) 사용 — 병합 버퍼는 수십 MB까지
+	 * 커질 수 있어 물리 연속 kzalloc은 실패한다(out_buf/srcs[].recs와 동일 방식). */
+	merged = kvzalloc(round_up(total_input_records * sizeof(struct sstable_record), 512), GFP_KERNEL);
+	discarded = kvmalloc_array(total_input_records ? total_input_records : 1, sizeof(*discarded), GFP_KERNEL);
 	if (!merged || !discarded) {
 		DMERR("compaction: out of memory allocating merge buffers, aborting this run");
 		goto out_free_sources;
@@ -1926,6 +1994,8 @@ static void compaction_work_fn(struct work_struct *work)
 		for (i = 0; i < nr_zones_to_check; i++) {
 			unsigned int zid = zones_to_check[i];
 
+			/* reset 직전, 이 SSTable zone을 읽는 중인 읽기(read pin)가 전부 끝나길 대기 */
+			zone_wait_reads_drained(c->zp, zid);
 			if (zone_reset_hw(c, zid)) {
 				DMERR("compaction: hardware zone reset failed for zone %u — zone leaked until manually recovered", zid);
 				continue;
@@ -1943,8 +2013,8 @@ out_free_sources:
 	for (i = 0; i < k; i++)
 		kvfree(srcs[i].recs);
 	kfree(srcs);
-	kfree(merged);
-	kfree(discarded);
+	kvfree(merged);
+	kvfree(discarded);
 out_free_snapshot:
 	kfree(snapshot);
 }
@@ -2260,12 +2330,14 @@ static int gc_relocate_one(struct zns_base_c *c, u64 lba, sector_t old_phys)
 	}
 
 	spin_lock_irq(&c->lock);
-	ret = mapping_put(c, lba, new_phys);
+	ret = mapping_put_if_match(c, lba, old_phys, new_phys);
 	spin_unlock_irq(&c->lock);
-	if (ret)
+	if (ret < 0) {
 		DMERR("gc: failed to update mapping for lba=%llu after relocation (%d), aborting this round",
 		      (unsigned long long)lba, ret);
-	return ret;
+		return ret;
+	}
+	return 0;  /* ret==1: 이주 중 사용자가 덮어써 스킵 — 그 블록은 이미 무효라 GC엔 정상 */
 }
 
 /* GC 본체 — victim 하나 회수. victim 선정 → 걸친 산 LBA를 memtable(검증 없이)과
@@ -2392,7 +2464,9 @@ static bool gc_reclaim_one_victim(struct zns_base_c *c)
 		goto out_free_snapshot;
 	}
 
-	/* 전부 성공 — victim zone에 더 이상 살아있는 데이터가 없다고 확신할 수 있으므로 실제로 회수 */
+	/* 전부 성공 — victim zone에 더 이상 살아있는 데이터가 없다고 확신할 수 있으므로 실제로 회수.
+	 * reset 직전 진행 중인 읽기(read pin)가 전부 끝나길 기다린다(회수 안전). */
+	zone_wait_reads_drained(c->zp, victim);
 	if (zone_reset_hw(c, victim)) {
 		DMERR("gc: hardware zone reset failed for zone %u — zone leaked until manually recovered", victim);
 	} else {
@@ -2603,6 +2677,14 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	for (i = 0; i < c->zp->nr_zones; i++)
 		INIT_LIST_HEAD(&c->zp->dispatch_waiters[i]);
 
+	/* kcalloc 0-초기화가 곧 atomic_t 0 — 별도 atomic_set 불필요 */
+	c->zp->inflight_reads = kcalloc(c->zp->nr_zones, sizeof(atomic_t), GFP_KERNEL);
+	if (!c->zp->inflight_reads) {
+		ti->error = "out of memory (inflight_reads)";
+		return -ENOMEM;
+	}
+	init_waitqueue_head(&c->zp->reclaim_waitq);
+
 	/* 0은 "zone 0번"이라는 유효한 값이라 "미배정"을 뜻하는 ZONE_NONE으로 명시 초기화 */
 	for (i = 0; i < ZONE_TAG_COUNT; i++)
 		c->zp->active_zone[i] = ZONE_NONE;
@@ -2661,6 +2743,8 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->private = c;
 	ti->num_flush_bios = 1;
 	ti->num_discard_bios = 0;
+	/* 읽기 bio가 pin한 zone을 완료 시 unpin하려면 per-bio에 그 zone을 실어둔다(zns_read_pin). */
+	ti->per_io_data_size = sizeof(struct zns_read_pin);
 	/* 매핑 단위(4KB)보다 큰 bio는 DM core가 애초에 쪼개서 .map()에 보내게 함 */
 	ti->max_io_len = BLOCK_SECTORS;
 
@@ -2705,6 +2789,7 @@ static void zns_base_dtr(struct dm_target *ti)
 	}
 	kfree(c->zp->dispatch_wp);
 	kfree(c->zp->dispatch_waiters);
+	kfree(c->zp->inflight_reads);
 	kfree(c->zp);
 	kfree(c);
 	DMINFO("dtr: target detached");
@@ -2713,11 +2798,14 @@ static void zns_base_dtr(struct dm_target *ti)
 static int zns_base_map(struct dm_target *ti, struct bio *bio)
 {
 	struct zns_base_c *c = ti->private;
+	struct zns_read_pin *pin = dm_per_bio_data(bio, sizeof(*pin));
 
 	sector_t lba;
 	sector_t nr = bio_sectors(bio);
 	sector_t block_lba;
 	sector_t offset_in_block;
+
+	pin->zone = -1;  /* 읽기 pin 없음이 기본 — READ 경로에서 필요 시에만 설정 */
 
 	/* 순수 flush 요청(nr=0)은 특정 LBA와 무관하므로 매핑 로직을 타면 안 됨.
 	 * bi_sector에 남은 임의값을 lba로 오인해 엉뚱한 매핑을 덮어쓰게 된다. */
@@ -2818,6 +2906,13 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 
 		spin_lock_irq(&c->lock);
 		found = mapping_get(c, block_lba, &phys);
+		if (found) {
+			/* 이 데이터 zone을 pin — REMAPPED로 나간 읽기가 끝날 때까지(end_io)
+			 * GC가 이 zone을 reset하지 못하게. 반드시 조회와 같은 락 안에서 pin해야
+			 * GC의 "매핑 이동 → drain → reset" 순서와 어긋나지 않는다. */
+			pin->zone = zone_of(c->zp, phys);
+			zone_read_get(c->zp, pin->zone);
+		}
 		nr_sst = c->nr_sstables;
 		spin_unlock_irq(&c->lock);
 
@@ -2845,13 +2940,18 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		spin_lock_irq(&c->lock);
 		actual_nr = min(nr_sst, c->nr_sstables);
 		memcpy(candidates, c->sstables, actual_nr * sizeof(*candidates));
-		spin_unlock_irq(&c->lock);
-
+		/* in-range 후보만 남기고, 각 후보의 SSTable zone을 pin — probe가 그 zone을
+		 * 읽는 동안 compaction이 reset하지 못하게. pin은 반드시 스냅샷과 같은 락
+		 * 안에서(compaction의 색인 제거와 순서가 맞아야). unpin은 sstable_read_finish. */
 		nmatch = 0;
 		for (i = 0; i < actual_nr; i++) {
-			if (block_lba >= candidates[i].min_lba && block_lba <= candidates[i].max_lba)
-				candidates[nmatch++] = candidates[i];
+			if (block_lba >= candidates[i].min_lba && block_lba <= candidates[i].max_lba) {
+				candidates[nmatch] = candidates[i];
+				zone_read_get(c->zp, zone_of(c->zp, candidates[nmatch].phys));
+				nmatch++;
+			}
 		}
+		spin_unlock_irq(&c->lock);
 
 		if (nmatch == 0) {
 			kfree(candidates);
@@ -2934,6 +3034,22 @@ static void zns_base_status(struct dm_target *ti, status_type_t type, unsigned i
 // 	return fn(ti, c->dev, 0, ti->len, data);
 // }
 
+/* 읽기 bio 완료 훅 — .map()이 그 읽기가 걸친 zone을 pin(zone_read_get)했으면 여기서
+ * put한다. 이 완료 추적 덕에 GC/compaction이 zone reset 전 진행 중인 읽기가 끝나길
+ * 기다릴 수 있다(zone_wait_reads_drained). pin 안 한 bio(쓰기/flush/미스)는
+ * per_io.zone == -1이라 no-op. REMAPPED·SUBMITTED 둘 다 이 훅이 불린다. */
+static int zns_base_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *error)
+{
+	struct zns_base_c *c = ti->private;
+	struct zns_read_pin *pin = dm_per_bio_data(bio, sizeof(*pin));
+
+	if (pin->zone >= 0) {
+		zone_read_put(c->zp, pin->zone);
+		pin->zone = -1;
+	}
+	return DM_ENDIO_DONE;
+}
+
 static struct target_type zns_base_target = {
 	.name            = "zns-base",
 	.version         = {0, 1, 0},
@@ -2943,6 +3059,7 @@ static struct target_type zns_base_target = {
 	.dtr             = zns_base_dtr,
 	.map             = zns_base_map,
 	.status			 = zns_base_status,
+	.end_io          = zns_base_end_io,
 	// .report_zones    = zns_base_report_zones, //위쪽엔 zone이 없으므로
 	// .iterate_devices = zns_base_iterate_devices, // 위쪽으로 zone 속성 전파를 막음
 };
