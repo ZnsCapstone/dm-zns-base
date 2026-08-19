@@ -43,7 +43,7 @@ flowchart TB
 | 컴포넌트 | 역할 |
 |---|---|
 | **MemTable** | 최근 `LBA -> PBA` 매핑을 RB-tree로 유지 |
-| **WAL** | 새 매핑을 durable하게 기록한 뒤 RAM 매핑을 publish하는 복구 로그 |
+| **WAL** | pending overlay를 durable mapping으로 publish하는 복구 로그 |
 | **SSTable** | frozen MemTable을 LBA 순으로 flush한 immutable on-media 매핑 파일 |
 | **Manifest A/B** | 현재 유효한 SSTable descriptor 목록과 checkpoint sequence 보관 |
 | **zone metadata** | zone 상태, write pointer, valid/pending block, reverse map 관리 |
@@ -150,27 +150,32 @@ sequenceDiagram
     IO->>DATA: lower data write
     DATA-->>IO: 성공
     IO->>IO: DATA wp commit + pending slot 예약
-    IO->>WAL: PUT record 4 KiB FUA append
-    WAL-->>IO: durable 성공
-    IO->>MAP: mapping/reverse map publish
-    IO-->>FS: bio_endio
+    IO->>WAL: PUT record를 pending WAL page에 stage
+    IO-->>FS: 일반 write bio_endio (writeback)
+    WAL->>WAL: page-full 또는 FLUSH/FUA 시 4 KiB FUA append
+    WAL->>MAP: durable mapping/reverse map publish
 ```
 
 현재 보장하는 순서는 다음과 같습니다.
 
 1. DATA zone에 새 4 KiB 블록을 기록합니다.
 2. 실제 data write 성공 후 DATA write pointer를 commit하고 새 slot을 `pending`으로 예약합니다.
-3. `seq`를 부여해 WAL PUT record를 기록하고 FUA 완료를 확인합니다.
-4. WAL 성공 후에만 `LBA -> new PBA` 매핑, 새 slot valid, 이전 PBA invalid를 publish합니다.
-5. WAL 실패 시 새 PBA는 mapping에 연결하지 않은 garbage로 남고 사용자 bio는 오류로 끝납니다.
+3. 일반 write는 WAL PUT을 in-memory pending page에 stage한 뒤 완료합니다. 후속 read는
+   pending WAL overlay에서 이 최신 PBA를 찾습니다.
+4. page-full, `FLUSH`, `FUA`에서 WAL page를 FUA로 기록한 뒤 `LBA -> new PBA` 매핑,
+   새 slot valid, 이전 PBA invalid를 durable하게 publish합니다.
+5. flush/FUA 경계에서 WAL 실패 시 해당 durability 요청은 오류로 끝납니다. 일반 write의
+   마지막 아직-flush되지 않은 batch는 전원 손실 시 유실될 수 있습니다.
 
 부분 write는 기존 4 KiB를 scratch page에 읽어 온 뒤 해당 바이트만 덮는
 read-modify-write 방식입니다. 읽는 동안 대상 zone의 `inflight_reads`를 pin하여 GC가
 해당 zone을 reset하지 못하게 합니다.
 
-> 현재 WAL 정책은 정확성 우선 MVP입니다. 32 B PUT record를 4 KiB WAL page 앞부분에
-> 하나 기록하고 즉시 flush합니다. WAL page format은 향후 여러 record를 묶을 수 있게
-> 정의되어 있으나 group commit은 아직 적용하지 않았습니다.
+> WAL은 최대 126개의 32 B PUT record를 하나의 4 KiB page에 묶어 FUA로 기록합니다.
+> 일반 write는 timer 없이 pending WAL overlay까지 stage된 시점에 완료됩니다. page가
+> 가득 차거나 `FLUSH`/`FUA`/GC가 durability 경계를 요구할 때만 즉시 기록합니다.
+> 따라서 flush/FUA가 성공한 write는 복구되며, 아직 flush되지 않은 일반 write batch는
+> writeback cache와 같이 전원 손실 시 유실될 수 있습니다.
 
 ---
 
@@ -315,8 +320,8 @@ sudo bash scripts/test-failure-injection.sh
 
 ## 현재 한계와 다음 단계
 
-- WAL은 record packing/group commit이 아니라 record당 4 KiB durable append를 사용하므로
-  write amplification과 latency가 큽니다.
+- WAL group commit은 page boundary와 explicit durability boundary만으로 batch를 만든다.
+  timer 기반 추가 지연은 없지만, 일반 write는 writeback semantics를 사용합니다.
 - on-disk SSTable lookup은 binary search지만 block cache나 bloom filter가 없어 cold read의
   metadata I/O 비용이 남습니다.
 - SSTable compaction은 가장 오래된 4개를 병합하는 단순 정책입니다. level 기반
