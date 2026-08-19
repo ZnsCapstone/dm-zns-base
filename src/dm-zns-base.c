@@ -392,6 +392,10 @@ struct zns_base_c {
 	u64 gc_moved_blocks;
 
 	mempool_t *io_pool;
+	/* quiescing rejects new upper bios while already-issued data completions
+	 * and their WAL publication are still allowed to drain.  stopping is the
+	 * later, hard-stop state used only after the WAL is empty. */
+	bool quiescing;
 	bool stopping;
 
 	wait_queue_head_t spare_waitq;
@@ -695,7 +699,7 @@ static int zns_base_queue_bio(struct zns_base_c *c, struct bio *bio){
 
 	spin_lock(&c -> lock);
 
-	if(c -> stopping){
+	if (c->quiescing || c->stopping) {
 		spin_unlock(&c -> lock);
 		mempool_free(io, c -> io_pool);
 		return -EIO;
@@ -1347,8 +1351,8 @@ static void zns_base_io_work(struct work_struct *work){
 			c -> io_work_scheduled = false;
 			spin_unlock(&c -> lock);
 			/* A partial WAL page deliberately remains staged here.  Normal
-			 * writes have already completed under writeback semantics; page-full
-			 * or an explicit FLUSH/FUA is the durability boundary. */
+			 * writes have already completed under writeback semantics; page-full,
+			 * explicit FLUSH/FUA, or graceful teardown is the durability boundary. */
 			return;
 		}
 
@@ -1394,9 +1398,12 @@ static void zns_base_gc_work(struct work_struct *work)
   	for (;;) {
   		spin_lock(&c->lock);
 
-  		if (c->stopping ||
-  		    zns_base_count_free_zones(c) >=
-  		    GC_TARGET_FREE_ZONES) {
+		if (c->stopping ||
+		    (c->quiescing && !c->io_work_scheduled &&
+		     !c->foreground_data_inflight &&
+		     list_empty(&c->pending_bios)) ||
+		    zns_base_count_free_zones(c) >=
+		    GC_TARGET_FREE_ZONES) {
   			spin_unlock(&c->lock);
   			break;
   		}
@@ -2085,13 +2092,19 @@ static bool zns_base_gc_needed(struct zns_base_c *c)
 
 static void zns_base_schedule_gc(struct zns_base_c *c)
 {
-  	bool queue_gc = false;
+	bool queue_gc = false;
+	bool draining_foreground;
 
-  	spin_lock(&c->lock);
+	spin_lock(&c->lock);
 
-  	if (!c->stopping &&
-  	    !c->gc_scheduled &&
-  	    zns_base_gc_needed(c)) {
+	draining_foreground = c->io_work_scheduled ||
+		c->foreground_data_inflight ||
+		!list_empty(&c->pending_bios);
+
+	if (!c->stopping &&
+	    (!c->quiescing || draining_foreground) &&
+	    !c->gc_scheduled &&
+	    zns_base_gc_needed(c)) {
   		c->gc_scheduled = true;
   		queue_gc = true;
   	}
@@ -4612,26 +4625,24 @@ static int zns_base_wal_flush_sync(struct zns_base_c *c)
 	bool has_records;
 	int ret;
 
-	mutex_lock(&c->metadata.lock);
-	has_records = wal->record_count != 0;
-	ret = wal->flush_error;
-	mutex_unlock(&c->metadata.lock);
-
-	if (ret)
-		return ret;
-
-	if (has_records) {
+	for (;;) {
 		mutex_lock(&c->metadata.lock);
-		wal->flush_scheduled = true;
+		has_records = wal->record_count != 0;
+		ret = wal->flush_error;
+		if (has_records && !ret)
+			wal->flush_scheduled = true;
 		mutex_unlock(&c->metadata.lock);
+
+		if (ret || !has_records)
+			return ret;
+
+		/* queue_work() may observe an older instance that is still pending or
+		 * executing.  flush_work() waits for that instance; the loop then
+		 * rechecks record_count and queues again if a newly staged partial page
+		 * remains. */
 		queue_work(c->wal_wq, &wal->flush_work);
 		flush_work(&wal->flush_work);
 	}
-
-	mutex_lock(&c->metadata.lock);
-	ret = wal->flush_error;
-	mutex_unlock(&c->metadata.lock);
-	return ret;
 }
 
 static int zns_base_wal_publish_gc_locked(
@@ -4811,6 +4822,7 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	c -> gc_running = false;
 	c->gc_error = 0;
 	c->gc_last_error = 0;
+	c->quiescing = false;
 	c -> stopping = false;
 
 	c->metadata.wal.flush_scheduled = false;
@@ -4892,24 +4904,52 @@ static void zns_base_dtr(struct dm_target *ti)
 {
 	struct zns_base_c *c = ti->private;
 	struct zns_base_io *io;
+	int wal_ret;
 
+	/* Stop accepting new upper bios, but keep internal mapping waits and WAL
+	 * publication alive until every already-issued data write has staged its
+	 * record. */
 	spin_lock(&c -> lock);
-	c -> stopping = true;
+	c->quiescing = true;
 	spin_unlock(&c -> lock);
 
 	wake_up_all(&c -> spare_waitq);
 	wake_up_all(&c -> gc_waitq);
 
-	cancel_work_sync(&c -> io_work);
-	cancel_work_sync(&c -> gc_work);
-	/* Lower data bios may still complete after the dispatcher was cancelled.
-	 * Their completion work must release pending slots before metadata/WAL and
-	 * the I/O workqueue are torn down. */
+	/* Drain the foreground dispatcher and all data completion work.  Completion
+	 * work can requeue io_work for an ordering-boundary FLUSH, hence the second
+	 * flush after foreground_data_inflight reaches zero. */
+	flush_workqueue(c->io_wq);
 	wait_event(c->data_waitq, !READ_ONCE(c->foreground_data_inflight));
 	flush_workqueue(c->io_wq);
 
+	/* A running GC is allowed to finish its current safe round while foreground
+	 * I/O drains.  Once the dispatcher is empty, quiescing prevents it from
+	 * being scheduled again. */
+	cancel_work_sync(&c -> gc_work);
+
+	/* Graceful target removal is a durability boundary.  Do not discard the
+	 * final partial WAL page: write and publish until record_count becomes zero. */
+	wal_ret = zns_base_wal_flush_sync(c);
+	if (wal_ret)
+		DMERR("failed to flush partial WAL during target removal: %d", wal_ret);
+
+	/* No WAL publication may still be using the mapping flush worker after this
+	 * point.  A cancelled frozen MemTable remains recoverable from the WAL. */
+	cancel_work_sync(&c->mapping.flush_work);
+
+	spin_lock(&c->lock);
+	c->stopping = true;
+	spin_unlock(&c->lock);
+	wake_up_all(&c->spare_waitq);
+	wake_up_all(&c->gc_waitq);
+
+	cancel_work_sync(&c->io_work);
+	cancel_work_sync(&c->gc_work);
 	cancel_work_sync(&c->metadata.wal.flush_work);
-  	zns_base_wal_abort_pending(c, -EIO);
+	/* On success this is a no-op.  On a real lower-device error it releases
+	 * otherwise stranded commit objects after the error has been reported. */
+	zns_base_wal_abort_pending(c, wal_ret ? wal_ret : -EIO);
 
 	for(;;){
 		spin_lock(&c -> lock);
