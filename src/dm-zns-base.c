@@ -36,8 +36,8 @@
 #define MEMTABLE_POOL_SIZE 4
 #define IO_POOL_SIZE 128
 #define GC_RESERVE_ZONES 2
-#define GC_LOW_WATERMARK 3
-#define GC_TARGET_FREE_ZONES 4
+#define GC_DEFAULT_LOW_WATERMARK 3
+#define GC_DEFAULT_TARGET_FREE_ZONES 4
 #define ZNS_BASE_NO_ZONE ((unsigned int)-1)
 #define ZNS_BASE_MANIFEST_ZONES 2
 #define ZNS_BASE_WAL_ZONES      2
@@ -66,6 +66,28 @@ static unsigned int data_zone_capacity_mib;
 module_param(data_zone_capacity_mib, uint, 0444);
 MODULE_PARM_DESC(data_zone_capacity_mib,
 	"optional usable MiB per data zone for bounded GC tests (0=device capacity)");
+
+/* Production defaults preserve the original policy.  Read-only parameters let
+ * a bounded functional test trigger one deterministic GC round without writing
+ * most of a multi-GiB FEMU namespace. */
+static unsigned int gc_low_watermark = GC_DEFAULT_LOW_WATERMARK;
+module_param(gc_low_watermark, uint, 0444);
+MODULE_PARM_DESC(gc_low_watermark,
+	"free data-zone count at or below which background GC is scheduled");
+
+static unsigned int gc_target_free_zones = GC_DEFAULT_TARGET_FREE_ZONES;
+module_param(gc_target_free_zones, uint, 0444);
+MODULE_PARM_DESC(gc_target_free_zones,
+	"free data-zone count at which a background GC run stops");
+
+/* The default remains the original 4096 entries.  M3 raises this slightly so
+ * its first generation is persistent while the deterministic overwrite
+ * generation stays RAM-resident; GC then tests migration rather than spending
+ * the timeout on thousands of synchronous SSTable probes. */
+static unsigned int memtable_capacity_entries = 4096;
+module_param(memtable_capacity_entries, uint, 0444);
+MODULE_PARM_DESC(memtable_capacity_entries,
+	"mapping entries per MemTable generation");
 
 enum zns_base_failpoint {
 	ZNS_BASE_FAIL_NONE = 0,
@@ -1414,7 +1436,7 @@ static void zns_base_gc_work(struct work_struct *work)
 		     !c->foreground_data_inflight &&
 		     list_empty(&c->pending_bios)) ||
 		    zns_base_count_free_zones(c) >=
-		    GC_TARGET_FREE_ZONES) {
+		    gc_target_free_zones) {
   			spin_unlock(&c->lock);
   			break;
   		}
@@ -1423,7 +1445,12 @@ static void zns_base_gc_work(struct work_struct *work)
 
 		ret = zns_base_select_victim(c, &victim);
 		if (ret == -ENOENT) {
-			ret = -ENOSPC;
+			/* No useful FULL victim is not corruption.  A proactive GC can
+			 * legitimately run while the current ACTIVE zone still has room.
+			 * End this round without poisoning every later foreground write;
+			 * a writer that actually needs another zone performs its own
+			 * one-shot ENOSPC decision in zns_base_wait_for_gc_space(). */
+			ret = 0;
 			break;
 		}
 
@@ -1479,10 +1506,16 @@ static void zns_base_gc_work(struct work_struct *work)
 
 	spin_lock(&c->lock);
 
-	if (ret && !c->stopping) {
+	if (ret && ret != -ENOSPC && !c->stopping) {
 		c->gc_error = ret;
 		c->gc_last_error = ret;
 		DMERR("GC stopped with error %d", ret);
+	} else if (ret == -ENOSPC && !c->stopping) {
+		/* Space pressure is recoverable after later overwrites create a
+		 * better victim.  Report it, but do not turn the whole target into
+		 * a permanent EIO state. */
+		c->gc_last_error = ret;
+		DMWARN("GC paused without relocation space (%d)", ret);
 	}
 
   	c->gc_running = false;
@@ -1651,13 +1684,15 @@ static int mapping_init(struct zns_base_c *c, sector_t target_sectors)
 	size_t nr_logical_blocks;
 	struct mapping_memtable *memtable;
 	struct mapping_memtable *next;
-	size_t mem_capacity = 4096;
+	size_t mem_capacity = memtable_capacity_entries;
 	size_t i;
 	int ret;
 
 	if(target_sectors % SECTORS_PER_BLOCK != 0){
 		return -EINVAL;
 	}
+	if (!mem_capacity)
+		return -EINVAL;
 	nr_logical_blocks = target_sectors / SECTORS_PER_BLOCK;
 	
 	INIT_LIST_HEAD(&c -> mapping.spare_memtables);
@@ -2056,7 +2091,20 @@ static unsigned int zns_base_count_free_zones(struct zns_base_c *c)
   			free_count++;
   	}
 
-  	return free_count;
+	return free_count;
+}
+
+/* Caller holds c->lock.  Once GC owns a destination, that zone itself is the
+ * first unit of relocation reserve.  Keeping the full two additional FREE
+ * zones at that point prevents a freshly reset victim from returning to
+ * foreground use and can deadlock exactly at the low watermark. */
+static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c)
+{
+	unsigned int reserve = GC_RESERVE_ZONES;
+
+	if (c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE && reserve)
+		reserve--;
+	return reserve;
 }
 
 static bool zns_base_gc_space_ready(struct zns_base_c *c)
@@ -2065,9 +2113,11 @@ static bool zns_base_gc_space_ready(struct zns_base_c *c)
 
   	spin_lock(&c->lock);
 
-  	ready = c->stopping ||
-  		c->gc_error ||
-  		zns_base_count_free_zones(c) > GC_RESERVE_ZONES;
+	ready = c->stopping ||
+		c->gc_error ||
+		zns_base_count_free_zones(c) >
+			zns_base_foreground_reserve_locked(c) ||
+		(!c->gc_running && !c->gc_scheduled);
 
   	spin_unlock(&c->lock);
 
@@ -2076,7 +2126,9 @@ static bool zns_base_gc_space_ready(struct zns_base_c *c)
 
 static int zns_base_wait_for_gc_space(struct zns_base_c *c)
 {
-  	for (;;) {
+	bool attempted_gc = false;
+
+	for (;;) {
   		spin_lock(&c->lock);
 
   		if (c->stopping) {
@@ -2091,15 +2143,26 @@ static int zns_base_wait_for_gc_space(struct zns_base_c *c)
   			return ret;
   		}
 
-  		if (zns_base_count_free_zones(c) > GC_RESERVE_ZONES) {
-  			spin_unlock(&c->lock);
-  			return 0;
-  		}
+		if (zns_base_count_free_zones(c) >
+		    zns_base_foreground_reserve_locked(c)) {
+			spin_unlock(&c->lock);
+			return 0;
+		}
+
+		/* A GC round completed but could not create an admissible FREE
+		 * zone.  Fail this allocation as NOSPC without setting gc_error;
+		 * the target remains usable instead of becoming permanently EIO. */
+		if (attempted_gc && !c->gc_running && !c->gc_scheduled) {
+			c->gc_last_error = -ENOSPC;
+			spin_unlock(&c->lock);
+			return -ENOSPC;
+		}
 
   		spin_unlock(&c->lock);
 
-  		/* lock 밖에서 GC를 예약해야 한다. */
-  		zns_base_schedule_gc(c);
+		/* lock 밖에서 GC를 예약해야 한다. */
+		zns_base_schedule_gc(c);
+		attempted_gc = true;
 
   		/*
   		 * reset 성공, GC 실패, dtr 종료 중 하나가 발생하면
@@ -2111,7 +2174,7 @@ static int zns_base_wait_for_gc_space(struct zns_base_c *c)
 
 static bool zns_base_gc_needed(struct zns_base_c *c)
 {
-  	return zns_base_count_free_zones(c) <= GC_LOW_WATERMARK;
+	return zns_base_count_free_zones(c) <= gc_low_watermark;
 }
 
 static void zns_base_schedule_gc(struct zns_base_c *c)
@@ -2592,7 +2655,8 @@ static int zns_base_activate_next_zone(struct zns_base_c *c)
   	unsigned int i;
   	struct zns_base_zone *zone;
 
-	if (zns_base_count_free_zones(c) <= GC_RESERVE_ZONES)
+	if (zns_base_count_free_zones(c) <=
+	    zns_base_foreground_reserve_locked(c))
   		return -EAGAIN;
 
   	for (i = ZNS_BASE_METADATA_ZONES; i < c->zone_state.nr_zones; i++) {

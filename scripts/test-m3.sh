@@ -10,8 +10,6 @@ MOD_NAME=dm-zns-base
 BLOCK_SIZE=4096
 SECTORS_PER_BLOCK=8
 WAL_PAGE_RECORDS=126
-GC_WORKING_SET_MIB=${GC_WORKING_SET_MIB:-0}
-GC_MARKER_MIB=${GC_MARKER_MIB:-4}
 # auto caps every larger zone to 16 MiB for a bounded functional GC test.
 # Use "full" for a device-scale endurance run, or supply an explicit MiB value.
 M3_ZONE_CAPACITY_MIB=${M3_ZONE_CAPACITY_MIB:-auto}
@@ -68,7 +66,7 @@ zone_wptr() {
 
 wait_for_persistent_memtable() {
 	local expected_seq=$1
-	local i status checkpoint_seq persistent_sstables
+	local i status="" checkpoint_seq persistent_sstables
 
 	for ((i = 0; i < 400; i++)); do
 		status=$(dmsetup status "$DM_NAME") ||
@@ -85,7 +83,28 @@ wait_for_persistent_memtable() {
 		sleep 0.05
 	done
 
-	fail "MemTable persistence did not reach checkpoint_seq=$expected_seq"
+	fail "MemTable persistence did not reach checkpoint_seq=$expected_seq: ${status:-status unavailable}"
+}
+
+wait_for_gc_reclaim() {
+	local i status="" resets moved error
+
+	for ((i = 0; i < 1200; i++)); do
+		status=$(dmsetup status "$DM_NAME") ||
+			fail "could not read target status while waiting for GC"
+		resets=$(sed -n 's/.*gc_resets=\([0-9][0-9]*\).*/\1/p' <<<"$status")
+		moved=$(sed -n 's/.*gc_moved_blocks=\([0-9][0-9]*\).*/\1/p' <<<"$status")
+		error=$(sed -n 's/.*gc_error=\(-\{0,1\}[0-9][0-9]*\).*/\1/p' <<<"$status")
+		[ -n "$error" ] && [ "$error" -ne 0 ] &&
+			fail "GC entered a fatal error state: $status"
+		if [ -n "$resets" ] && [ -n "$moved" ] &&
+		   [ "$resets" -gt 0 ] && [ "$moved" -gt 0 ]; then
+			return 0
+		fi
+		sleep 0.05
+	done
+
+	fail "GC did not reclaim and migrate a live block within 60 seconds: ${status:-status unavailable}"
 }
 
 [ -b "$UNDERLYING" ] || fail "$UNDERLYING is missing. Run scripts/nullblk-up.sh first."
@@ -133,23 +152,27 @@ else
 	module_zone_capacity_mib=$effective_zone_mib
 fi
 
+zone_block_count=$((effective_zone_sectors / SECTORS_PER_BLOCK))
+# block_count is the first WAL-page-aligned count beyond one data zone.  Leave
+# 64 slots in the first MemTable, then stage WAL_PAGE_RECORDS-1 new mappings in
+# stage 3.  Together with the block-0 overwrite they form one complete WAL
+# page, cross the MemTable exactly once, and leave only 61 entries in the new
+# active generation.
+block_count=$((((zone_block_count + 1 + WAL_PAGE_RECORDS - 1) / WAL_PAGE_RECORDS) * WAL_PAGE_RECORDS))
+m3_memtable_capacity=$((block_count + 64))
+memtable_flush_blocks=$((WAL_PAGE_RECORDS - 1))
+rollover_second_zone_blocks=$((block_count - zone_block_count))
+total_bytes=$((block_count * BLOCK_SIZE))
+
 data_zones=$((nr_zones - METADATA_ZONES))
 logical_data_zones=$((data_zones - GC_RESERVE_ZONES))
 sectors=$((logical_data_zones * effective_zone_sectors))
-logical_mib=$((logical_data_zones * effective_zone_mib))
-if [ "$GC_WORKING_SET_MIB" -eq 0 ]; then
-	GC_WORKING_SET_MIB=$((logical_mib * 80 / 100))
-fi
-GC_OVERWRITE_MIB=${GC_OVERWRITE_MIB:-$((GC_WORKING_SET_MIB * 12 / 10))}
-gc_marker_offset_mib=$((GC_WORKING_SET_MIB + 16))
-
-[ "$GC_WORKING_SET_MIB" -gt 0 ] || fail "GC working set must be positive"
-[ "$GC_WORKING_SET_MIB" -le "$logical_mib" ] ||
-	fail "GC working set must fit in top logical capacity"
-[ "$GC_OVERWRITE_MIB" -gt "$GC_WORKING_SET_MIB" ] ||
-	fail "GC overwrite amount must exceed the working set"
-[ $((gc_marker_offset_mib + GC_MARKER_MIB)) -lt "$logical_mib" ] ||
-	fail "GC marker range must fit outside the random-write working set"
+# Stage 2 leaves two data zones in use.  When deterministic victim rewrites
+# activate a third one, free data zones become data_zones-3.  Trigger and stop
+# above that point instead of filling 80% of a multi-GiB FEMU namespace.
+gc_test_watermark=$((data_zones - 3))
+gc_test_target=$((gc_test_watermark + 1))
+[ "$gc_test_watermark" -gt 0 ] || fail "deterministic GC test needs four data zones"
 
 echo "[*] Building module"
 make -C "$SRC_DIR" >/dev/null || fail "build failed"
@@ -169,20 +192,20 @@ else
 fi
 
 echo "[*] insmod $KO_PATH"
-insmod "$KO_PATH" data_zone_capacity_mib="$module_zone_capacity_mib" ||
+insmod "$KO_PATH" data_zone_capacity_mib="$module_zone_capacity_mib" \
+	gc_low_watermark="$gc_test_watermark" \
+	gc_target_free_zones="$gc_test_target" \
+	memtable_capacity_entries="$m3_memtable_capacity" ||
 	fail "insmod failed"
 
 echo "[*] dmsetup create $DM_NAME"
 echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" ||
 	fail "dmsetup create failed"
 
-zone_block_count=$((effective_zone_sectors / SECTORS_PER_BLOCK))
 # Cross the first data-zone boundary and continue through the next complete
 # WAL page.  Merely writing zone_blocks+1 leaves up to 125 mappings in the
-# partial in-memory WAL page, so a 4096-entry MemTable may not freeze yet.
-block_count=$((((zone_block_count + 1 + WAL_PAGE_RECORDS - 1) / WAL_PAGE_RECORDS) * WAL_PAGE_RECORDS))
-rollover_second_zone_blocks=$((block_count - zone_block_count))
-total_bytes=$((block_count * BLOCK_SIZE))
+# partial in-memory WAL page; stage 3 deliberately completes the enlarged
+# MemTable after this rollover write.
 
 echo
 echo "=== [1/6] underlying zone geometry ==="
@@ -223,6 +246,17 @@ cmp "$TMP_DIR/overwrite.bin" "$TMP_DIR/overwrite.read" ||
 	fail "overwrite did not become the newest mapping"
 cmp "$TMP_DIR/neighbor.expected" "$TMP_DIR/neighbor.read" ||
 	fail "overwrite corrupted neighboring logical block"
+
+# Fill the deliberately enlarged first MemTable and cross it once.  These 125
+# records plus the preceding block-0 overwrite make a complete 126-record WAL
+# page, so persistence does not depend on userspace fsync behavior.  The next
+# victim-overwrite generation remains below the new MemTable's capacity.
+dd if=/dev/zero bs="$BLOCK_SIZE" count="$memtable_flush_blocks" status=none |
+	tr '\000' '\307' > "$TMP_DIR/memtable-flush.bin"
+dd if="$TMP_DIR/memtable-flush.bin" of="$DM_DEV" bs="$BLOCK_SIZE" \
+	count="$memtable_flush_blocks" seek="$block_count" iflag=fullblock \
+	oflag=direct conv=notrunc,fsync status=none ||
+	fail "MemTable flush trigger write failed"
 echo "[OK]"
 
 echo
@@ -268,7 +302,8 @@ data0_wptr=$((data0_wptr_hex))
 data1_wptr=$((data1_wptr_hex))
 expected_data0_wptr=$effective_zone_sectors
 # blkzone report prints the write pointer relative to each zone start.
-expected_data1_wptr=$((SECTORS_PER_BLOCK * (rollover_second_zone_blocks + 1)))
+expected_data1_wptr=$((SECTORS_PER_BLOCK *
+	(rollover_second_zone_blocks + 1 + memtable_flush_blocks)))
 
 echo "data zone $METADATA_ZONES wp=$data0_wptr, expected=$expected_data0_wptr"
 echo "data zone $((METADATA_ZONES + 1)) wp=$data1_wptr, expected=$expected_data1_wptr"
@@ -280,22 +315,25 @@ echo "data zone $((METADATA_ZONES + 1)) wp=$data1_wptr, expected=$expected_data1
 echo "[OK]"
 
 echo
-echo "=== [5/6] GC reclaims space during bounded fill and random overwrite ==="
-dd if=/dev/urandom of="$TMP_DIR/gc-marker.bin" bs=1M \
-	count="$GC_MARKER_MIB" status=none
-dd if="$TMP_DIR/gc-marker.bin" of="$DM_DEV" bs=1M \
-	seek="$gc_marker_offset_mib" conv=notrunc oflag=direct status=none ||
-	fail "GC marker write failed"
+echo "=== [5/6] GC reclaims one deterministic victim zone ==="
+# Stage 2 placed logical blocks 0..zone_block_count-1 in the first physical
+# data zone.  Block 0 was already overwritten in stage 3.  Overwrite every
+# block except block 1 once more: the old first zone is then an unambiguous
+# victim with one live marker, while only one additional effective zone worth
+# of foreground data is written.  This keeps FEMU's 2 GiB hardware-zone test
+# bounded to about 16 MiB without weakening the reset/migration assertion.
+victim_overwrite_blocks=$((zone_block_count - 2))
+dd if=/dev/zero bs="$BLOCK_SIZE" count="$victim_overwrite_blocks" status=none |
+	tr '\000' '\074' > "$TMP_DIR/victim-overwrite.bin"
+dd if="$TMP_DIR/victim-overwrite.bin" of="$DM_DEV" bs="$BLOCK_SIZE" \
+	count="$victim_overwrite_blocks" seek=2 iflag=fullblock \
+	oflag=direct conv=notrunc,fsync status=none ||
+	fail "deterministic victim overwrite failed"
 
-fio --name=gc-fill --filename="$DM_DEV" --rw=randwrite \
-	--bs=4k --size="${GC_WORKING_SET_MIB}M" --io_size="${GC_WORKING_SET_MIB}M" \
-	--ioengine=libaio --iodepth=32 --direct=1 --group_reporting ||
-	fail "random fill failed"
-
-fio --name=gc-overwrite --filename="$DM_DEV" --rw=randwrite \
-	--bs=4k --size="${GC_WORKING_SET_MIB}M" --io_size="${GC_OVERWRITE_MIB}M" \
-	--ioengine=libaio --iodepth=32 --direct=1 --group_reporting ||
-	fail "random overwrite failed"
+# The rollover leaves fewer than WAL_PAGE_RECORDS records after the new data
+# zone is activated.  fsync above is therefore essential: it publishes that
+# partial WAL page, after which the free-zone watermark can schedule GC.
+wait_for_gc_reclaim
 
 target_status=$(dmsetup status "$DM_NAME") || fail "could not read target status after GC"
 gc_resets=$(sed -n 's/.*gc_resets=\([0-9][0-9]*\).*/\1/p' <<<"$target_status")
@@ -305,17 +343,25 @@ gc_moved_blocks=$(sed -n 's/.*gc_moved_blocks=\([0-9][0-9]*\).*/\1/p' <<<"$targe
 [ "$gc_resets" -gt 0 ] || fail "workload did not reset/reuse any data zone"
 [ "$gc_moved_blocks" -gt 0 ] || fail "workload did not exercise live-block migration"
 
-echo "working set=${GC_WORKING_SET_MIB}MiB (80% of ${logical_mib}MiB), overwrite=${GC_OVERWRITE_MIB}MiB"
+echo "deterministic overwrite=$((victim_overwrite_blocks * BLOCK_SIZE / 1024 / 1024))MiB"
 echo "gc resets=$gc_resets, moved blocks=$gc_moved_blocks"
 echo "[OK]"
 
 echo
 echo "=== [6/6] valid data survives GC migration ==="
-dd if="$DM_DEV" of="$TMP_DIR/gc-marker.read" bs=1M \
-	skip="$gc_marker_offset_mib" count="$GC_MARKER_MIB" \
-	iflag=direct status=none || fail "GC marker read failed"
-cmp "$TMP_DIR/gc-marker.bin" "$TMP_DIR/gc-marker.read" ||
-	fail "valid marker data was corrupted during GC"
+dd if="$DM_DEV" of="$TMP_DIR/gc-marker.read" bs="$BLOCK_SIZE" \
+	skip=1 count=1 iflag=direct status=none || fail "GC marker read failed"
+cmp "$TMP_DIR/neighbor.expected" "$TMP_DIR/gc-marker.read" ||
+	fail "live marker data was corrupted during GC"
+
+# Also make sure GC did not let its older copy win over the foreground update.
+dd if="$TMP_DIR/victim-overwrite.bin" of="$TMP_DIR/overwrite.expected" \
+	bs="$BLOCK_SIZE" count=1 status=none
+dd if="$DM_DEV" of="$TMP_DIR/post-gc-overwrite.read" bs="$BLOCK_SIZE" \
+	skip=2 count=1 iflag=direct status=none ||
+	fail "post-GC overwrite read failed"
+cmp "$TMP_DIR/overwrite.expected" "$TMP_DIR/post-gc-overwrite.read" ||
+	fail "GC replaced a newer foreground mapping with stale data"
 echo "[OK]"
 
 echo
