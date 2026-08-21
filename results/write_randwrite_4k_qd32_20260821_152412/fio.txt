@@ -1,0 +1,25 @@
+zns-base-randwrite: (g=0): rw=randwrite, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=libaio, iodepth=32
+fio-3.28
+Starting 1 process
+
+zns-base-randwrite: (groupid=0, jobs=1): err= 0: pid=85210: Fri Aug 21 15:24:17 2026
+  write: IOPS=31.8k, BW=124MiB/s (130MB/s)(512MiB/4116msec); 0 zone resets
+    slat (usec): min=2, max=7743, avg= 6.19, stdev=25.14
+    clat (usec): min=104, max=45776, avg=998.12, stdev=1526.73
+     lat (usec): min=155, max=45779, avg=1004.35, stdev=1526.92
+    clat percentiles (usec):
+     | 50.0th=[  873], 90.0th=[ 1029], 95.0th=[ 1188], 99.0th=[ 2245],
+     | 99.9th=[31589]
+   bw (  KiB/s): min=112496, max=136960, per=99.63%, avg=126913.00, stdev=7364.79, samples=8
+   iops        : min=28124, max=34240, avg=31728.12, stdev=1841.14, samples=8
+  lat (usec)   : 250=0.03%, 500=0.08%, 750=3.67%, 1000=84.43%
+  lat (msec)   : 2=10.37%, 4=0.99%, 10=0.11%, 20=0.15%, 50=0.17%
+  cpu          : usr=0.00%, sys=22.75%, ctx=121804, majf=0, minf=20
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=100.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.1%, 64=0.0%, >=64=0.0%
+     issued rwts: total=0,131072,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=32
+
+Run status group 0 (all jobs):
+  WRITE: bw=124MiB/s (130MB/s), 124MiB/s-124MiB/s (130MB/s-130MB/s), io=512MiB (537MB), run=4116-4116msec

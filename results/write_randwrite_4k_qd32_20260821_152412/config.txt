@@ -1,0 +1,11 @@
+underlying=/dev/nullb0
+hardware_zone_mib=64
+nr_zones=32
+target_mib=1536
+rw=randwrite
+bs=4k
+iodepth=32
+numjobs=1
+working_set_mib=512
+io_mib=512
+fsync_blocks=0
