@@ -28,8 +28,22 @@ TMP_DIR=$(mktemp -d /tmp/dm-zns-m3.XXXXXX)
 
 [ "$(id -u)" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
 
-cleanup() {
+remove_target() {
+	local i
+
 	dmsetup remove "$DM_NAME" 2>/dev/null || true
+	for ((i = 0; i < 50; i++)); do
+		if ! dmsetup info "$DM_NAME" >/dev/null 2>&1; then
+			return 0
+		fi
+		sleep 0.1
+		dmsetup remove --retry "$DM_NAME" 2>/dev/null || true
+	done
+	return 1
+}
+
+cleanup() {
+	remove_target 2>/dev/null || true
 	rmmod "$MOD_NAME" 2>/dev/null || true
 	rm -rf "$TMP_DIR"
 }
@@ -140,7 +154,7 @@ gc_marker_offset_mib=$((GC_WORKING_SET_MIB + 16))
 echo "[*] Building module"
 make -C "$SRC_DIR" >/dev/null || fail "build failed"
 
-dmsetup remove "$DM_NAME" 2>/dev/null || true
+remove_target 2>/dev/null || true
 if lsmod | grep -q '^dm_zns_base '; then
 	rmmod "$MOD_NAME" 2>/dev/null ||
 		fail "$MOD_NAME is already loaded and in use. Remove existing zns-base dm devices first."
