@@ -7,7 +7,7 @@ UNDERLYING=${UNDERLYING:-/dev/nullb0}
 DM_NAME=${DM_NAME:-myzns-checkpoint-$$}
 DM_DEV=/dev/mapper/$DM_NAME
 MOD_NAME=dm-zns-base
-METADATA_ZONES=10
+METADATA_ZONES=6
 GC_RESERVE_ZONES=2
 # Three WAL capacities force manifest A -> B -> A reuse.
 WRITE_MIB=${WRITE_MIB:-396}

@@ -53,15 +53,15 @@ flowchart TB
 
 ## Zone 배치와 메타데이터
 
-현재 `null_blk` 기본 환경은 64 MiB zone 32개입니다. 앞쪽 10개 zone은 metadata 전용,
+현재 `null_blk` 기본 환경은 64 MiB zone 32개입니다. 앞쪽 6개 zone은 metadata 전용,
 나머지는 DATA 용도입니다.
 
 | zone 범위 | 개수 | 역할 |
 |---|---:|---|
 | 0-1 | 2 | Manifest A/B |
 | 2-3 | 2 | WAL |
-| 4-9 | 6 | persistent SSTable 및 compaction output |
-| 10 이후 | 나머지 | 사용자 DATA 및 GC destination |
+| 4-5 | 2 | packed persistent SSTable A/B 및 compaction output |
+| 6 이후 | 나머지 | 사용자 DATA 및 GC destination |
 
 각 DATA zone은 다음 정보를 RAM에 유지합니다.
 
@@ -119,9 +119,10 @@ struct mapping_entry {
 - MemTable miss는 Manifest catalog의 SSTable을 `min_lba/max_lba`로 먼저 거르고,
   후보 SSTable에서 필요한 4 KiB page만 읽는 on-disk binary search를 수행합니다.
 - 여러 SSTable에서 같은 LBA가 발견되면 가장 큰 `seq`를 선택합니다.
-- SSTable 수가 4개에 도달하면 가장 오래된 4개를 병합합니다. 같은 LBA는 최신 entry만
-  남긴 output SSTable을 기록하고, 새 Manifest publish 성공 뒤에만 기존 SSTable zone을
-  reset합니다.
+- 여러 SSTable은 현재 SSTable zone 안에 연속 append됩니다. SSTable 수가 4개에
+  도달하면 그 zone의 모든 live table을 병합하여 반대편 빈 zone에 기록합니다. 같은
+  LBA는 최신 entry만 남기고, 새 Manifest publish 성공 뒤에만 이전 SSTable zone을
+  reset합니다. 두 zone은 이 과정을 A/B ping-pong으로 반복합니다.
 
 따라서 runtime lookup 순서는 다음과 같습니다.
 
@@ -306,7 +307,7 @@ sudo bash scripts/test-failure-injection.sh
 |---|---|
 | `test-m1.sh` | 기본 random write/read, overwrite, persistent MemTable flush, flush bio |
 | `test-m2.sh` | 1024 B read, partial overwrite/RMW, ext4 round-trip |
-| `test-m3.sh` | zone rollover, metadata 동작, GC, 80% fill + 1.2x overwrite |
+| `test-m3.sh` | zone rollover, metadata 격리, 실제 GC reset/reuse, live-block migration |
 | `test-wal-recovery.sh` | module reload 뒤 WAL replay readback |
 | `test-wal-recovery-ext4.sh` | ext4 sync/unmount/reload/remount hash 검증 |
 | `test-checkpoint-recovery.sh` | persistent SSTable, Manifest A/B rotation, checkpoint 복구 |
@@ -316,6 +317,16 @@ sudo bash scripts/test-failure-injection.sh
 내려야 합니다. target이 mount되었거나 `dumpe2fs` 같은 프로세스가 열고 있으면
 `Device or resource busy`가 발생합니다.
 
+`test-m3.sh`는 16 MiB보다 큰 zone을 감지하면 각 DATA zone의 앞 16 MiB만 사용하는
+bounded 기능 검증 모드로 자동 실행합니다. 물리 zone 경계와 순차 쓰기 규칙은 그대로 유지하고,
+zone rollover와 reset만 작은 유효 용량에서 빨리 발생시킵니다. 전체 2 GiB zone으로
+장시간 검증하려면 다음처럼 실행합니다.
+
+```bash
+UNDERLYING=/dev/nvme0n1 M3_ZONE_CAPACITY_MIB=full \
+sudo -E bash scripts/test-m3.sh
+```
+
 ---
 
 ## 현재 한계와 다음 단계
@@ -324,8 +335,8 @@ sudo bash scripts/test-failure-injection.sh
   timer 기반 추가 지연은 없지만, 일반 write는 writeback semantics를 사용합니다.
 - on-disk SSTable lookup은 binary search지만 block cache나 bloom filter가 없어 cold read의
   metadata I/O 비용이 남습니다.
-- SSTable compaction은 가장 오래된 4개를 병합하는 단순 정책입니다. level 기반
-  compaction과 workload-aware scheduling은 아직 없습니다.
+- SSTable compaction은 live table 수가 4개가 되면 현재 packed zone 전체를 병합하는
+  단순 정책입니다. level 기반 compaction과 workload-aware scheduling은 아직 없습니다.
 - partial write는 즉시 RMW합니다. dirty-block cache/write coalescing이 없습니다.
 - GC policy는 최소 `valid_blocks`를 고르는 단순 greedy입니다. copy budget, tail latency
   제어, workload-aware victim selection이 남아 있습니다.

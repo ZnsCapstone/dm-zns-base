@@ -9,7 +9,7 @@ DM_NAME=${DM_NAME:-myzns-recovery}
 DM_DEV=/dev/mapper/$DM_NAME
 MOD_NAME=dm-zns-base
 BLOCK_SIZE=4096
-METADATA_ZONES=10
+METADATA_ZONES=6
 GC_RESERVE_ZONES=2
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)

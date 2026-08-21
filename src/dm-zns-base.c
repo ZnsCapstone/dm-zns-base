@@ -32,17 +32,18 @@
 #define ZNS_BASE_BLOCK_SIZE 4096
 #define ZNS_BASE_SECTOR_SIZE 512
 #define SECTORS_PER_BLOCK 8
+#define ZNS_BASE_SECTORS_PER_MIB (1024 * 1024 / ZNS_BASE_SECTOR_SIZE)
 #define MEMTABLE_POOL_SIZE 4
 #define IO_POOL_SIZE 128
 #define GC_RESERVE_ZONES 2
 #define GC_LOW_WATERMARK 3
-#define GC_TARGET_FREE_ZONES 5
+#define GC_TARGET_FREE_ZONES 4
 #define ZNS_BASE_NO_ZONE ((unsigned int)-1)
 #define ZNS_BASE_MANIFEST_ZONES 2
 #define ZNS_BASE_WAL_ZONES      2
-#define ZNS_BASE_SSTABLE_ZONES  6
+#define ZNS_BASE_SSTABLE_ZONES  2
 #define ZNS_BASE_METADATA_ZONES (ZNS_BASE_MANIFEST_ZONES + ZNS_BASE_WAL_ZONES + ZNS_BASE_SSTABLE_ZONES)
-#define ZNS_BASE_FORMAT_VERSION 2
+#define ZNS_BASE_FORMAT_VERSION 3
 #define ZNS_BASE_WAL_MAGIC      0x4c41575aU // ZWAL
 #define ZNS_BASE_SSTABLE_MAGIC  0x4254535aU // ZSTB
 #define ZNS_BASE_MANIFEST_MAGIC 0x4e414d5aU	// ZMAN
@@ -56,6 +57,15 @@
 	((ZNS_BASE_BLOCK_SIZE - sizeof(struct zns_base_manifest_header_disk)) / \
 	 sizeof(struct zns_base_sstable_descriptor_disk))
 #define ZNS_BASE_SSTABLE_COMPACTION_THRESHOLD 4
+
+/* Keep the production default at the device-reported capacity.  Large-zone
+ * emulators can set this read-only parameter to exercise rollover and GC over
+ * a smaller prefix of every physical zone.  Zone reset still covers the full
+ * hardware zone. */
+static unsigned int data_zone_capacity_mib;
+module_param(data_zone_capacity_mib, uint, 0444);
+MODULE_PARM_DESC(data_zone_capacity_mib,
+	"optional usable MiB per data zone for bounded GC tests (0=device capacity)");
 
 enum zns_base_failpoint {
 	ZNS_BASE_FAIL_NONE = 0,
@@ -130,6 +140,7 @@ struct zns_base_zone_slot {
 struct zns_base_zone {
   	sector_t start_sector;
   	sector_t capacity_sectors;
+	sector_t reset_sectors;
   	sector_t write_pointer;
    	unsigned int nr_blocks;
    	unsigned int valid_blocks;
@@ -1914,6 +1925,7 @@ static int zns_base_report_zone(struct blk_zone *zone,
 {
   	struct zns_base_c *c = data;
   	struct zns_base_zone *z;
+	sector_t requested_capacity;
 
   	if (idx >= c->zone_state.nr_zones)
   		return -EINVAL;
@@ -1928,13 +1940,25 @@ static int zns_base_report_zone(struct blk_zone *zone,
 	z = &c->zone_state.zones[idx];
 	z->start_sector = zone->start;
 	z->capacity_sectors = zone->capacity;
+	z->reset_sectors = zone->len;
+	z->role = zns_base_zone_role_from_index(idx);
+	if (z->role == ZNS_BASE_ZONE_DATA && data_zone_capacity_mib) {
+		requested_capacity =
+			(sector_t)data_zone_capacity_mib *
+			ZNS_BASE_SECTORS_PER_MIB;
+		if (!requested_capacity ||
+		    requested_capacity > zone->capacity ||
+		    requested_capacity % SECTORS_PER_BLOCK != 0 ||
+		    zone->wp > zone->start + requested_capacity)
+			return -EINVAL;
+		z->capacity_sectors = requested_capacity;
+	}
 	/* Recovery uses the device-reported write pointer as the source of truth. */
 	z->write_pointer = zone->wp;
-	z->nr_blocks = zone->capacity / SECTORS_PER_BLOCK;
+	z->nr_blocks = z->capacity_sectors / SECTORS_PER_BLOCK;
 	z->valid_blocks = 0;
 	z->pending_blocks = 0;
 	z->gc_skip_run = 0;
-	z->role = zns_base_zone_role_from_index(idx);
   	z->state = ZNS_BASE_ZONE_FREE;
 	atomic_set(&z->inflight_reads, 0);
 	init_waitqueue_head(&z->read_waitq);
@@ -2525,7 +2549,7 @@ static int zns_base_reset_victim(struct zns_base_c *c,
 
   	ret = blkdev_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET,
   			       victim->start_sector,
-  			       victim->capacity_sectors,
+			       victim->reset_sectors,
   			       GFP_KERNEL);
   	if (ret)
   		return ret;
@@ -3183,7 +3207,7 @@ static int zns_base_reset_metadata_zone_locked(struct zns_base_c *c,
 	int ret;
 
 	ret = blkdev_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET,
-				      zone->start_sector, zone->capacity_sectors,
+				      zone->start_sector, zone->reset_sectors,
 				      GFP_KERNEL);
 	if (ret)
 		return ret;
@@ -3193,21 +3217,67 @@ static int zns_base_reset_metadata_zone_locked(struct zns_base_c *c,
 	return 0;
 }
 
-static int zns_base_choose_free_sstable_zone_locked(
-		struct zns_base_c *c, unsigned int *zone_idx)
+static size_t zns_base_sstable_blocks(size_t entry_count)
 {
+	return 1 + DIV_ROUND_UP(entry_count,
+		ZNS_BASE_BLOCK_SIZE / sizeof(struct zns_base_sstable_entry_disk));
+}
+
+static bool zns_base_sstable_zone_has_space(struct zns_base_zone *zone,
+					     size_t blocks)
+{
+	sector_t remaining;
+
+	if (zone->write_pointer < zone->start_sector ||
+	    zone->write_pointer > zone->start_sector + zone->capacity_sectors)
+		return false;
+	remaining = zone->start_sector + zone->capacity_sectors -
+		zone->write_pointer;
+	return blocks <= remaining / SECTORS_PER_BLOCK;
+}
+
+/*
+ * Normal MemTable flushes append to the current SSTable zone.  Compaction and
+ * checkpoint consolidation set rotate=true and write their replacement table
+ * to the other, empty zone.  Only after its Manifest is durable may the caller
+ * reset the old zone.  This two-zone ping-pong is the metadata equivalent of
+ * copy-on-write and is what makes packing multiple SSTables per zone safe.
+ */
+static int zns_base_choose_sstable_zone_locked(struct zns_base_c *c,
+		 size_t blocks, bool rotate, unsigned int *zone_idx)
+{
+	struct zns_base_metadata_stream *stream = &c->metadata.sstable;
+	struct zns_base_zone *active;
 	unsigned int i;
 
-	for (i = 0; i < c->metadata.sstable.zone_count; i++) {
-		unsigned int idx = c->metadata.sstable.first_zone_idx + i;
+	active = &c->zone_state.zones[stream->active_zone_idx];
+	if (active->role != ZNS_BASE_ZONE_SSTABLE)
+		return -EIO;
+
+	if (!rotate) {
+		if (!zns_base_sstable_zone_has_space(active, blocks))
+			return -ENOSPC;
+		active->state = ZNS_BASE_ZONE_ACTIVE;
+		*zone_idx = stream->active_zone_idx;
+		return 0;
+	}
+
+	for (i = 0; i < stream->zone_count; i++) {
+		unsigned int idx = stream->first_zone_idx + i;
 		struct zns_base_zone *zone = &c->zone_state.zones[idx];
 
 		if (zone->role != ZNS_BASE_ZONE_SSTABLE)
 			return -EIO;
+		if (idx == stream->active_zone_idx)
+			continue;
 		if (zone->write_pointer != zone->start_sector)
 			continue;
+		if (!zns_base_sstable_zone_has_space(zone, blocks))
+			return -ENOSPC;
 
+		active->state = ZNS_BASE_ZONE_FULL;
 		zone->state = ZNS_BASE_ZONE_ACTIVE;
+		stream->active_zone_idx = idx;
 		*zone_idx = idx;
 		return 0;
 	}
@@ -3218,6 +3288,7 @@ static int zns_base_choose_free_sstable_zone_locked(
 static int zns_base_write_sstable_locked(struct zns_base_c *c,
 					 const struct mapping_entry *entries,
 					 size_t entry_count, u64 table_generation,
+					 bool rotate,
 					 struct zns_base_sstable_descriptor_disk *descriptor)
 {
 	struct zns_base_sstable_header_disk *header;
@@ -3226,17 +3297,26 @@ static int zns_base_write_sstable_locked(struct zns_base_c *c,
 	u32 entries_crc = ~0;
 	sector_t start_sector;
 	size_t i, page_entry, blocks;
+	unsigned int previous_active;
 	unsigned int zone_idx;
 	int ret;
 
-	ret = zns_base_choose_free_sstable_zone_locked(c, &zone_idx);
+	blocks = zns_base_sstable_blocks(entry_count);
+	previous_active = c->metadata.sstable.active_zone_idx;
+	ret = zns_base_choose_sstable_zone_locked(c, blocks, rotate, &zone_idx);
 	if (ret)
 		return ret;
 
-	c->metadata.sstable.active_zone_idx = zone_idx;
 	buffer = kvzalloc(ZNS_BASE_BLOCK_SIZE, GFP_KERNEL);
-	if (!buffer)
+	if (!buffer) {
+		if (rotate) {
+			c->metadata.sstable.active_zone_idx = previous_active;
+			c->zone_state.zones[previous_active].state =
+				ZNS_BASE_ZONE_ACTIVE;
+			c->zone_state.zones[zone_idx].state = ZNS_BASE_ZONE_FREE;
+		}
 		return -ENOMEM;
+	}
 
 	for (i = 0; i < entry_count; i++) {
 		entry.logical_block = cpu_to_le64(entries[i].logical_block);
@@ -3281,8 +3361,6 @@ static int zns_base_write_sstable_locked(struct zns_base_c *c,
 			goto out;
 	}
 
-	blocks = 1 + DIV_ROUND_UP(entry_count,
-					 ZNS_BASE_BLOCK_SIZE / sizeof(entry));
 	descriptor->zone_idx = cpu_to_le32(zone_idx);
 	descriptor->start_sector = cpu_to_le64(start_sector);
 	descriptor->length_bytes = cpu_to_le64(blocks * ZNS_BASE_BLOCK_SIZE);
@@ -3290,11 +3368,22 @@ static int zns_base_write_sstable_locked(struct zns_base_c *c,
 	descriptor->max_logical_block = cpu_to_le64(entry_count ? entries[entry_count - 1].logical_block : 0);
 	descriptor->generation = cpu_to_le64(table_generation);
 	descriptor->payload_crc32c = cpu_to_le32(entries_crc);
-	c->zone_state.zones[zone_idx].state = ZNS_BASE_ZONE_FULL;
+	if (zns_base_sstable_zone_has_space(&c->zone_state.zones[zone_idx], 1))
+		c->zone_state.zones[zone_idx].state = ZNS_BASE_ZONE_ACTIVE;
+	else
+		c->zone_state.zones[zone_idx].state = ZNS_BASE_ZONE_FULL;
 	DMINFO("SSTable: zone=%u start=%llu entries=%zu crc=%08x",
 	       zone_idx, (unsigned long long)start_sector, entry_count,
 	       entries_crc);
 out:
+	if (ret && rotate) {
+		/* No Manifest can reference this replacement yet.  Keep the old live
+		 * zone selected; recovery will reset any written orphan tail. */
+		c->metadata.sstable.active_zone_idx = previous_active;
+		c->zone_state.zones[previous_active].state =
+			ZNS_BASE_ZONE_ACTIVE;
+		c->zone_state.zones[zone_idx].state = ZNS_BASE_ZONE_FULL;
+	}
 	kvfree(buffer);
 	return ret;
 }
@@ -3489,40 +3578,51 @@ static int zns_base_compact_sstables_locked(struct zns_base_c *c)
 {
 	struct mapping_entry *snapshot;
 	struct mapping_entry *entries;
-	struct zns_base_sstable_descriptor_disk *next;
+	struct zns_base_sstable_descriptor_disk *input_descriptors;
 	struct zns_base_sstable_descriptor_disk output;
-	struct zns_base_sstable_descriptor_disk
-		input_descriptors[ZNS_BASE_SSTABLE_COMPACTION_THRESHOLD];
-	unsigned int input_zones[ZNS_BASE_SSTABLE_COMPACTION_THRESHOLD];
-	unsigned int input_count = ZNS_BASE_SSTABLE_COMPACTION_THRESHOLD;
-	unsigned int next_count;
+	unsigned int input_count = c->metadata.sstable_count;
+	unsigned int input_zone;
+	unsigned int output_zone;
 	size_t entry_count = 0;
 	u64 max_seq = 0;
 	size_t i;
 	int ret;
 
-	if (c->metadata.sstable_count < input_count)
+	if (!input_count)
 		return 0;
-	next = kvcalloc(ZNS_BASE_MAX_MANIFEST_SSTABLES, sizeof(*next), GFP_KERNEL);
-	if (!next)
+	input_descriptors = kvcalloc(input_count, sizeof(*input_descriptors),
+		GFP_KERNEL);
+	if (!input_descriptors)
 		return -ENOMEM;
+	memcpy(input_descriptors, c->metadata.sstables,
+	       input_count * sizeof(*input_descriptors));
+	input_zone = le32_to_cpu(input_descriptors[0].zone_idx);
+	for (i = 1; i < input_count; i++) {
+		if (le32_to_cpu(input_descriptors[i].zone_idx) != input_zone) {
+			DMERR("compaction: live SSTables span multiple zones");
+			ret = -EIO;
+			goto out_descriptors;
+		}
+	}
 
 	snapshot = kvcalloc(c->nr_logical_blocks, sizeof(*snapshot), GFP_KERNEL);
 	if (!snapshot) {
 		ret = -ENOMEM;
-		goto out_next;
+		goto out_descriptors;
 	}
 	for (i = 0; i < input_count; i++) {
-		input_descriptors[i] = c->metadata.sstables[i];
-		input_zones[i] = le32_to_cpu(c->metadata.sstables[i].zone_idx);
 		ret = zns_base_sstable_apply_to_snapshot_locked(c,
-			&c->metadata.sstables[i], snapshot);
+			&input_descriptors[i], snapshot);
 		if (ret)
 			goto out_snapshot;
 	}
 	for (i = 0; i < c->nr_logical_blocks; i++)
 		if (snapshot[i].seq)
 			entry_count++;
+	if (!entry_count) {
+		ret = -EIO;
+		goto out_snapshot;
+	}
 	entries = kvcalloc(entry_count, sizeof(*entries), GFP_KERNEL);
 	if (!entries) {
 		ret = -ENOMEM;
@@ -3536,21 +3636,23 @@ static int zns_base_compact_sstables_locked(struct zns_base_c *c)
 		max_seq = max(max_seq, snapshot[i].seq);
 	}
 	ret = zns_base_write_sstable_locked(c, entries, entry_count, max_seq,
-					      &output);
+					      true, &output);
 	if (ret)
 		goto out_entries;
+	output_zone = le32_to_cpu(output.zone_idx);
 	if (zns_base_failpoint_hit(ZNS_BASE_FAIL_AFTER_SSTABLE_WRITE)) {
+		/* The replacement is not referenced by any Manifest yet. */
+		zns_base_reset_metadata_zone_locked(c, output_zone);
+		c->metadata.sstable.active_zone_idx = input_zone;
+		c->zone_state.zones[input_zone].state = ZNS_BASE_ZONE_ACTIVE;
 		ret = -EIO;
 		goto out_entries;
 	}
 
-	next_count = c->metadata.sstable_count - input_count;
-	memcpy(next, &c->metadata.sstables[input_count],
-	       next_count * sizeof(*next));
-	next[next_count++] = output;
-	ret = zns_base_publish_catalog_locked(c, next, next_count, max_seq);
+	ret = zns_base_publish_catalog_locked(c, &output, 1, max_seq);
 	if (ret)
 		goto out_entries;
+	c->metadata.checkpoint_sstable_zone_idx = output_zone;
 
 	/* The output and Manifest are now durable.  Old duplicate data PBAs can
 	 * finally be reflected in the reverse map; failures only leave conservative
@@ -3564,18 +3666,16 @@ static int zns_base_compact_sstables_locked(struct zns_base_c *c)
 			DMWARN("compaction: obsolete reverse-map scan failed for input %zu: %d",
 			       i, invalidate_ret);
 	}
-	for (i = 0; i < input_count; i++) {
-		ret = zns_base_reset_metadata_zone_locked(c,
-			input_zones[i]);
-		if (ret)
-			break;
-	}
+	/* Every live input was packed into one zone.  Reset it once, after the
+	 * replacement SSTable and its Manifest are durable. */
+	if (input_zone != output_zone)
+		ret = zns_base_reset_metadata_zone_locked(c, input_zone);
 out_entries:
 	kvfree(entries);
 out_snapshot:
 	kvfree(snapshot);
-	out_next:
-	kvfree(next);
+out_descriptors:
+	kvfree(input_descriptors);
 	return ret;
 }
 
@@ -3605,7 +3705,15 @@ static int zns_base_persist_memtable_locked(struct zns_base_c *c,
 
 	max_seq = zns_base_entries_max_seq(entries, entry_count);
 	ret = zns_base_write_sstable_locked(c, entries, entry_count, max_seq,
-					      &output);
+					      false, &output);
+	if (ret == -ENOSPC && c->metadata.sstable_count) {
+		/* A packed zone can run out before the descriptor threshold.  Fold
+		 * every live table into the other zone, then append this MemTable. */
+		ret = zns_base_compact_sstables_locked(c);
+		if (!ret)
+			ret = zns_base_write_sstable_locked(c, entries,
+				entry_count, max_seq, false, &output);
+	}
 	if (ret)
 		goto out_next;
 	if (zns_base_failpoint_hit(ZNS_BASE_FAIL_AFTER_SSTABLE_WRITE)) {
@@ -3734,10 +3842,21 @@ static int zns_base_checkpoint_locked(struct zns_base_c *c)
 	       c->metadata.sstable_count * sizeof(*old));
 	old_count = c->metadata.sstable_count;
 	ret = zns_base_write_sstable_locked(c, entries, entry_count,
-						checkpoint_seq, &descriptor);
+						checkpoint_seq, old_count > 0,
+						&descriptor);
 	if (ret)
 		goto out;
 	if (zns_base_failpoint_hit(ZNS_BASE_FAIL_AFTER_SSTABLE_WRITE)) {
+		unsigned int output_zone = le32_to_cpu(descriptor.zone_idx);
+
+		if (old_count) {
+			unsigned int input_zone = le32_to_cpu(old[0].zone_idx);
+
+			zns_base_reset_metadata_zone_locked(c, output_zone);
+			c->metadata.sstable.active_zone_idx = input_zone;
+			c->zone_state.zones[input_zone].state =
+				ZNS_BASE_ZONE_ACTIVE;
+		}
 		ret = -EIO;
 		goto out;
 	}
@@ -3750,12 +3869,27 @@ static int zns_base_checkpoint_locked(struct zns_base_c *c)
 		ret = -EIO;
 		goto out;
 	}
+	c->metadata.checkpoint_sstable_zone_idx =
+		le32_to_cpu(descriptor.zone_idx);
 
 	for (i = 0; i < old_count; i++) {
 		unsigned int zone_idx = le32_to_cpu(old[i].zone_idx);
+		unsigned int j;
+		bool already_reset = false;
 
-		if (zone_idx != le32_to_cpu(descriptor.zone_idx))
-			zns_base_reset_metadata_zone_locked(c, zone_idx);
+		if (zone_idx == le32_to_cpu(descriptor.zone_idx))
+			continue;
+		for (j = 0; j < i; j++) {
+			if (le32_to_cpu(old[j].zone_idx) == zone_idx) {
+				already_reset = true;
+				break;
+			}
+		}
+		if (!already_reset) {
+			ret = zns_base_reset_metadata_zone_locked(c, zone_idx);
+			if (ret)
+				goto out;
+		}
 	}
 
 	/* The manifest now covers every published WAL record. */
@@ -3912,6 +4046,62 @@ static bool zns_base_manifest_page_valid(
 	return actual_crc == stored_crc;
 }
 
+/*
+ * A valid Manifest owns at most one packed SSTable zone.  Anything in the
+ * other zone is an unpublished compaction/checkpoint output and can be reset.
+ * With no Manifest, WAL replay is the only source of mappings, so both
+ * SSTable zones are orphaned and may be cleared.
+ */
+static int zns_base_recover_sstable_zones(struct zns_base_c *c,
+	const struct zns_base_sstable_descriptor_disk *descriptors,
+	unsigned int descriptor_count)
+{
+	struct zns_base_metadata_stream *stream = &c->metadata.sstable;
+	unsigned int live_zone = ZNS_BASE_NO_ZONE;
+	unsigned int i;
+	int ret;
+
+	if (descriptor_count) {
+		live_zone = le32_to_cpu(descriptors[0].zone_idx);
+		if (live_zone < stream->first_zone_idx ||
+		    live_zone >= stream->first_zone_idx + stream->zone_count)
+			return -EIO;
+		for (i = 1; i < descriptor_count; i++) {
+			if (le32_to_cpu(descriptors[i].zone_idx) != live_zone)
+				return -EIO;
+		}
+	}
+
+	for (i = 0; i < stream->zone_count; i++) {
+		unsigned int idx = stream->first_zone_idx + i;
+		struct zns_base_zone *zone = &c->zone_state.zones[idx];
+		sector_t end = zone->start_sector + zone->capacity_sectors;
+
+		if (idx == live_zone) {
+			if (zone->write_pointer == zone->start_sector)
+				return -EIO;
+			zone->state = zone->write_pointer < end ?
+				ZNS_BASE_ZONE_ACTIVE : ZNS_BASE_ZONE_FULL;
+			continue;
+		}
+
+		if (zone->write_pointer != zone->start_sector) {
+			ret = zns_base_reset_metadata_zone_locked(c, idx);
+			if (ret)
+				return ret;
+		} else {
+			zone->state = ZNS_BASE_ZONE_FREE;
+		}
+	}
+
+	if (live_zone == ZNS_BASE_NO_ZONE) {
+		live_zone = stream->first_zone_idx;
+		c->zone_state.zones[live_zone].state = ZNS_BASE_ZONE_ACTIVE;
+	}
+	stream->active_zone_idx = live_zone;
+	return 0;
+}
+
 static int zns_base_manifest_recover(struct zns_base_c *c)
 {
 	struct zns_base_zone *manifest_zone;
@@ -3966,6 +4156,10 @@ static int zns_base_manifest_recover(struct zns_base_c *c)
 		}
 	}
 
+	ret = zns_base_recover_sstable_zones(c, latest, latest_count);
+	if (ret)
+		goto out;
+
 	if (!latest_generation)
 		goto out;
 
@@ -4002,10 +4196,9 @@ static int zns_base_manifest_recover(struct zns_base_c *c)
 	c->metadata.manifest.active_zone_idx = latest_manifest_idx;
 	memcpy(c->metadata.sstables, latest, latest_count * sizeof(*latest));
 	c->metadata.sstable_count = latest_count;
+	c->metadata.checkpoint_sstable_zone_idx = latest_count == 1 ?
+		le32_to_cpu(latest[0].zone_idx) : ZNS_BASE_NO_ZONE;
 	c->mapping.next_seq = max_seq + 1;
-	for (i = 0; i < latest_count; i++)
-		c->zone_state.zones[le32_to_cpu(latest[i].zone_idx)].state =
-			ZNS_BASE_ZONE_FULL;
 	goto out;
 out_snapshot:
 	kvfree(snapshot);
@@ -4783,6 +4976,16 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		dm_put_device(ti, c->dev);
 		kfree(c);
 		return ret;
+	}
+	if (zns_base_sstable_blocks(c->nr_logical_blocks) >
+	    c->zone_state.zones[c->metadata.sstable.first_zone_idx].nr_blocks) {
+		ti->error = "full mapping SSTable does not fit in one metadata zone";
+		mapping_destroy(c);
+		zns_base_metadata_destroy(c);
+		zns_base_zone_destroy(c);
+		dm_put_device(ti, c->dev);
+		kfree(c);
+		return -ENOSPC;
 	}
 
 	/* WAL/SSTable replay can wait for MemTable flush work during recovery. */

@@ -9,11 +9,15 @@ DM_DEV=/dev/mapper/$DM_NAME
 MOD_NAME=dm-zns-base
 BLOCK_SIZE=4096
 SECTORS_PER_BLOCK=8
+WAL_PAGE_RECORDS=126
 GC_WORKING_SET_MIB=${GC_WORKING_SET_MIB:-0}
 GC_MARKER_MIB=${GC_MARKER_MIB:-4}
+# auto caps every larger zone to 16 MiB for a bounded functional GC test.
+# Use "full" for a device-scale endurance run, or supply an explicit MiB value.
+M3_ZONE_CAPACITY_MIB=${M3_ZONE_CAPACITY_MIB:-auto}
 MANIFEST_ZONES=2
 WAL_ZONES=2
-SSTABLE_ZONES=6
+SSTABLE_ZONES=2
 METADATA_ZONES=$((MANIFEST_ZONES + WAL_ZONES + SSTABLE_ZONES))
 GC_RESERVE_ZONES=2
 
@@ -48,6 +52,28 @@ zone_wptr() {
 		}'
 }
 
+wait_for_persistent_memtable() {
+	local expected_seq=$1
+	local i status checkpoint_seq persistent_sstables
+
+	for ((i = 0; i < 400; i++)); do
+		status=$(dmsetup status "$DM_NAME") ||
+			fail "could not read target status while waiting for MemTable persistence"
+		checkpoint_seq=$(sed -n \
+			's/.*checkpoint_seq=\([0-9][0-9]*\).*/\1/p' <<<"$status")
+		persistent_sstables=$(sed -n \
+			's/.*persistent_sstables=\([0-9][0-9]*\).*/\1/p' <<<"$status")
+		if [ -n "$checkpoint_seq" ] && [ -n "$persistent_sstables" ] &&
+		   [ "$checkpoint_seq" -ge "$expected_seq" ] &&
+		   [ "$persistent_sstables" -gt 0 ]; then
+			return 0
+		fi
+		sleep 0.05
+	done
+
+	fail "MemTable persistence did not reach checkpoint_seq=$expected_seq"
+}
+
 [ -b "$UNDERLYING" ] || fail "$UNDERLYING is missing. Run scripts/nullblk-up.sh first."
 
 underlying_name=$(basename "$(readlink -f "$UNDERLYING")")
@@ -61,10 +87,42 @@ nr_zones=$(cat "$queue_dir/nr_zones" 2>/dev/null) ||
 	fail "rollover test requires metadata, GC reserve, and two data zones"
 [ $((zone_sectors % SECTORS_PER_BLOCK)) -eq 0 ] ||
 	fail "zone capacity is not aligned to 4 KiB blocks"
+[ $((zone_sectors % 2048)) -eq 0 ] ||
+	fail "zone size must be an integral MiB for this test"
+
+hardware_zone_mib=$((zone_sectors / 2048))
+case "$M3_ZONE_CAPACITY_MIB" in
+auto)
+	if [ "$hardware_zone_mib" -gt 16 ]; then
+		effective_zone_mib=16
+	else
+		effective_zone_mib=$hardware_zone_mib
+	fi
+	;;
+full)
+	effective_zone_mib=$hardware_zone_mib
+	;;
+*[!0-9]*|'')
+	fail "M3_ZONE_CAPACITY_MIB must be auto, full, or a positive integer"
+	;;
+*)
+	effective_zone_mib=$M3_ZONE_CAPACITY_MIB
+	;;
+esac
+[ "$effective_zone_mib" -gt 0 ] || fail "effective data-zone capacity must be positive"
+[ "$effective_zone_mib" -le "$hardware_zone_mib" ] ||
+	fail "requested data-zone capacity exceeds the hardware zone size"
+effective_zone_sectors=$((effective_zone_mib * 2048))
+if [ "$effective_zone_sectors" -eq "$zone_sectors" ]; then
+	module_zone_capacity_mib=0
+else
+	module_zone_capacity_mib=$effective_zone_mib
+fi
+
 data_zones=$((nr_zones - METADATA_ZONES))
 logical_data_zones=$((data_zones - GC_RESERVE_ZONES))
-sectors=$((logical_data_zones * zone_sectors))
-logical_mib=$((logical_data_zones * zone_sectors / 2048))
+sectors=$((logical_data_zones * effective_zone_sectors))
+logical_mib=$((logical_data_zones * effective_zone_mib))
 if [ "$GC_WORKING_SET_MIB" -eq 0 ]; then
 	GC_WORKING_SET_MIB=$((logical_mib * 80 / 100))
 fi
@@ -97,18 +155,25 @@ else
 fi
 
 echo "[*] insmod $KO_PATH"
-insmod "$KO_PATH" || fail "insmod failed"
+insmod "$KO_PATH" data_zone_capacity_mib="$module_zone_capacity_mib" ||
+	fail "insmod failed"
 
 echo "[*] dmsetup create $DM_NAME"
 echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" ||
 	fail "dmsetup create failed"
 
-block_count=$((zone_sectors / SECTORS_PER_BLOCK + 1))
+zone_block_count=$((effective_zone_sectors / SECTORS_PER_BLOCK))
+# Cross the first data-zone boundary and continue through the next complete
+# WAL page.  Merely writing zone_blocks+1 leaves up to 125 mappings in the
+# partial in-memory WAL page, so a 4096-entry MemTable may not freeze yet.
+block_count=$((((zone_block_count + 1 + WAL_PAGE_RECORDS - 1) / WAL_PAGE_RECORDS) * WAL_PAGE_RECORDS))
+rollover_second_zone_blocks=$((block_count - zone_block_count))
 total_bytes=$((block_count * BLOCK_SIZE))
 
 echo
 echo "=== [1/6] underlying zone geometry ==="
-echo "zone sectors=$zone_sectors, zones=$nr_zones, data start=$METADATA_ZONES, rollover write=$total_bytes bytes"
+echo "hardware zone=${hardware_zone_mib}MiB, effective data zone=${effective_zone_mib}MiB, zones=$nr_zones"
+echo "data start=$METADATA_ZONES, rollover write=$total_bytes bytes"
 echo "[OK]"
 
 echo
@@ -149,9 +214,14 @@ echo "[OK]"
 echo
 echo "=== [4/6] metadata is role-isolated; data zones roll over ==="
 
-# A 64 MiB rollover write fills multiple MemTables. Persistent LSM flushes
-# therefore append SSTables and publish a Manifest; this is metadata, not a
-# user-data write leaking into metadata zones.
+# WAL publication and the persistent MemTable worker are asynchronous.  Wait
+# until the first full MemTable is represented by an SSTable and Manifest
+# before inspecting their physical write pointers.
+wait_for_persistent_memtable "$zone_block_count"
+
+# The rollover write fills a MemTable. Persistent LSM flushes therefore append
+# SSTables and publish a Manifest; this is metadata, not a user-data write
+# leaking into metadata zones.
 manifest_advanced=0
 sstable_advanced=0
 for ((i = 0; i < MANIFEST_ZONES; i++)); do
@@ -182,21 +252,21 @@ data1_wptr_hex=$(zone_wptr "$next_data_sector")
 
 data0_wptr=$((data0_wptr_hex))
 data1_wptr=$((data1_wptr_hex))
-expected_data0_wptr=$zone_sectors
+expected_data0_wptr=$effective_zone_sectors
 # blkzone report prints the write pointer relative to each zone start.
-expected_data1_wptr=$((SECTORS_PER_BLOCK * 2))
+expected_data1_wptr=$((SECTORS_PER_BLOCK * (rollover_second_zone_blocks + 1)))
 
 echo "data zone $METADATA_ZONES wp=$data0_wptr, expected=$expected_data0_wptr"
 echo "data zone $((METADATA_ZONES + 1)) wp=$data1_wptr, expected=$expected_data1_wptr"
 
 [ "$data0_wptr" -eq "$expected_data0_wptr" ] ||
-	fail "first data zone is not full after rollover write"
+	fail "first data zone did not reach the effective rollover boundary"
 [ "$data1_wptr" -eq "$expected_data1_wptr" ] ||
 	fail "second data zone did not receive rollover and overwrite blocks"
 echo "[OK]"
 
 echo
-echo "=== [5/6] GC reclaims space during 80% fill and 1.2x random overwrite ==="
+echo "=== [5/6] GC reclaims space during bounded fill and random overwrite ==="
 dd if=/dev/urandom of="$TMP_DIR/gc-marker.bin" bs=1M \
 	count="$GC_MARKER_MIB" status=none
 dd if="$TMP_DIR/gc-marker.bin" of="$DM_DEV" bs=1M \
@@ -206,13 +276,23 @@ dd if="$TMP_DIR/gc-marker.bin" of="$DM_DEV" bs=1M \
 fio --name=gc-fill --filename="$DM_DEV" --rw=randwrite \
 	--bs=4k --size="${GC_WORKING_SET_MIB}M" --io_size="${GC_WORKING_SET_MIB}M" \
 	--ioengine=libaio --iodepth=32 --direct=1 --group_reporting ||
-	fail "80% random fill failed"
+	fail "random fill failed"
 
 fio --name=gc-overwrite --filename="$DM_DEV" --rw=randwrite \
 	--bs=4k --size="${GC_WORKING_SET_MIB}M" --io_size="${GC_OVERWRITE_MIB}M" \
 	--ioengine=libaio --iodepth=32 --direct=1 --group_reporting ||
-	fail "1.2x random overwrite failed"
+	fail "random overwrite failed"
+
+target_status=$(dmsetup status "$DM_NAME") || fail "could not read target status after GC"
+gc_resets=$(sed -n 's/.*gc_resets=\([0-9][0-9]*\).*/\1/p' <<<"$target_status")
+gc_moved_blocks=$(sed -n 's/.*gc_moved_blocks=\([0-9][0-9]*\).*/\1/p' <<<"$target_status")
+[ -n "$gc_resets" ] || fail "target status is missing gc_resets"
+[ -n "$gc_moved_blocks" ] || fail "target status is missing gc_moved_blocks"
+[ "$gc_resets" -gt 0 ] || fail "workload did not reset/reuse any data zone"
+[ "$gc_moved_blocks" -gt 0 ] || fail "workload did not exercise live-block migration"
+
 echo "working set=${GC_WORKING_SET_MIB}MiB (80% of ${logical_mib}MiB), overwrite=${GC_OVERWRITE_MIB}MiB"
+echo "gc resets=$gc_resets, moved blocks=$gc_moved_blocks"
 echo "[OK]"
 
 echo
