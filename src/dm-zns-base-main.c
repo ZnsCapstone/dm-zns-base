@@ -38,6 +38,10 @@ static struct workqueue_struct *zns_gc_wq;
  * zone을 reset한다. GC/compaction과 별개(서로 안 막게). */
 static struct workqueue_struct *zns_wal_reclaim_wq;
 
+/* Frozen memtable 직렬화는 큰 버퍼를 필요로 하므로 bio 완료(atomic) 경로가
+ * 아니라 이 process-context 워크큐에서 수행한다. */
+static struct workqueue_struct *zns_flush_wq;
+
 struct deferred_bio_work {
 	struct work_struct work;
 	struct bio *bio;
@@ -165,8 +169,18 @@ struct zns_base_c {
 	int wal_ckpt_inflight;              // 아직 durable 안 된 체크포인트 개수
 	u64 wal_highest_issued_split_gen;   // 지금까지 발행된 체크포인트 중 최대 split_gen
 	u64 wal_durable_split_gen;          // 이 값보다 작은 gen의 WAL zone은 회수 가능
+	wait_queue_head_t flush_waitq;      // dtr에서 비동기 flush chain drain 대기
 
 	spinlock_t 		lock;
+};
+
+struct memtable_flush_work {
+	struct work_struct work;
+	struct zns_base_c *c;
+	struct skiplist *old_memtable;
+	u64 seq_no;
+	u64 split_gen;
+	sector_t split_off;
 };
 
 // SSTable - 오래된 걸 압축해서 Zone에 색인포함으로 보관
@@ -1075,6 +1089,16 @@ static void checkpoint_write_done(struct bio *bio);
 static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memtable,
 				   u64 seq_no, u64 split_gen, sector_t split_off);
 
+static void flush_memtable_work_fn(struct work_struct *work)
+{
+	struct memtable_flush_work *fw =
+		container_of(work, struct memtable_flush_work, work);
+
+	flush_memtable_async(fw->c, fw->old_memtable, fw->seq_no,
+				 fw->split_gen, fw->split_off);
+	kfree(fw);
+}
+
 /* WAL PUT 레코드(512B, 앞 32B만 유효) 비동기 제출. process/atomic context
  * 양쪽에서 불리므로 GFP_ATOMIC 필수(GFP_NOIO도 sleep 가능해 안전하지 않음). */
 static void submit_wal_async(struct zns_io_ctx *ctx)
@@ -1276,6 +1300,7 @@ static void wal_put_done(struct bio *wal_bio)
 	u64 lba = ctx->lba;
 	sector_t phys = ctx->phys;
 	struct skiplist *flushed_memtable = NULL;
+	struct memtable_flush_work *flush_work = NULL;
 	u64 flushed_seq = 0;
 	u64 flushed_split_gen = 0;
 	sector_t flushed_split_off = 0;
@@ -1297,7 +1322,8 @@ static void wal_put_done(struct bio *wal_bio)
 		/* memtable 교체는 이 락 안에서 — skiplist_init도 GFP_ATOMIC이라 atomic 컨텍스트에서 불러도 안전하다. */
 		struct skiplist *new_memtable = kzalloc(sizeof(*new_memtable), GFP_ATOMIC);
 
-		if (new_memtable && skiplist_init(new_memtable) == 0) {
+		flush_work = kzalloc(sizeof(*flush_work), GFP_ATOMIC);
+		if (new_memtable && flush_work && skiplist_init(new_memtable) == 0) {
 			unsigned int wal_zone = c->zp->active_zone[ZONE_TAG_WAL];
 
 			flushed_memtable = c->memtable;
@@ -1311,8 +1337,16 @@ static void wal_put_done(struct bio *wal_bio)
 			/* 이 flush의 체크포인트가 곧 발행된다 — durable될 때까지 in-flight로 센다. split_gen은 스왑마다 단조 증가. */
 			c->wal_ckpt_inflight++;
 			c->wal_highest_issued_split_gen = flushed_split_gen;
+			INIT_WORK(&flush_work->work, flush_memtable_work_fn);
+			flush_work->c = c;
+			flush_work->old_memtable = flushed_memtable;
+			flush_work->seq_no = flushed_seq;
+			flush_work->split_gen = flushed_split_gen;
+			flush_work->split_off = flushed_split_off;
 		} else {
 			/* 못 만들면 이번 flush는 건너뛴다 — 다음 put에서 다시 시도됨 */
+			kfree(flush_work);
+			flush_work = NULL;
 			kfree(new_memtable);
 		}
 	}
@@ -1325,9 +1359,8 @@ static void wal_put_done(struct bio *wal_bio)
 	}
 
 	/* flush는 fire-and-forget — WAL에 이미 durable하게 기록됐으므로 데이터 bio가 flush 완료를 기다릴 필요 없다. */
-	if (flushed_memtable)
-		flush_memtable_async(c, flushed_memtable, flushed_seq,
-				     flushed_split_gen, flushed_split_off);
+	if (flush_work)
+		queue_work(zns_flush_wq, &flush_work->work);
 
 	bio_endio(orig);
 }
@@ -1347,6 +1380,7 @@ static void flush_chain_end(struct zns_base_c *c)
 		advanced = true;
 	}
 	spin_unlock_irq(&c->lock);
+	wake_up_all(&c->flush_waitq);
 
 	if (advanced)
 		queue_work(zns_wal_reclaim_wq, &c->wal_reclaim_work);
@@ -1569,7 +1603,8 @@ static void sstable_write_chunk_done(struct bio *bio)
 	sstable_flush_complete(ctx, 0);  /* 전 청크 durable */
 }
 
-/* memtable 하나를 SSTable 한 세대로 직렬화해서 zone에 기록. wal_put_done (atomic context)에서 호출되므로 전부 GFP_ATOMIC.
+/* memtable 하나를 SSTable 한 세대로 직렬화해서 zone에 기록. 전용 flush worker의
+ * process context에서 호출되므로 큰 버퍼는 kvzalloc(GFP_KERNEL)로 잡을 수 있다.
  * old_memtable은 이미 c->memtable에서 떼어져 나온 상태라 락 없이 순회해도 안전.
  * split_gen/off는 ctx에 실어 뒷단 체크포인트 레코드에 쓴다. */
 static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memtable,
@@ -1600,10 +1635,9 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 	nr_sectors = data_bytes / 512;
 	alloc_bytes = round_up(data_bytes, PAGE_SIZE);
 
-	/* buf는 물리 연속 메모리 통짜 할당(GFP_ATOMIC) — 큰 flush_threshold에선 이 할당이 실패해 flush를 포기할 수 있다(데이터는 WAL에 남아 안전).
-	 * atomic context라 kvmalloc(sleep 가능)을 못 써 kzalloc 유지. 쓰기 자체는 submit_sstable_write_async가 이미 청크 bio로 쪼갠다.
-	 * 근본 해결은 flush를 process context로 옮기는 것(범위 밖). */
-	buf = kzalloc(alloc_bytes, GFP_ATOMIC);
+	/* kvzalloc은 큰 버퍼가 물리 연속 할당에 실패하면 vmalloc로 폴백한다.
+	 * 아래 비동기 SSTable writer는 buf_page()로 두 종류 버퍼를 모두 지원한다. */
+	buf = kvzalloc(alloc_bytes, GFP_KERNEL);
 	if (!buf) {
 		DMERR("SSTable flush: out of memory (seq=%llu), dropping this generation (data remains in WAL)",
 		      (unsigned long long)seq_no);
@@ -1636,18 +1670,18 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 	if (ret) {
 		DMERR("SSTable flush: zone_pool_alloc failed (%d, seq=%llu), dropping this generation (data remains in WAL)",
 		      ret, (unsigned long long)seq_no);
-		kfree(buf);
+		kvfree(buf);
 		skiplist_destroy(old_memtable);
 		kfree(old_memtable);
 		flush_chain_end(c);
 		return;
 	}
 
-	ctx = kzalloc(sizeof(*ctx), GFP_ATOMIC);
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx) {
 		DMERR("SSTable flush: out of memory building ctx (seq=%llu), dropping this generation (data remains in WAL)",
 		      (unsigned long long)seq_no);
-		kfree(buf);
+		kvfree(buf);
 		skiplist_destroy(old_memtable);
 		kfree(old_memtable);
 		flush_chain_end(c);
@@ -2909,6 +2943,7 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	INIT_WORK(&c->compaction_work, compaction_work_fn);
 	INIT_WORK(&c->gc_work, gc_work_fn);
 	INIT_WORK(&c->wal_reclaim_work, wal_reclaim_work_fn);
+	init_waitqueue_head(&c->flush_waitq);
 
 	spin_lock_init(&c->lock);
 
@@ -2932,6 +2967,11 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 static void zns_base_dtr(struct dm_target *ti)
 {
 	struct zns_base_c *c = ti->private;
+
+	/* worker가 SSTable/checkpoint 비동기 체인을 시작하게 한 뒤, 마지막 callback의
+	 * flush_chain_end까지 기다려 c와 frozen memtable의 수명을 보장한다. */
+	flush_workqueue(zns_flush_wq);
+	wait_event(c->flush_waitq, READ_ONCE(c->wal_ckpt_inflight) == 0);
 
 	/* 아직 큐잉/실행 중인 compaction이 있으면 완전히 끝날 때까지 기다린다(안 그러면 아래에서 c를 해제한 뒤 use-after-free) */
 	cancel_work_sync(&c->compaction_work);
@@ -3253,9 +3293,21 @@ static int __init zns_base_init(void)
 		return -ENOMEM;
 	}
 
+	zns_flush_wq = alloc_workqueue("dm_zns_base_flush",
+				       WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+	if (!zns_flush_wq) {
+		DMERR("failed to allocate flush workqueue");
+		destroy_workqueue(zns_wal_reclaim_wq);
+		destroy_workqueue(zns_gc_wq);
+		destroy_workqueue(zns_compaction_wq);
+		destroy_workqueue(zns_wq);
+		return -ENOMEM;
+	}
+
 	ret = dm_register_target(&zns_base_target);
 	if (ret < 0) {
 		DMERR("target registration failed: %d", ret);
+		destroy_workqueue(zns_flush_wq);
 		destroy_workqueue(zns_wal_reclaim_wq);
 		destroy_workqueue(zns_gc_wq);
 		destroy_workqueue(zns_compaction_wq);
@@ -3269,6 +3321,7 @@ static int __init zns_base_init(void)
 static void __exit zns_base_exit(void)
 {
 	dm_unregister_target(&zns_base_target);
+	destroy_workqueue(zns_flush_wq);
 	destroy_workqueue(zns_wal_reclaim_wq);
 	destroy_workqueue(zns_gc_wq);
 	destroy_workqueue(zns_compaction_wq);
