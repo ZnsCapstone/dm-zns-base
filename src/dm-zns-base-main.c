@@ -122,6 +122,8 @@ struct zone_pool {
 	u64 wal_next_gen; 							// 다음 WAL zone에 부여할 generation (단조 증가, c->lock 하에 증가)
 	atomic_t *inflight_reads;  // zone_id별 진행 중인 읽기 수 — 회수(reset) 전 drain 대기용
 	wait_queue_head_t reclaim_waitq;  // inflight_reads가 0이 되길 기다리는 회수 대기 큐
+	bool *append_ready;               // zone header가 durable해 append를 받을 수 있음
+	struct list_head *append_waiters; // header 완료 전 대기하는 zone append bio
 };
 
 /* zone_dispatch_write() 대기열에 들어가는 항목 하나 — "phys부터 nr섹터를
@@ -133,6 +135,11 @@ struct dispatch_waiter {
 	sector_t nr;
 	void (*fire)(void *arg);
 	void *arg;
+};
+
+struct append_waiter {
+	struct list_head link;
+	struct bio *bio;
 };
 
 struct zns_base_c {
@@ -242,6 +249,11 @@ struct zns_io_ctx {
 	struct bio *orig_bio;
 	u64 lba;
 	sector_t phys;
+	sector_t reserved_phys;      /* capacity 예약용; append 완료 전에는 실제 주소가 아님 */
+	sector_t orig_sector;
+	unsigned int orig_opf;
+	bio_end_io_t *orig_end_io;
+	void *orig_private;
 
 	/* SSTable flush 경로 전용 */
 	struct skiplist *old_memtable;
@@ -364,6 +376,7 @@ static void zone_pool_mark_free(struct zone_pool *zp, unsigned int zone_id)
 	zp->zone_tag[zone_id] = ZONE_TAG_FREE;
 	zp->invalid_count[zone_id] = 0;
 	zp->sstable_live_count[zone_id] = 0;
+	zp->append_ready[zone_id] = false;
 }
 
 static inline unsigned int zone_of(struct zone_pool *zp, sector_t phys)
@@ -482,6 +495,54 @@ static void zone_dispatch_cancel(struct zns_base_c *c, sector_t phys, sector_t n
 	if (zone_dispatch_gate(c, phys, nr, dispatch_fire_noop, NULL))
 		DMERR("zone dispatch: out of memory cancelling reservation (zone %u, phys %llu) — this zone's dispatch queue will stall",
 		      zone_of(c->zp, phys), (unsigned long long)phys);
+}
+
+/* Zone Append는 실제 기록 위치를 컨트롤러가 결정하므로 같은 zone에 여러
+ * bio를 동시 제출해도 된다. 단, 오프셋 0의 zone header가 먼저 durable해야
+ * 하므로 새 zone의 append는 header 완료 콜백까지 이 큐에서 대기한다. */
+static int zone_append_write(struct zns_base_c *c, unsigned int zid, struct bio *bio)
+{
+	struct append_waiter *w;
+
+	spin_lock_irq(&c->lock);
+	if (c->zp->append_ready[zid]) {
+		spin_unlock_irq(&c->lock);
+		submit_bio_deferred(bio);
+		return 0;
+	}
+	w = kzalloc(sizeof(*w), GFP_ATOMIC);
+	if (!w) {
+		spin_unlock_irq(&c->lock);
+		return -ENOMEM;
+	}
+	w->bio = bio;
+	list_add_tail(&w->link, &c->zp->append_waiters[zid]);
+	spin_unlock_irq(&c->lock);
+	return 0;
+}
+
+static void zone_append_header_done(struct zns_base_c *c, unsigned int zid,
+				    blk_status_t status)
+{
+	LIST_HEAD(ready);
+	struct append_waiter *w, *tmp;
+
+	spin_lock_irq(&c->lock);
+	if (!status)
+		c->zp->append_ready[zid] = true;
+	list_splice_init(&c->zp->append_waiters[zid], &ready);
+	spin_unlock_irq(&c->lock);
+
+	list_for_each_entry_safe(w, tmp, &ready, link) {
+		list_del(&w->link);
+		if (status) {
+			w->bio->bi_status = status;
+			bio_endio(w->bio);
+		} else {
+			submit_bio_deferred(w->bio);
+		}
+		kfree(w);
+	}
 }
 
 /* zone_dispatch_gate의 블로킹 버전 — compaction처럼 동기(submit_bio_wait) 코드에서 쓴다.
@@ -977,6 +1038,7 @@ static int recovery_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
 	real_wp = zone->wp - zone->start;  /* zone 기준 상대 wp */
 
 	c->zp->zone_tag[idx] = tag;
+	c->zp->append_ready[idx] = true;
 	c->zp->wp[idx] = real_wp;
 	/* dispatch_wp도 실제 하드웨어 wp까지 따라잡혀 있어야 한다.
 	 * 안 그러면 재부팅 후 이 zone의 첫 쓰기가 dispatch_wp의 초기값(zone 시작)을 영원히 기다리게 된다. */
@@ -1004,6 +1066,8 @@ static int recovery_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
 
 static void header_write_done(struct bio *bio);
 static void wal_put_done(struct bio *wal_bio);
+static void submit_data_append_async(struct zns_io_ctx *ctx);
+static void data_append_done(struct bio *bio);
 static void sstable_write_chunk_done(struct bio *bio);
 static void sstable_flush_complete(struct zns_io_ctx *ctx, blk_status_t status);
 static void submit_checkpoint_async(struct zns_io_ctx *ctx);
@@ -1019,8 +1083,6 @@ static void submit_wal_async(struct zns_io_ctx *ctx)
 	struct wal_record *rec;
 	struct bio *wal_bio;
 	struct page *page;
-	/* bio_endio 이후엔 못 읽으므로 미리 확보 — 실패 경로에서 이 데이터 예약분을 취소할 때 필요하다. */
-	sector_t data_nr = bio_sectors(ctx->orig_bio);
 
 	/* 섹터 하나(512B) 전체를 kzalloc — 레코드는 앞 32바이트뿐이지만 디바이스에 512B보다 작은 단위로는 쓸 수 없어 나머지는 패딩. */
 	rec = kzalloc(512, GFP_ATOMIC);
@@ -1037,19 +1099,22 @@ static void submit_wal_async(struct zns_io_ctx *ctx)
 		goto fail;
 	}
 	bio_set_dev(wal_bio, c->dev->bdev);
-	wal_bio->bi_iter.bi_sector = ctx->wal_phys;
-	wal_bio->bi_opf = REQ_OP_WRITE;
+	wal_bio->bi_iter.bi_sector =
+		(zone_of(c->zp, ctx->wal_phys) * c->zp->zone_sectors);
+	wal_bio->bi_opf = REQ_OP_ZONE_APPEND;
 	page = virt_to_page(rec);
 	bio_add_page(wal_bio, page, 512, offset_in_page(rec));
 	wal_bio->bi_end_io = wal_put_done;
 	wal_bio->bi_private = ctx;
-	zone_dispatch_write(c, ctx->wal_phys, 1, wal_bio);
+	if (zone_append_write(c, zone_of(c->zp, ctx->wal_phys), wal_bio)) {
+		wal_bio->bi_status = BLK_STS_RESOURCE;
+		bio_endio(wal_bio);
+	}
 	return;
 
 fail:
-	/* 이미 배정받은 WAL/데이터 phys를 게이트에서 건너뛰게 해줘야 해당 zone들의 dispatch가 여기서 영구히 멈추지 않는다. */
-	zone_dispatch_cancel(c, ctx->wal_phys, 1);
-	zone_dispatch_cancel(c, ctx->phys, data_nr);
+	/* append capacity 예약은 되돌리지 않는다. 뒤 요청이 그 자리를
+	 * 재사용하면 완료 순서에 따라 계정이 어괋나므로 보수적으로 hole로 남긴다. */
 	ctx->orig_bio->bi_status = BLK_STS_RESOURCE;
 	bio_endio(ctx->orig_bio);
 	kfree(ctx);
@@ -1096,6 +1161,9 @@ skip_header:
 	 * 단, 섹터 0은 zone_pool_acquire_free가 이미 예약(wp=1)해뒀으므로 반드시 취소해줘야 한다.
 	 * 안 그러면 dispatch_wp가 zone 시작에서 못 움직여 그 zone 전체가 처음부터 영구히 막힌다. */
 	zone_dispatch_cancel(c, (sector_t)h->zone_id * c->zp->zone_sectors, 1);
+	/* 이 실험 브랜치에서 append 대기열이 영구히 멈추지 않게 한다.
+	 * header 없이 진행한 zone은 재기동 복구 대상이 아니므로 DMERR를 확인해야 한다. */
+	zone_append_header_done(c, h->zone_id, 0);
 	ctx->header_idx++;
 	if (ctx->header_idx < ctx->nr_headers)
 		submit_header_async(ctx);
@@ -1108,6 +1176,7 @@ static void header_write_done(struct bio *bio)
 {
 	struct zns_io_ctx *ctx = bio->bi_private;
 	blk_status_t status = bio->bi_status;
+	unsigned int zid = ctx->headers[ctx->header_idx].zone_id;
 
 	kfree(ctx->hdr_buf);
 	bio_put(bio);
@@ -1115,6 +1184,7 @@ static void header_write_done(struct bio *bio)
 	if (status)
 		DMERR("zone header write failed (zone %u, tag %u): recovery for this zone will be broken",
 		      ctx->headers[ctx->header_idx].zone_id, ctx->headers[ctx->header_idx].tag);
+	zone_append_header_done(ctx->c, zid, status);
 
 	ctx->header_idx++;
 	if (ctx->header_idx < ctx->nr_headers)
@@ -1123,7 +1193,80 @@ static void header_write_done(struct bio *bio)
 		ctx->on_headers_done(ctx);
 }
 
-/* WAL PUT record가 durable하게 쓰인 뒤 호출. 여기서 비로소 memtable에 반영하고 원본 데이터 bio를 제출한다(WAL이 데이터보다 먼저 durable해야 함). */
+static void submit_data_append_async(struct zns_io_ctx *ctx)
+{
+	struct bio *bio = ctx->orig_bio;
+	unsigned int zid = zone_of(ctx->c->zp, ctx->reserved_phys);
+
+	ctx->orig_sector = bio->bi_iter.bi_sector;
+	ctx->orig_opf = bio->bi_opf;
+	ctx->orig_end_io = bio->bi_end_io;
+	ctx->orig_private = bio->bi_private;
+	bio_set_dev(bio, ctx->c->dev->bdev);
+	bio->bi_iter.bi_sector = (sector_t)zid * ctx->c->zp->zone_sectors;
+	bio->bi_opf = (bio->bi_opf & ~REQ_OP_MASK) | REQ_OP_ZONE_APPEND;
+	bio->bi_end_io = data_append_done;
+	bio->bi_private = ctx;
+	if (zone_append_write(ctx->c, zid, bio)) {
+		bio->bi_status = BLK_STS_RESOURCE;
+		bio_endio(bio);
+	}
+}
+
+/* Zone Append 완료 시 bio sector에 반환된 실제 주소를 WAL에 남긴다.
+ * data가 WAL보다 먼저 durable하므로 crash 시 매핑 없는 orphan은 생길 수
+ * 있지만, durable하지 않은 data를 가리키는 매핑은 생기지 않는다. */
+static void data_append_done(struct bio *bio)
+{
+	struct zns_io_ctx *ctx = bio->bi_private;
+	struct zns_base_c *c = ctx->c;
+	sector_t wal_phys;
+	int new_wal_zone;
+	int ret;
+
+	if (bio->bi_status) {
+		bio->bi_end_io = ctx->orig_end_io;
+		bio->bi_private = ctx->orig_private;
+		bio->bi_iter.bi_sector = ctx->orig_sector;
+		bio->bi_opf = ctx->orig_opf;
+		kfree(ctx);
+		bio_endio(bio);
+		return;
+	}
+	ctx->phys = bio->bi_iter.bi_sector;
+	bio->bi_end_io = ctx->orig_end_io;
+	bio->bi_private = ctx->orig_private;
+	bio->bi_iter.bi_sector = ctx->orig_sector;
+	bio->bi_opf = ctx->orig_opf;
+
+	spin_lock_irq(&c->lock);
+	ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, 1, &wal_phys,
+			      &new_wal_zone, false);
+	spin_unlock_irq(&c->lock);
+	if (ret) {
+		bio->bi_status = BLK_STS_NOSPC;
+		kfree(ctx);
+		bio_endio(bio);
+		return;
+	}
+	ctx->wal_phys = wal_phys;
+	ctx->nr_headers = 0;
+	if (new_wal_zone >= 0) {
+		ctx->headers[0].zone_id = new_wal_zone;
+		ctx->headers[0].tag = ZONE_TAG_WAL;
+		ctx->headers[0].gen = c->zp->wal_gen[new_wal_zone];
+		ctx->nr_headers = 1;
+	}
+	ctx->header_idx = 0;
+	ctx->on_headers_done = submit_wal_async;
+	if (ctx->nr_headers)
+		submit_header_async(ctx);
+	else
+		submit_wal_async(ctx);
+}
+
+/* data Zone Append 완료 후 제출한 WAL의 완료 콜백. WAL이 durable해진
+ * 시점에 매핑을 공개하고 원본 bio를 완료한다. */
 static void wal_put_done(struct bio *wal_bio)
 {
 	struct zns_io_ctx *ctx = wal_bio->bi_private;
@@ -1186,9 +1329,7 @@ static void wal_put_done(struct bio *wal_bio)
 		flush_memtable_async(c, flushed_memtable, flushed_seq,
 				     flushed_split_gen, flushed_split_off);
 
-	orig->bi_iter.bi_sector = phys;
-	bio_set_dev(orig, c->dev->bdev);
-	zone_dispatch_write(c, phys, bio_sectors(orig), orig);
+	bio_endio(orig);
 }
 
 /* flush 체인(memtable → SSTable → checkpoint)의 모든 종료 지점에서 정확히 한 번 호출 — 성공/실패 무관.
@@ -1314,13 +1455,17 @@ static void submit_checkpoint_async(struct zns_io_ctx *ctx)
 
 	bio = bio_alloc(GFP_ATOMIC, 1);
 	bio_set_dev(bio, c->dev->bdev);
-	bio->bi_iter.bi_sector = ctx->wal_phys;
-	bio->bi_opf = REQ_OP_WRITE;
+	bio->bi_iter.bi_sector =
+		(zone_of(c->zp, ctx->wal_phys) * c->zp->zone_sectors);
+	bio->bi_opf = REQ_OP_ZONE_APPEND;
 	page = virt_to_page(rec);
 	bio_add_page(bio, page, 512, offset_in_page(rec));
 	bio->bi_end_io = checkpoint_write_done;
 	bio->bi_private = ctx;
-	zone_dispatch_write(c, ctx->wal_phys, 1, bio);
+	if (zone_append_write(c, zone_of(c->zp, ctx->wal_phys), bio)) {
+		bio->bi_status = BLK_STS_RESOURCE;
+		bio_endio(bio);
+	}
 }
 
 /* CHECKPOINT 기록이 끝난 뒤(성공하든 실패하든) flush 체인의 진짜 마지막 — 여기서 비로소 old_memtable을 완전히 버린다. */
@@ -2162,7 +2307,8 @@ static void gc_gate_write_end(struct bio *bio)
 	complete(&w->done);
 }
 
-static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512)
+static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512,
+			      bool append)
 {
 	struct gc_gate_write w;
 	struct bio *bio = bio_alloc(GFP_KERNEL, 1);
@@ -2174,12 +2320,20 @@ static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512)
 	init_completion(&w.done);
 	w.status = 0;
 	bio_set_dev(bio, c->dev->bdev);
-	bio->bi_iter.bi_sector = phys;
-	bio->bi_opf = REQ_OP_WRITE;
+	bio->bi_iter.bi_sector = append ?
+		(zone_of(c->zp, phys) * c->zp->zone_sectors) : phys;
+	bio->bi_opf = append ? REQ_OP_ZONE_APPEND : REQ_OP_WRITE;
 	bio_add_page(bio, virt_to_page(buf512), 512, offset_in_page(buf512));
 	bio->bi_end_io = gc_gate_write_end;
 	bio->bi_private = &w;
-	zone_dispatch_write(c, phys, 1, bio);  /* async, dispatch 순서대로 제출 */
+	if (append) {
+		if (zone_append_write(c, zone_of(c->zp, phys), bio)) {
+			bio->bi_status = BLK_STS_RESOURCE;
+			bio_endio(bio);
+		}
+	} else {
+		zone_dispatch_write(c, phys, 1, bio);
+	}
 	wait_for_completion(&w.done);
 	return w.status ? -EIO : 0;
 }
@@ -2217,12 +2371,13 @@ static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys)
 		spin_lock_irq(&c->lock);
 		zhdr->gen = cpu_to_le64(c->zp->wal_gen[new_wal_zone]);
 		spin_unlock_irq(&c->lock);
-		ret = gc_sync_gate_write(c, hdr_phys, zhdr);
+		ret = gc_sync_gate_write(c, hdr_phys, zhdr, false);
 		kfree(zhdr);
 		if (ret) {
 			zone_dispatch_cancel(c, wal_phys, 1);
 			return ret;
 		}
+		zone_append_header_done(c, new_wal_zone, 0);
 	}
 
 	rec = kzalloc(512, GFP_KERNEL);
@@ -2233,7 +2388,7 @@ static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys)
 	rec->type = cpu_to_le32(WAL_REC_PUT);
 	rec->put.lba = cpu_to_le64(lba);
 	rec->put.phys = cpu_to_le64(phys);
-	ret = gc_sync_gate_write(c, wal_phys, rec);
+	ret = gc_sync_gate_write(c, wal_phys, rec, true);
 	kfree(rec);
 	return ret;
 }
@@ -2622,6 +2777,10 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	c->zp->zone_sectors = bdev_zone_sectors(c->dev->bdev);
+	if (bdev_max_zone_append_sectors(c->dev->bdev) < BLOCK_SECTORS) {
+		ti->error = "underlying device does not support 4KB zone append";
+		return -EOPNOTSUPP;
+	}
 	c->nr_sectors = ti->len;
 	c->zp->nr_zones = c->nr_sectors / c->zp->zone_sectors;
 
@@ -2676,6 +2835,19 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 	for (i = 0; i < c->zp->nr_zones; i++)
 		INIT_LIST_HEAD(&c->zp->dispatch_waiters[i]);
+	c->zp->append_ready = kcalloc(c->zp->nr_zones, sizeof(bool), GFP_KERNEL);
+	if (!c->zp->append_ready) {
+		ti->error = "out of memory (append_ready)";
+		return -ENOMEM;
+	}
+	c->zp->append_waiters = kmalloc_array(c->zp->nr_zones,
+					       sizeof(struct list_head), GFP_KERNEL);
+	if (!c->zp->append_waiters) {
+		ti->error = "out of memory (append_waiters)";
+		return -ENOMEM;
+	}
+	for (i = 0; i < c->zp->nr_zones; i++)
+		INIT_LIST_HEAD(&c->zp->append_waiters[i]);
 
 	/* kcalloc 0-초기화가 곧 atomic_t 0 — 별도 atomic_set 불필요 */
 	c->zp->inflight_reads = kcalloc(c->zp->nr_zones, sizeof(atomic_t), GFP_KERNEL);
@@ -2789,6 +2961,8 @@ static void zns_base_dtr(struct dm_target *ti)
 	}
 	kfree(c->zp->dispatch_wp);
 	kfree(c->zp->dispatch_waiters);
+	kfree(c->zp->append_ready);
+	kfree(c->zp->append_waiters);
 	kfree(c->zp->inflight_reads);
 	kfree(c->zp);
 	kfree(c);
@@ -2828,10 +3002,9 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 
 	switch (bio_op(bio)) {
 	case REQ_OP_WRITE: {
-		sector_t phys;     // 실제 데이터가 놓일 물리 섹터
-		sector_t wal_phys; // WAL 레코드가 놓일 물리 섹터
+		sector_t phys;     // append capacity 예약 위치(실제 phys는 완료 시 반환)
 		int ret;
-		int new_data_zone, new_wal_zone;
+		int new_data_zone;
 		struct zns_io_ctx *ctx;
 
 		ret = zone_pool_alloc_with_gc_retry(c, ZONE_TAG_USER_DATA, nr, &phys, &new_data_zone);
@@ -2840,26 +3013,8 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 			bio_endio(bio);
 			return DM_MAPIO_SUBMITTED;
 		}
-		/* WAL은 별개 zone(태그)에서 항상 1섹터짜리 고정 레코드 하나만 append */
-		ret = zone_pool_alloc_with_gc_retry(c, ZONE_TAG_WAL, 1, &wal_phys, &new_wal_zone);
-		if (ret) {
-			/* 데이터 쪽은 이미 배정됐다 — 취소 안 하면 그 zone의 dispatch가 여기서 영구히 멈춘다(zone pool이 빠듯한 GC 테스트에서 실제로 가장 걸리기 쉬운 경로). */
-			if (new_data_zone >= 0)
-				zone_dispatch_cancel(c, (sector_t)new_data_zone * c->zp->zone_sectors, 1);
-			zone_dispatch_cancel(c, phys, nr);
-			bio->bi_status = BLK_STS_NOSPC;
-			bio_endio(bio);
-			return DM_MAPIO_SUBMITTED;
-		}
-
 		ctx = kmalloc(sizeof(*ctx), GFP_NOIO);
 		if (!ctx) {
-			if (new_data_zone >= 0)
-				zone_dispatch_cancel(c, (sector_t)new_data_zone * c->zp->zone_sectors, 1);
-			if (new_wal_zone >= 0)
-				zone_dispatch_cancel(c, (sector_t)new_wal_zone * c->zp->zone_sectors, 1);
-			zone_dispatch_cancel(c, phys, nr);
-			zone_dispatch_cancel(c, wal_phys, 1);
 			bio->bi_status = BLK_STS_RESOURCE;
 			bio_endio(bio);
 			return DM_MAPIO_SUBMITTED;
@@ -2867,8 +3022,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		ctx->c = c;
 		ctx->orig_bio = bio;
 		ctx->lba = lba;
-		ctx->phys = phys;
-		ctx->wal_phys = wal_phys;
+		ctx->reserved_phys = phys;
 
 		/* 새로 배정받은 zone이 있으면(태그별 최대 1개) 헤더부터 비동기로 써야 재부팅 후 recovery_zone_cb가 zone_tag[]/wp[]를 되찾을 수 있다. */
 		ctx->nr_headers = 0;
@@ -2878,22 +3032,15 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 			ctx->headers[ctx->nr_headers].gen = 0;  /* WAL 아님 */
 			ctx->nr_headers++;
 		}
-		if (new_wal_zone >= 0) {
-			ctx->headers[ctx->nr_headers].zone_id = new_wal_zone;
-			ctx->headers[ctx->nr_headers].tag = ZONE_TAG_WAL;
-			/* 방금 배정된 zone이라 wal_gen[new_wal_zone]은 안정된 값 */
-			ctx->headers[ctx->nr_headers].gen = c->zp->wal_gen[new_wal_zone];
-			ctx->nr_headers++;
-		}
 		ctx->header_idx = 0;
-		ctx->on_headers_done = submit_wal_async;
+		ctx->on_headers_done = submit_data_append_async;
 
 		if (ctx->nr_headers > 0)
 			submit_header_async(ctx);
 		else
-			submit_wal_async(ctx);
+			submit_data_append_async(ctx);
 
-		/* 데이터 bio는 아직 안 내보냄 — wal_put_done이 WAL 완료 후 이어서 처리 */
+		/* data append의 실제 phys를 알아야 WAL을 만들 수 있어 data가 먼저다. */
 		maybe_trigger_gc(c);
 		return DM_MAPIO_SUBMITTED;
 	}
