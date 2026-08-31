@@ -2366,6 +2366,11 @@ static int gc_lookup_current_phys(struct zns_base_c *c, u64 lba, sector_t *phys_
 
 /* GC가 512B를 phys에 써서 durable까지 블로킹. 반드시 async gate (zone_dispatch_write)로 제출.
  * wait_turn을 쓰면 dispatch_wp만 먼저 전진해 뒤따르는 async 쓰기가 디바이스에 먼저 나가 순차쓰기 위반(EIO)이 난다.
+ * GC worker의 내부 WAL은 Zone Append를 쓰지 않는다. foreground writeback이
+ * flush_work(gc_work)에서 GC를 기다리는 동안 GC까지 append_ready/
+ * append completion을 기다리면 JBD2-writeback-GC 순환 대기가 생길 수 있다.
+ * zone_pool_alloc이 예약한 phys에 gate를 통한 일반 write를 써도 ZNS
+ * 순차 제약과 WAL recovery 포맷은 그대로 유지된다.
  * [반환값] 0/-EIO. process context 전용. */
 struct gc_gate_write {
 	struct completion done;
@@ -2381,8 +2386,7 @@ static void gc_gate_write_end(struct bio *bio)
 	complete(&w->done);
 }
 
-static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512,
-			      bool append)
+static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512)
 {
 	struct gc_gate_write w;
 	struct bio *bio = bio_alloc(GFP_KERNEL, 1);
@@ -2394,23 +2398,13 @@ static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512,
 	init_completion(&w.done);
 	w.status = 0;
 	bio_set_dev(bio, c->dev->bdev);
-	bio->bi_iter.bi_sector = append ?
-		(zone_of(c->zp, phys) * c->zp->zone_sectors) : phys;
-	bio->bi_opf = append ? REQ_OP_ZONE_APPEND : REQ_OP_WRITE;
+	bio->bi_iter.bi_sector = phys;
+	bio->bi_opf = REQ_OP_WRITE;
 	bio_add_page(bio, virt_to_page(buf512), 512, offset_in_page(buf512));
 	bio->bi_end_io = gc_gate_write_end;
 	bio->bi_private = &w;
-	if (append) {
-		if (zone_append_write(c, zone_of(c->zp, phys), bio)) {
-			bio->bi_status = BLK_STS_RESOURCE;
-			bio_endio(bio);
-		}
-	} else {
-		zone_dispatch_write(c, phys, 1, bio);
-	}
+	zone_dispatch_write(c, phys, 1, bio);
 	wait_for_completion(&w.done);
-	if (append)
-		zone_dispatch_cancel(c, phys, 1);
 	return w.status ? -EIO : 0;
 }
 
@@ -2447,7 +2441,7 @@ static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys)
 		spin_lock_irq(&c->lock);
 		zhdr->gen = cpu_to_le64(c->zp->wal_gen[new_wal_zone]);
 		spin_unlock_irq(&c->lock);
-		ret = gc_sync_gate_write(c, hdr_phys, zhdr, false);
+		ret = gc_sync_gate_write(c, hdr_phys, zhdr);
 		kfree(zhdr);
 		if (ret) {
 			zone_dispatch_cancel(c, wal_phys, 1);
@@ -2464,7 +2458,7 @@ static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys)
 	rec->type = cpu_to_le32(WAL_REC_PUT);
 	rec->put.lba = cpu_to_le64(lba);
 	rec->put.phys = cpu_to_le64(phys);
-	ret = gc_sync_gate_write(c, wal_phys, rec, true);
+	ret = gc_sync_gate_write(c, wal_phys, rec);
 	kfree(rec);
 	return ret;
 }
