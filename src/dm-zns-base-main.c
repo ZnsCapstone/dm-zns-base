@@ -2366,11 +2366,6 @@ static int gc_lookup_current_phys(struct zns_base_c *c, u64 lba, sector_t *phys_
 
 /* GC가 512B를 phys에 써서 durable까지 블로킹. 반드시 async gate (zone_dispatch_write)로 제출.
  * wait_turn을 쓰면 dispatch_wp만 먼저 전진해 뒤따르는 async 쓰기가 디바이스에 먼저 나가 순차쓰기 위반(EIO)이 난다.
- * GC worker의 내부 WAL은 Zone Append를 쓰지 않는다. foreground writeback이
- * flush_work(gc_work)에서 GC를 기다리는 동안 GC까지 append_ready/
- * append completion을 기다리면 JBD2-writeback-GC 순환 대기가 생길 수 있다.
- * zone_pool_alloc이 예약한 phys에 gate를 통한 일반 write를 써도 ZNS
- * 순차 제약과 WAL recovery 포맷은 그대로 유지된다.
  * [반환값] 0/-EIO. process context 전용. */
 struct gc_gate_write {
 	struct completion done;
@@ -2386,7 +2381,8 @@ static void gc_gate_write_end(struct bio *bio)
 	complete(&w->done);
 }
 
-static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512)
+static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512,
+			      bool append)
 {
 	struct gc_gate_write w;
 	struct bio *bio = bio_alloc(GFP_KERNEL, 1);
@@ -2398,13 +2394,23 @@ static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512)
 	init_completion(&w.done);
 	w.status = 0;
 	bio_set_dev(bio, c->dev->bdev);
-	bio->bi_iter.bi_sector = phys;
-	bio->bi_opf = REQ_OP_WRITE;
+	bio->bi_iter.bi_sector = append ?
+		(zone_of(c->zp, phys) * c->zp->zone_sectors) : phys;
+	bio->bi_opf = append ? REQ_OP_ZONE_APPEND : REQ_OP_WRITE;
 	bio_add_page(bio, virt_to_page(buf512), 512, offset_in_page(buf512));
 	bio->bi_end_io = gc_gate_write_end;
 	bio->bi_private = &w;
-	zone_dispatch_write(c, phys, 1, bio);
+	if (append) {
+		if (zone_append_write(c, zone_of(c->zp, phys), bio)) {
+			bio->bi_status = BLK_STS_RESOURCE;
+			bio_endio(bio);
+		}
+	} else {
+		zone_dispatch_write(c, phys, 1, bio);
+	}
 	wait_for_completion(&w.done);
+	if (append)
+		zone_dispatch_cancel(c, phys, 1);
 	return w.status ? -EIO : 0;
 }
 
@@ -2441,7 +2447,7 @@ static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys)
 		spin_lock_irq(&c->lock);
 		zhdr->gen = cpu_to_le64(c->zp->wal_gen[new_wal_zone]);
 		spin_unlock_irq(&c->lock);
-		ret = gc_sync_gate_write(c, hdr_phys, zhdr);
+		ret = gc_sync_gate_write(c, hdr_phys, zhdr, false);
 		kfree(zhdr);
 		if (ret) {
 			zone_dispatch_cancel(c, wal_phys, 1);
@@ -2458,7 +2464,7 @@ static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys)
 	rec->type = cpu_to_le32(WAL_REC_PUT);
 	rec->put.lba = cpu_to_le64(lba);
 	rec->put.phys = cpu_to_le64(phys);
-	ret = gc_sync_gate_write(c, wal_phys, rec);
+	ret = gc_sync_gate_write(c, wal_phys, rec, true);
 	kfree(rec);
 	return ret;
 }
@@ -2710,38 +2716,25 @@ out_free_mt:
 	return reclaimed;
 }
 
-/* zone_pool_alloc 시도, free zone 부족으로 실패하면 GC를 한 라운드 돌려 확보 후 재시도.
- * zone 소진과 회수 시차 사이 도착한 쓰기가 억울하게 ENOSPC 맞는 걸 막음. free zone이 안 늘면 더 할 게 없으니 그 실패를 반환.
- * GC 실행은 직접 호출이 아니라 queue_work+flush_work로 우회
- * .map WRITE가 iodepth만큼 동시에 타므로 직접 부르면 max_active=1("GC 한 번에 하나")이 깨져 여러 스레드가 같은 victim을 건드린다.
- * [반환값] 0 성공, 그 외 zone_pool_alloc 에러(보통 -ENOSPC). process context 전용. */
+/* zone_pool_alloc 시도. 공간이 부족하면 GC를 worker에 트리거하고
+ * -EAGAIN을 반환한다. .map() 호출자는 bio를 DM core에 requeue해 GC가
+ * zone을 회수한 뒤 다시 map하게 한다. 여기서 flush_work()로 기다리면
+ * ext4 writeback/JBD2가 GC I/O의 진행 자체를 막는 순환 대기가 생긴다.
+ * [반환값] 0 성공, -EAGAIN GC 후 requeue 필요. */
 static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag, sector_t nr,
 					   sector_t *phys_out, int *new_zone_out)
 {
 	int ret;
-	unsigned int attempts;
-	unsigned int prev_free = UINT_MAX;
 
 	spin_lock_irq(&c->lock);
 	ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out, false);
 	spin_unlock_irq(&c->lock);
 
-	for (attempts = 0; ret && attempts < c->zp->nr_zones; attempts++) {
-		unsigned int free_now;
-
+	if (ret) {
 		queue_work(zns_gc_wq, &c->gc_work);
-		flush_work(&c->gc_work);
-
-		spin_lock_irq(&c->lock);
-		free_now = gc_count_free_zones(c->zp);
-		ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out, false);
-		spin_unlock_irq(&c->lock);
-
-		if (ret && free_now == prev_free)
-			break;  /* GC를 돌렸는데도 free zone이 안 늘었음 — 더 시도해봤자 소용없음 */
-		prev_free = free_now;
+		return -EAGAIN;
 	}
-	return ret;
+	return 0;
 }
 
 /* zns_gc_wq 워커 — free zone이 watermark 이하인 동안 gc_reclaim_one_victim 반복 (한 번에 하나만 회수하면 쓰기를 못 따라잡음).
@@ -3085,6 +3078,8 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		struct zns_io_ctx *ctx;
 
 		ret = zone_pool_alloc_with_gc_retry(c, ZONE_TAG_USER_DATA, nr, &phys, &new_data_zone);
+		if (ret == -EAGAIN)
+			return DM_MAPIO_REQUEUE;
 		if (ret) {
 			bio->bi_status = BLK_STS_NOSPC;
 			bio_endio(bio);
