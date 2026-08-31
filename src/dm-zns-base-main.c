@@ -2810,6 +2810,7 @@ static void wal_reclaim_work_fn(struct work_struct *work)
 static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct zns_base_c *c;
+	sector_t physical_sectors;
 	int ret;
 	unsigned int i;
 
@@ -2845,8 +2846,21 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->error = "underlying device does not support 4KB zone append";
 		return -EOPNOTSUPP;
 	}
+	physical_sectors = bdev_nr_sectors(c->dev->bdev);
+	if (ti->len > physical_sectors) {
+		ti->error = "logical target is larger than underlying device";
+		return -EINVAL;
+	}
+	if (!c->zp->zone_sectors || physical_sectors % c->zp->zone_sectors) {
+		ti->error = "underlying capacity is not zone aligned";
+		return -EINVAL;
+	}
 	c->nr_sectors = ti->len;
-	c->zp->nr_zones = c->nr_sectors / c->zp->zone_sectors;
+	/* ti->len is the host-visible logical address range.  The allocator must
+	 * nevertheless manage every physical zone of the underlying ZNS device;
+	 * otherwise reducing ti->len for over-provisioning also hides exactly the
+	 * reserve zones that WAL, compaction and GC need. */
+	c->zp->nr_zones = physical_sectors / c->zp->zone_sectors;
 
 	c->zp->wp = kcalloc(c->zp->nr_zones, sizeof(sector_t), GFP_KERNEL);
 	if (!c->zp->wp) {
