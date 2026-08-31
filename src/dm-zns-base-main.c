@@ -264,6 +264,7 @@ struct zns_io_ctx {
 	u64 lba;
 	sector_t phys;
 	sector_t reserved_phys;      /* capacity 예약용; append 완료 전에는 실제 주소가 아님 */
+	sector_t reserved_nr;        /* append 예약 완료 시 dispatch_wp 회계 전진용 */
 	sector_t orig_sector;
 	unsigned int orig_opf;
 	bio_end_io_t *orig_end_io;
@@ -1137,8 +1138,10 @@ static void submit_wal_async(struct zns_io_ctx *ctx)
 	return;
 
 fail:
-	/* append capacity 예약은 되돌리지 않는다. 뒤 요청이 그 자리를
-	 * 재사용하면 완료 순서에 따라 계정이 어괋나므로 보수적으로 hole로 남긴다. */
+	/* 예약 공간은 재사용하지 않고 hole로 남기되, 발행 완료 회계는 반드시
+	 * 전진시킨다. 그렇지 않으면 GC가 이 zone을 영원히 in-flight로 본다. */
+	zone_dispatch_cancel(c, ctx->wal_phys, 1);
+	zone_dispatch_cancel(c, ctx->reserved_phys, ctx->reserved_nr);
 	ctx->orig_bio->bi_status = BLK_STS_RESOURCE;
 	bio_endio(ctx->orig_bio);
 	kfree(ctx);
@@ -1249,6 +1252,7 @@ static void data_append_done(struct bio *bio)
 	int ret;
 
 	if (bio->bi_status) {
+		zone_dispatch_cancel(c, ctx->reserved_phys, ctx->reserved_nr);
 		bio->bi_end_io = ctx->orig_end_io;
 		bio->bi_private = ctx->orig_private;
 		bio->bi_iter.bi_sector = ctx->orig_sector;
@@ -1268,6 +1272,7 @@ static void data_append_done(struct bio *bio)
 			      &new_wal_zone, false);
 	spin_unlock_irq(&c->lock);
 	if (ret) {
+		zone_dispatch_cancel(c, ctx->reserved_phys, ctx->reserved_nr);
 		bio->bi_status = BLK_STS_NOSPC;
 		kfree(ctx);
 		bio_endio(bio);
@@ -1299,6 +1304,9 @@ static void wal_put_done(struct bio *wal_bio)
 	blk_status_t wal_status = wal_bio->bi_status;
 	u64 lba = ctx->lba;
 	sector_t phys = ctx->phys;
+	sector_t reserved_phys = ctx->reserved_phys;
+	sector_t reserved_nr = ctx->reserved_nr;
+	sector_t wal_phys = ctx->wal_phys;
 	struct skiplist *flushed_memtable = NULL;
 	struct memtable_flush_work *flush_work = NULL;
 	u64 flushed_seq = 0;
@@ -1308,9 +1316,11 @@ static void wal_put_done(struct bio *wal_bio)
 
 	kfree(ctx->wal_buf);
 	bio_put(wal_bio);
-	kfree(ctx);
 
 	if (wal_status) {
+		zone_dispatch_cancel(c, wal_phys, 1);
+		zone_dispatch_cancel(c, reserved_phys, reserved_nr);
+		kfree(ctx);
 		orig->bi_status = wal_status;
 		bio_endio(orig);
 		return;
@@ -1351,6 +1361,12 @@ static void wal_put_done(struct bio *wal_bio)
 		}
 	}
 	spin_unlock_irq(&c->lock);
+	/* Zone Append는 일반 dispatch gate를 통과하지 않으므로 완료 시점에
+	 * 예약 순서 회계를 직접 전진시킨다. data는 mapping_put 뒤에 완료
+	 * 처리해야 dispatch_wp==wp가 곧 "모든 매핑 공개 완료"를 뜻한다. */
+	zone_dispatch_cancel(c, wal_phys, 1);
+	zone_dispatch_cancel(c, reserved_phys, reserved_nr);
+	kfree(ctx);
 
 	if (ret) {
 		orig->bi_status = BLK_STS_RESOURCE;
@@ -1475,6 +1491,7 @@ static void submit_checkpoint_async(struct zns_io_ctx *ctx)
 	if (!rec) {
 		DMERR("checkpoint write: out of memory (seq=%llu), skipping — replay will just do extra work next time",
 		      (unsigned long long)ctx->checkpoint_seq);
+		zone_dispatch_cancel(c, ctx->wal_phys, 1);
 		skiplist_destroy(ctx->old_memtable);
 		kfree(ctx->old_memtable);
 		kfree(ctx);
@@ -1488,6 +1505,16 @@ static void submit_checkpoint_async(struct zns_io_ctx *ctx)
 	ctx->wal_buf = rec;
 
 	bio = bio_alloc(GFP_ATOMIC, 1);
+	if (!bio) {
+		kfree(rec);
+		ctx->wal_buf = NULL;
+		zone_dispatch_cancel(c, ctx->wal_phys, 1);
+		skiplist_destroy(ctx->old_memtable);
+		kfree(ctx->old_memtable);
+		kfree(ctx);
+		flush_chain_end(c);
+		return;
+	}
 	bio_set_dev(bio, c->dev->bdev);
 	bio->bi_iter.bi_sector =
 		(zone_of(c->zp, ctx->wal_phys) * c->zp->zone_sectors);
@@ -1508,9 +1535,11 @@ static void checkpoint_write_done(struct bio *bio)
 	struct zns_io_ctx *ctx = bio->bi_private;
 	struct zns_base_c *c = ctx->c;
 	blk_status_t status = bio->bi_status;
+	sector_t wal_phys = ctx->wal_phys;
 
 	kfree(ctx->wal_buf);
 	bio_put(bio);
+	zone_dispatch_cancel(c, wal_phys, 1);
 
 	if (status)
 		DMERR("checkpoint write failed (seq=%llu): replay will just do extra work next time, no data lost",
@@ -2369,6 +2398,8 @@ static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512,
 		zone_dispatch_write(c, phys, 1, bio);
 	}
 	wait_for_completion(&w.done);
+	if (append)
+		zone_dispatch_cancel(c, phys, 1);
 	return w.status ? -EIO : 0;
 }
 
@@ -3055,6 +3086,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		}
 		ctx = kmalloc(sizeof(*ctx), GFP_NOIO);
 		if (!ctx) {
+			zone_dispatch_cancel(c, phys, nr);
 			bio->bi_status = BLK_STS_RESOURCE;
 			bio_endio(bio);
 			return DM_MAPIO_SUBMITTED;
@@ -3063,6 +3095,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		ctx->orig_bio = bio;
 		ctx->lba = lba;
 		ctx->reserved_phys = phys;
+		ctx->reserved_nr = nr;
 
 		/* 새로 배정받은 zone이 있으면(태그별 최대 1개) 헤더부터 비동기로 써야 재부팅 후 recovery_zone_cb가 zone_tag[]/wp[]를 되찾을 수 있다. */
 		ctx->nr_headers = 0;
