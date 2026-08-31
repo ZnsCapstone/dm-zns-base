@@ -2269,6 +2269,7 @@ static void maybe_trigger_gc(struct zns_base_c *c)
 static unsigned int gc_select_victim(struct zns_base_c *c)
 {
 	unsigned int z, victim = ZONE_NONE;
+	unsigned int fallback = ZONE_NONE;
 	unsigned int best_invalid = 0;
 
 	spin_lock_irq(&c->lock);
@@ -2281,19 +2282,29 @@ static unsigned int gc_select_victim(struct zns_base_c *c)
 		 * 판정하면 안 됨 — rollover가 항상 몇 섹터 남기고 넘어가 절대 안 참. */
 		if (z == c->zp->active_zone[tag])
 			continue;
-		if (c->zp->invalid_count[z] == 0)
-			continue;  /* 100% live zone은 회수해도 순증가 0이라 제외 */
 		/* 아직 발행 안 된 배정분이 남은 zone은 건드리면 안 됨 — .map()은 phys를 배정만 하고,
 		 * 매핑은 wal_put_done에서야 등록되므로 아래 스캔이 진행 중인 쓰기를 못 본다.
 		 * mapping_put이 dispatch보다 먼저 실행되므로 이 등식이 "배정분 전부 발행됨 = 전부 memtable에 보임"을 뜻한다. */
 		if (c->zp->dispatch_wp[z] != (sector_t)z * c->zp->zone_sectors + c->zp->wp[z])
+			continue;
+		/* SSTable에 내려간 매핑의 overwrite는 atomic PUT callback에서 옛 phys를
+		 * 읽을 수 없어 invalid_count에 즉시 반영되지 않는다. 따라서 알려진
+		 * invalid가 없는 경우에도, 닫히고 drain된 data zone 하나를 fallback으로
+		 * 실제 live-map 검증 대상으로 허용한다. */
+		if (fallback == ZONE_NONE)
+			fallback = z;
+		if (c->zp->invalid_count[z] == 0)
 			continue;
 		if (victim == ZONE_NONE || c->zp->invalid_count[z] > best_invalid) {
 			victim = z;
 			best_invalid = c->zp->invalid_count[z];
 		}
 	}
+	if (victim == ZONE_NONE)
+		victim = fallback;
 	spin_unlock_irq(&c->lock);
+	if (victim != ZONE_NONE && best_invalid == 0)
+		DMINFO("gc: no invalid_count candidate; probing fallback data zone %u", victim);
 	return victim;
 }
 
@@ -2587,33 +2598,34 @@ static bool gc_reclaim_one_victim(struct zns_base_c *c)
 	vstart = (sector_t)victim * c->zp->zone_sectors;
 	vend = vstart + c->zp->zone_sectors;
 
-	/* 1) memtable 스냅샷 — 순회 중 mapping_put으로 리스트가 바뀌는 걸
-	 * 피하려고 (lba, phys)만 배열로 복사해둔 뒤 락을 놓는다. */
+	/* 1) memtable 스냅샷. worker process context에서 먼저 크기를 세고 큰
+	 * 배열은 락 밖에서 GFP_KERNEL로 할당한다. 기존의 spinlock 안
+	 * krealloc(GFP_ATOMIC)은 대형 Kafka memtable에서 반복 OOM을 냈다. */
 	spin_lock_irq(&c->lock);
 	for (node = c->memtable->head->forward[0]; node; node = node->forward[0]) {
 		if (node->phys < vstart || node->phys >= vend)
 			continue;
-		if (nr_mt == mt_cap) {
-			unsigned int new_cap = mt_cap ? mt_cap * 2 : 16;
-			struct gc_candidate *grown = krealloc(mt_candidates,
-							new_cap * sizeof(*grown), GFP_ATOMIC);
-			if (!grown) {
-				ok = false;
-				break;
-			}
-			mt_candidates = grown;
-			mt_cap = new_cap;
-		}
+		mt_cap++;
+	}
+	spin_unlock_irq(&c->lock);
+
+	if (mt_cap)
+		mt_candidates = kvmalloc_array(mt_cap, sizeof(*mt_candidates), GFP_KERNEL);
+	if (mt_cap && !mt_candidates) {
+		DMERR("gc: out of memory snapshotting memtable, aborting this round");
+		goto out_free_mt;
+	}
+
+	spin_lock_irq(&c->lock);
+	for (node = c->memtable->head->forward[0]; node && nr_mt < mt_cap;
+	     node = node->forward[0]) {
+		if (node->phys < vstart || node->phys >= vend)
+			continue;
 		mt_candidates[nr_mt].lba = node->lba;
 		mt_candidates[nr_mt].phys = node->phys;
 		nr_mt++;
 	}
 	spin_unlock_irq(&c->lock);
-
-	if (!ok) {
-		DMERR("gc: out of memory snapshotting memtable, aborting this round");
-		goto out_free_mt;
-	}
 
 	for (i = 0; i < nr_mt && ok; i++)
 		ok = (gc_relocate_one(c, mt_candidates[i].lba, mt_candidates[i].phys) == 0);
@@ -2700,7 +2712,7 @@ static bool gc_reclaim_one_victim(struct zns_base_c *c)
 out_free_snapshot:
 	kfree(snapshot);
 out_free_mt:
-	kfree(mt_candidates);
+	kvfree(mt_candidates);
 	return reclaimed;
 }
 
