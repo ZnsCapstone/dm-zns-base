@@ -216,8 +216,10 @@ struct zns_base_io {
  * join the durable WAL batch. */
 struct zns_base_data_write {
 	struct work_struct complete_work;
+	struct list_head node;
 	struct zns_base_c *c;
 	struct zns_base_io *io;
+	struct bio *lower_bio;
 	struct zns_base_zone *new_zone;
 	size_t logical_block;
 	sector_t physical_sector;
@@ -415,6 +417,12 @@ struct zns_base_c {
 
 	bool io_work_scheduled;
 	unsigned int foreground_data_inflight;
+	/* Conventional writes to the single active DATA stream are released only
+	 * after the previous lower bio completes.  Serializing the dispatcher work
+	 * alone is insufficient because submit_bio() returns before device
+	 * completion. */
+	struct list_head data_write_queue;
+	bool data_write_inflight;
 	int data_write_error;
 	bool gc_scheduled;
 	bool gc_running;
@@ -948,16 +956,80 @@ static int zns_base_read_chunk(struct zns_base_c *c, struct bio *bio,
 	return ret;
 }
 
+static void zns_base_submit_data_write(struct zns_base_data_write *write)
+{
+	struct bio *lower = write->lower_bio;
+
+	WARN_ON_ONCE(!lower);
+	submit_bio(lower);
+}
+
+/* Complete the current conventional DATA dispatch and select the next one.
+ * PBA allocation is ordered by the single foreground worker, while this gate
+ * makes device submission completion-ordered as required by a sequential
+ * write zone.  If one write fails, later reservations cannot be reused safely
+ * and are returned through failed_writes without reaching the device. */
+static struct zns_base_data_write *
+zns_base_finish_data_dispatch(struct zns_base_c *c,
+			      struct list_head *failed_writes)
+{
+	struct zns_base_data_write *next = NULL;
+
+	spin_lock(&c->lock);
+	if (WARN_ON_ONCE(!c->data_write_inflight)) {
+		spin_unlock(&c->lock);
+		return NULL;
+	}
+
+	c->data_write_inflight = false;
+	if (c->data_write_error) {
+		list_splice_init(&c->data_write_queue, failed_writes);
+	} else if (!list_empty(&c->data_write_queue)) {
+		next = list_first_entry(&c->data_write_queue,
+					struct zns_base_data_write, node);
+		list_del_init(&next->node);
+		c->data_write_inflight = true;
+	}
+	spin_unlock(&c->lock);
+
+	return next;
+}
+
+static void zns_base_fail_queued_data_writes(struct zns_base_c *c,
+					      struct list_head *failed_writes,
+					      int error)
+{
+	struct zns_base_data_write *write;
+	struct zns_base_data_write *next;
+
+	list_for_each_entry_safe(write, next, failed_writes, node) {
+		list_del_init(&write->node);
+		bio_put(write->lower_bio);
+		write->lower_bio = NULL;
+		zns_base_release_pending_slot(c, write->new_zone,
+			write->new_slot, write->logical_block);
+		if (write->scratch_page)
+			__free_page(write->scratch_page);
+		zns_base_io_finish_data(c, write->io, error);
+		kfree(write);
+	}
+}
+
 static void zns_base_data_write_complete_work(struct work_struct *work)
 {
 	struct zns_base_data_write *write = container_of(work,
 		struct zns_base_data_write, complete_work);
 	struct zns_base_c *c = write->c;
+	struct zns_base_data_write *next;
+	LIST_HEAD(failed_writes);
 	bool wal_page_full = false;
+	bool first_data_error = false;
 	int ret = 0;
 
 	if (write->status) {
-		ret = -EIO;
+		ret = blk_status_to_errno(write->status);
+		if (!ret)
+			ret = -EIO;
 	} else if (zns_base_failpoint_hit(ZNS_BASE_FAIL_AFTER_DATA_WRITE)) {
 		ret = -EIO;
 	}
@@ -967,9 +1039,16 @@ static void zns_base_data_write_complete_work(struct work_struct *work)
 		 * leaves a hole that cannot safely be reused, so fail subsequent data
 		 * allocations instead of silently corrupting the zone stream. */
 		spin_lock(&c->lock);
-		if (!c->data_write_error)
+		if (!c->data_write_error) {
 			c->data_write_error = ret;
+			first_data_error = true;
+		}
 		spin_unlock(&c->lock);
+		if (first_data_error)
+			DMERR("DATA write pipeline stopped: zone=%u sector=%llu status=%d",
+			      (unsigned int)(write->new_zone -
+					     c->zone_state.zones),
+			      (unsigned long long)write->physical_sector, ret);
 		zns_base_release_pending_slot(c, write->new_zone, write->new_slot,
 			write->logical_block);
 	} else {
@@ -988,6 +1067,13 @@ static void zns_base_data_write_complete_work(struct work_struct *work)
 		__free_page(write->scratch_page);
 	zns_base_io_finish_data(c, write->io, ret);
 	kfree(write);
+
+	next = zns_base_finish_data_dispatch(c, &failed_writes);
+	if (!list_empty(&failed_writes))
+		zns_base_fail_queued_data_writes(c, &failed_writes,
+						 c->data_write_error ?: -EIO);
+	if (next)
+		zns_base_submit_data_write(next);
 }
 
 static void zns_base_data_write_endio(struct bio *bio)
@@ -995,14 +1081,14 @@ static void zns_base_data_write_endio(struct bio *bio)
 	struct zns_base_data_write *write = bio->bi_private;
 
 	write->status = bio->bi_status;
+	write->lower_bio = NULL;
 	bio_put(bio);
 	queue_work(write->c->io_wq, &write->complete_work);
 }
 
 /* The caller already reserved both the data PBA and its pending reverse-map
- * slot.  This function only issues the lower write; the single foreground
- * dispatcher calls it in PBA order, so writes to one active data zone are
- * submitted in the required sequential order without waiting for completion. */
+ * slot.  The lower bio is queued in PBA order and is submitted only when the
+ * previous conventional DATA write has completed. */
 static int zns_base_submit_data_write_async(struct zns_base_c *c,
 		struct zns_base_io *io, const struct zns_base_chunk *chunk,
 		sector_t physical_sector, struct zns_base_zone *new_zone,
@@ -1022,6 +1108,7 @@ static int zns_base_submit_data_write_async(struct zns_base_c *c,
 	write->physical_sector = physical_sector;
 	write->new_slot = new_slot;
 	write->scratch_page = scratch_page;
+	INIT_LIST_HEAD(&write->node);
 	INIT_WORK(&write->complete_work, zns_base_data_write_complete_work);
 
 	if (scratch_page) {
@@ -1048,8 +1135,18 @@ static int zns_base_submit_data_write_async(struct zns_base_c *c,
 
 	lower->bi_end_io = zns_base_data_write_endio;
 	lower->bi_private = write;
+	write->lower_bio = lower;
 	zns_base_io_add_pending_data(c, io);
-	submit_bio(lower);
+
+	spin_lock(&c->lock);
+	if (!c->data_write_inflight && list_empty(&c->data_write_queue)) {
+		c->data_write_inflight = true;
+		spin_unlock(&c->lock);
+		zns_base_submit_data_write(write);
+	} else {
+		list_add_tail(&write->node, &c->data_write_queue);
+		spin_unlock(&c->lock);
+	}
 	return 0;
 
 out_free_write:
@@ -3136,11 +3233,12 @@ static int zns_base_metadata_commit_block(
   	return 0;
 }
 
-static int zns_base_metadata_write_block_locked(
+static int zns_base_metadata_write_block_flags_locked(
   	struct zns_base_c *c,
   	struct zns_base_metadata_stream *stream,
   	const void *buffer,
-  	sector_t *written_sector)
+	sector_t *written_sector,
+	unsigned int op_flags)
 {
   	struct page *page;
   	void *addr;
@@ -3159,8 +3257,8 @@ static int zns_base_metadata_write_block_locked(
 
 	ret = zns_base_metadata_allocate_block(c, stream,
   					       &physical_sector);
-  	if (!ret)
-  		ret = zns_base_submit_page(c, page, REQ_OP_WRITE, REQ_FUA,
+	if (!ret)
+		ret = zns_base_submit_page(c, page, REQ_OP_WRITE, op_flags,
   					   physical_sector);
   	if (!ret)
   		ret = zns_base_metadata_commit_block(c, stream,
@@ -3197,6 +3295,28 @@ static int zns_base_metadata_read_block(
 
 	__free_page(page);
 	return ret;
+}
+
+static int zns_base_metadata_write_block_locked(
+	struct zns_base_c *c,
+	struct zns_base_metadata_stream *stream,
+	const void *buffer,
+	sector_t *written_sector)
+{
+	return zns_base_metadata_write_block_flags_locked(c, stream, buffer,
+		written_sector, REQ_FUA);
+}
+
+/* An SSTable is unreachable until its descriptor is published by a durable
+ * Manifest.  Its body therefore needs one durability barrier after all pages,
+ * rather than an expensive FUA on every 4 KiB page. */
+static int zns_base_sstable_write_block_locked(
+	struct zns_base_c *c,
+	const void *buffer,
+	sector_t *written_sector)
+{
+	return zns_base_metadata_write_block_flags_locked(c,
+		&c->metadata.sstable, buffer, written_sector, 0);
 }
 
 static void zns_base_snapshot_consider(struct mapping_entry *snapshot,
@@ -3403,8 +3523,7 @@ static int zns_base_write_sstable_locked(struct zns_base_c *c,
 	header->header_crc32c = 0;
 	header->header_crc32c = cpu_to_le32(crc32c(~0, header, sizeof(*header)));
 
-	ret = zns_base_metadata_write_block_locked(c, &c->metadata.sstable,
-						   buffer, &start_sector);
+	ret = zns_base_sstable_write_block_locked(c, buffer, &start_sector);
 	if (ret)
 		goto out;
 
@@ -3419,11 +3538,16 @@ static int zns_base_write_sstable_locked(struct zns_base_c *c,
 			disk_entry->physical_sector = cpu_to_le64(entries[i].physical_sector);
 			disk_entry->seq = cpu_to_le64(entries[i].seq);
 		}
-		ret = zns_base_metadata_write_block_locked(c, &c->metadata.sstable,
-							   buffer, NULL);
+		ret = zns_base_sstable_write_block_locked(c, buffer, NULL);
 		if (ret)
 			goto out;
 	}
+
+	/* Publish through the Manifest only after every non-FUA SSTable page is
+	 * durable.  A crash before this flush leaves only an unreachable tail. */
+	ret = zns_base_submit_flush(c);
+	if (ret)
+		goto out;
 
 	descriptor->zone_idx = cpu_to_le32(zone_idx);
 	descriptor->start_sector = cpu_to_le64(start_sector);
@@ -5078,12 +5202,14 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	INIT_LIST_HEAD(&c -> pending_bios);
+	INIT_LIST_HEAD(&c->data_write_queue);
 	init_waitqueue_head(&c -> spare_waitq);
 	init_waitqueue_head(&c -> gc_waitq);
 	init_waitqueue_head(&c -> data_waitq);
 
 	c -> io_work_scheduled = false;
 	c->foreground_data_inflight = 0;
+	c->data_write_inflight = false;
 	c->data_write_error = 0;
 	c -> gc_scheduled = false;
 	c -> gc_running = false;
@@ -5189,6 +5315,10 @@ static void zns_base_dtr(struct dm_target *ti)
 	flush_workqueue(c->io_wq);
 	wait_event(c->data_waitq, !READ_ONCE(c->foreground_data_inflight));
 	flush_workqueue(c->io_wq);
+	spin_lock(&c->lock);
+	WARN_ON_ONCE(c->data_write_inflight ||
+		     !list_empty(&c->data_write_queue));
+	spin_unlock(&c->lock);
 
 	/* A running GC is allowed to finish its current safe round while foreground
 	 * I/O drains.  Once the dispatcher is empty, quiescing prevents it from
@@ -5296,10 +5426,16 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	u64 gc_reset_count;
 	u64 gc_moved_blocks;
 	unsigned int persistent_sstables;
+	unsigned int data_write_queued = 0;
+	unsigned int data_write_inflight;
+	unsigned int active_data_zone;
+	struct zns_base_data_write *queued_write;
+	sector_t active_data_wp;
 	sector_t wal_used_sectors;
 	sector_t wal_capacity_sectors;
 	int gc_error;
 	int gc_last_error;
+	int data_write_error;
 	int wal_error;
 	unsigned int sz = 0;
 
@@ -5358,6 +5494,12 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	gc_moved_blocks = c->gc_moved_blocks;
 	gc_error = c->gc_error;
 	gc_last_error = c->gc_last_error;
+	data_write_error = c->data_write_error;
+	data_write_inflight = c->data_write_inflight;
+	list_for_each_entry(queued_write, &c->data_write_queue, node)
+		data_write_queued++;
+	active_data_zone = c->zone_state.active_zone_idx;
+	active_data_wp = c->zone_state.zones[active_data_zone].write_pointer;
 	spin_unlock(&c->lock);
 
 	DMEMIT("data_active=%u data_free=%u data_full=%u gc_dest=%u gc_victim=%u ",
@@ -5366,6 +5508,9 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		(unsigned long long)gc_runs,
 		(unsigned long long)gc_reset_count,
 		(unsigned long long)gc_moved_blocks, gc_error, gc_last_error);
+	DMEMIT("data_write_inflight=%u data_write_queued=%u data_write_error=%d active_data_zone=%u active_data_wp=%llu ",
+		data_write_inflight, data_write_queued, data_write_error,
+		active_data_zone, (unsigned long long)active_data_wp);
 	DMEMIT("wal_zone=%u wal_generation=%llu wal_used_blocks=%llu wal_capacity_blocks=%llu wal_staged_records=%u wal_error=%d ",
 		wal_zone_idx, (unsigned long long)wal_generation,
 		(unsigned long long)(wal_used_sectors / SECTORS_PER_BLOCK),
