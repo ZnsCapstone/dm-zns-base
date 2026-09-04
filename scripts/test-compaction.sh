@@ -77,6 +77,17 @@ if [ "$COMPACT_COUNT" -lt 1 ]; then
 	echo "[!] compaction이 한 번도 안 돌았습니다 (WRITE_COUNT/FLUSH_THRESHOLD/COMPACTION_K를 조정해보세요)" >&2
 	exit 3
 fi
+# Compaction은 새 논리 쓰기가 아니므로 결과 seq가 병합 대상의
+# 최대 seq보다 커지면 안 된다. 그러면 대상 밖의 더 최신
+# SSTable을 예전 데이터가 덮어쓰는 세대 역전이 생긴다.
+SEQ_VIOLATIONS=$(dmesg |
+	sed -nE 's/.*seq [0-9]+\.\.([0-9]+)\) into seq=([0-9]+).*/\1 \2/p' |
+	awk '$2 > $1 { bad++ } END { print bad + 0 }')
+if [ "$SEQ_VIOLATIONS" -ne 0 ]; then
+	echo "[FAIL] compaction 결과 seq가 victim 최대 seq보다 큼 — 최신 mapping 역전 가능" >&2
+	exit 3
+fi
+echo "    compaction sequence 역전: 0건"
 echo "[OK]"
 
 echo
