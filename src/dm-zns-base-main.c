@@ -170,6 +170,7 @@ struct zns_base_c {
 	u64 wal_highest_issued_split_gen;   // 지금까지 발행된 체크포인트 중 최대 split_gen
 	u64 wal_durable_split_gen;          // 이 값보다 작은 gen의 WAL zone은 회수 가능
 	wait_queue_head_t flush_waitq;      // dtr에서 비동기 flush chain drain 대기
+	bool gc_active;                     // GC latest-map 구축/이주 중 memtable swap 금지
 
 	spinlock_t 		lock;
 };
@@ -218,6 +219,7 @@ struct sstable_info {
 // WAL - 복구용
 #define WAL_REC_PUT        1
 #define WAL_REC_CHECKPOINT 2
+#define WAL_REC_GC_PUT     3
 
 /* 고정 크기(512/4096에 나머지 없이 나눠떨어짐). 체크포인트는 스왑 시점의
  * WAL 스트림 위치를 (split_gen, split_off) = (활성 WAL zone의 generation,
@@ -230,6 +232,7 @@ struct wal_record {
 	__le32 reserved;
 	union {
         struct { __le64 lba; __le64 phys; } put;
+        struct { __le64 lba; __le64 phys; __le64 expected_old; } gc_put;
         struct { __le64 seq_no; __le64 split_gen; __le64 split_off; } checkpoint;
     };
 };
@@ -654,61 +657,6 @@ static int sstable_io_sync(struct zns_base_c *c, unsigned int op,
 	return 0;
 }
 
-/* SSTable(헤더 si->phys, 레코드 si->phys+1부터) 안에서 lba를 on-disk binary search로 찾는다 — 레코드가 고정 16B라 512B당 32개,
- * i번째 레코드는 섹터(si->phys+1 + i/32) 오프셋 (i%32)*16에 있다. 필요한 512B 섹터 몇 개만 읽어 O(log n)으로 찾으므로
- * SSTable 전체를 한 번에 읽던 방식의 거대 할당과 read amplification이 없다. 찾으면 1 + *phys_out, 없으면 0. process context 전용. */
-static int sstable_bsearch_ondisk_sync(struct zns_base_c *c, struct sstable_info *si,
-				       u64 lba, sector_t *phys_out)
-{
-	sector_t data_start = si->phys + 1;
-	void *sec;
-	long lo = 0, hi = (long)si->record_count - 1;
-	int found = 0;
-	sector_t last_sector = (sector_t)-1;
-	const unsigned int per_sec = 512 / sizeof(struct sstable_record);  /* =32 */
-
-	sec = kzalloc(512, GFP_KERNEL);
-	if (!sec)
-		return 0;
-
-	// 이진 탐색으로 phys 찾기
-	while (lo <= hi) {
-		long mid = lo + (hi - lo) / 2;
-		sector_t sec_no = data_start + mid / per_sec;
-		unsigned int off = (mid % per_sec) * sizeof(struct sstable_record);
-		struct sstable_record *r;
-
-		if (sec_no != last_sector) {  /* 같은 섹터를 연속 탐색하면 재사용 */
-			struct bio *bio = bio_alloc(GFP_KERNEL, 1);
-
-			if (!bio)
-				break;
-			bio_set_dev(bio, c->dev->bdev);
-			bio->bi_iter.bi_sector = sec_no;
-			bio->bi_opf = REQ_OP_READ;
-			bio_add_page(bio, virt_to_page(sec), 512, offset_in_page(sec));
-			if (submit_bio_wait(bio)) {
-				bio_put(bio);
-				break;
-			}
-			bio_put(bio);
-			last_sector = sec_no;
-		}
-		r = (struct sstable_record *)((char *)sec + off);
-		if (le64_to_cpu(r->lba) == lba) {
-			*phys_out = le64_to_cpu(r->phys);
-			found = 1;
-			break;
-		} else if (le64_to_cpu(r->lba) < lba) {
-			lo = mid + 1;
-		} else {
-			hi = mid - 1;
-		}
-	}
-	kfree(sec);
-	return found;
-}
-
 /* 절대 섹터 phys에서 512B를 동기적으로 읽어 SSTable 헤더를 얻는다.
  * read_zone_header와 같은 이유로 ctr() 전용(process context). */
 static int read_sstable_header(struct zns_base_c *c, sector_t phys, struct sstable_header *hdr_out)
@@ -914,6 +862,20 @@ static void wal_replay_cb(void *fn_ctx, struct wal_record *rec, sector_t sector)
 		if (skiplist_upsert(c->memtable, le64_to_cpu(rec->put.lba),
 				    le64_to_cpu(rec->put.phys), &old_phys) == 1)
 			c->zp->invalid_count[zone_of(c->zp, old_phys)]++;
+	} else if (le32_to_cpu(rec->type) == WAL_REC_GC_PUT) {
+		u64 lba = le64_to_cpu(rec->gc_put.lba);
+		u64 phys = le64_to_cpu(rec->gc_put.phys);
+		u64 expected_old = le64_to_cpu(rec->gc_put.expected_old);
+		u64 cur, old_phys;
+
+		/* GC WAL이 foreground overwrite보다 뒤에 durable해져도,
+		 * replay 시 현재 mapping이 GC가 읽은 예전 위치와 다르면
+		 * stale 재배치로 보고 무시한다. memtable miss는 checkpoint
+		 * SSTable에 expected_old가 있는 일반적 경우이므로 적용한다. */
+		if (skiplist_lookup(c->memtable, lba, &cur) && cur != expected_old)
+			return;
+		if (skiplist_upsert(c->memtable, lba, phys, &old_phys) == 1)
+			c->zp->invalid_count[zone_of(c->zp, old_phys)]++;
 	}
 }
 
@@ -1087,6 +1049,7 @@ static void sstable_write_chunk_done(struct bio *bio);
 static void sstable_flush_complete(struct zns_io_ctx *ctx, blk_status_t status);
 static void submit_checkpoint_async(struct zns_io_ctx *ctx);
 static void checkpoint_write_done(struct bio *bio);
+static unsigned int gc_count_free_zones(struct zone_pool *zp);
 static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memtable,
 				   u64 seq_no, u64 split_gen, sector_t split_off);
 
@@ -1328,7 +1291,7 @@ static void wal_put_done(struct bio *wal_bio)
 
 	spin_lock_irq(&c->lock);
 	ret = mapping_put(c, lba, phys);
-	if (!ret && c->memtable->count >= flush_threshold) {
+	if (!ret && !c->gc_active && c->memtable->count >= flush_threshold) {
 		/* memtable 교체는 이 락 안에서 — skiplist_init도 GFP_ATOMIC이라 atomic 컨텍스트에서 불러도 안전하다. */
 		struct skiplist *new_memtable = kzalloc(sizeof(*new_memtable), GFP_ATOMIC);
 
@@ -1388,6 +1351,7 @@ static void wal_put_done(struct bio *wal_bio)
 static void flush_chain_end(struct zns_base_c *c)
 {
 	bool advanced = false;
+	bool need_gc;
 
 	spin_lock_irq(&c->lock);
 	if (--c->wal_ckpt_inflight == 0 &&
@@ -1395,11 +1359,17 @@ static void flush_chain_end(struct zns_base_c *c)
 		c->wal_durable_split_gen = c->wal_highest_issued_split_gen;
 		advanced = true;
 	}
+	need_gc = c->wal_ckpt_inflight == 0 &&
+		gc_count_free_zones(c->zp) <= gc_low_watermark;
 	spin_unlock_irq(&c->lock);
 	wake_up_all(&c->flush_waitq);
 
 	if (advanced)
 		queue_work(zns_wal_reclaim_wq, &c->wal_reclaim_work);
+	/* GC가 frozen memtable 때문에 연기됐다면 마지막 flush가
+	 * 끝나는 시점에 다시 실행. 새 write가 와야만 재시도되는 행을 막는다. */
+	if (need_gc)
+		queue_work(zns_gc_wq, &c->gc_work);
 }
 
 /* 모든 SSTable 청크가 durable하게 쓰인 뒤(또는 쓰기 실패 시) 호출.
@@ -1920,7 +1890,7 @@ static int compaction_read_source(struct zns_base_c *c, struct sstable_info *vic
 {
 	size_t total_bytes = victim->record_count * sizeof(struct sstable_record);
 	size_t alloc_bytes = round_up(total_bytes, PAGE_SIZE);
-	sector_t nr_sectors = alloc_bytes / 512;
+	sector_t nr_sectors = DIV_ROUND_UP(total_bytes, 512);
 	int ret;
 
 	/* 병합 SSTable은 수 MB까지 커질 수 있어 kvmalloc(vmalloc 폴백) 사용 */
@@ -2020,6 +1990,7 @@ static void compaction_work_fn(struct work_struct *work)
 	struct zns_base_c *c = container_of(work, struct zns_base_c, compaction_work);
 	struct sstable_info *snapshot = NULL;
 	unsigned int snap_count = 0;
+	unsigned int snap_cap;
 	struct compaction_source *srcs = NULL;
 	struct sstable_record *merged = NULL;
 	sector_t *discarded = NULL;
@@ -2044,11 +2015,19 @@ static void compaction_work_fn(struct work_struct *work)
 		spin_unlock_irq(&c->lock);
 		return;  /* 그 사이 조건이 이미 해소됨(레이스) — 할 일 없음 */
 	}
-	snap_count = c->nr_sstables;
-	snapshot = kmalloc_array(snap_count, sizeof(*snapshot), GFP_ATOMIC);
+	snap_cap = c->nr_sstables;
+	spin_unlock_irq(&c->lock);
+
+	snapshot = kvmalloc_array(snap_cap, sizeof(*snapshot), GFP_KERNEL);
 	if (!snapshot) {
-		spin_unlock_irq(&c->lock);
 		DMERR("compaction: out of memory snapshotting SSTable index, will retry on next trigger");
+		return;
+	}
+	spin_lock_irq(&c->lock);
+	snap_count = min(snap_cap, c->nr_sstables);
+	if (snap_count < k) {
+		spin_unlock_irq(&c->lock);
+		kvfree(snapshot);
 		return;
 	}
 	memcpy(snapshot, c->sstables, snap_count * sizeof(*snapshot));
@@ -2105,9 +2084,11 @@ static void compaction_work_fn(struct work_struct *work)
 		goto out_free_sources;
 	}
 
-	spin_lock_irq(&c->lock);
-	out_seq_no = c->next_seq_no++;
-	spin_unlock_irq(&c->lock);
+	/* 압축 결과는 새 논리 쓰기가 아니다. next_seq_no를 붙이면
+	 * 병합 대상이 아닌 더 최신 SSTable보다 새로운 것처럼 보여
+	 * 예전 phys가 최신 mapping을 덮어쓴다. 제거할 victim 중 최대
+	 * seq를 유지하면 대상 밖의 더 최신 SSTable이 계속 우선한다. */
+	out_seq_no = snapshot[k - 1].seq_no;
 
 	out_hdr = out_buf;
 	out_hdr->magic = cpu_to_le32(SSTABLE_MAGIC);
@@ -2224,7 +2205,7 @@ out_free_sources:
 	kvfree(merged);
 	kvfree(discarded);
 out_free_snapshot:
-	kfree(snapshot);
+	kvfree(snapshot);
 }
 
 /* ============================================================================
@@ -2237,6 +2218,112 @@ struct gc_candidate {
 	u64 lba;
 	sector_t phys;
 };
+
+/* GC 라운드 전용 latest-map. victim을 한 번이라도 가리킨 LBA만
+ * 보관한다. 오래된 SSTable부터 순차 스캔하며 phys를 덮어쓰면
+ * 마지막에는 각 LBA의 최신 SSTable 위치만 남는다. */
+struct gc_live_entry {
+	u64 lba;
+	sector_t phys;
+	bool used;
+};
+
+struct gc_live_map {
+	struct gc_live_entry *entries;
+	unsigned int capacity; /* 항상 2의 거듭제곱 */
+	unsigned int count;
+};
+
+struct gc_cycle {
+	struct gc_live_map latest;
+	struct sstable_info *sstables;
+	unsigned int nr_sstables;
+	bool built;
+};
+
+static unsigned int gc_live_hash(u64 lba, unsigned int capacity)
+{
+	/* Fibonacci hashing. LBA가 4KB 정렬이어도 하위 비트가 고르게 섞인다. */
+	return (unsigned int)((lba * 11400714819323198485ULL) & (capacity - 1));
+}
+
+static struct gc_live_entry *gc_live_map_find(struct gc_live_map *map, u64 lba)
+{
+	unsigned int idx, probes;
+
+	if (!map->capacity)
+		return NULL;
+	idx = gc_live_hash(lba, map->capacity);
+	for (probes = 0; probes < map->capacity; probes++) {
+		struct gc_live_entry *entry = &map->entries[idx];
+
+		if (!entry->used)
+			return NULL;
+		if (entry->lba == lba)
+			return entry;
+		idx = (idx + 1) & (map->capacity - 1);
+	}
+	return NULL;
+}
+
+static int gc_live_map_resize(struct gc_live_map *map, unsigned int new_capacity)
+{
+	struct gc_live_entry *old = map->entries;
+	unsigned int old_capacity = map->capacity;
+	unsigned int i;
+
+	map->entries = kvcalloc(new_capacity, sizeof(*map->entries), GFP_KERNEL);
+	if (!map->entries) {
+		map->entries = old;
+		return -ENOMEM;
+	}
+	map->capacity = new_capacity;
+	map->count = 0;
+	for (i = 0; i < old_capacity; i++) {
+		unsigned int idx;
+
+		if (!old[i].used)
+			continue;
+		idx = gc_live_hash(old[i].lba, map->capacity);
+		while (map->entries[idx].used)
+			idx = (idx + 1) & (map->capacity - 1);
+		map->entries[idx] = old[i];
+		map->count++;
+	}
+	kvfree(old);
+	return 0;
+}
+
+/* create=false면 이미 victim 후보인 LBA만 갱신. create=true면
+ * victim을 가리킨 첫 레코드이므로 없으면 새로 등록한다. */
+static int gc_live_map_update(struct gc_live_map *map, u64 lba,
+			      sector_t phys, bool create)
+{
+	struct gc_live_entry *entry = gc_live_map_find(map, lba);
+	unsigned int idx;
+
+	if (entry) {
+		entry->phys = phys;
+		return 0;
+	}
+	if (!create)
+		return 0;
+	if (!map->capacity || (map->count + 1) * 2 >= map->capacity) {
+		unsigned int new_capacity = map->capacity ? map->capacity << 1 : 1024;
+
+		if (new_capacity < map->capacity ||
+		    gc_live_map_resize(map, new_capacity))
+			return -ENOMEM;
+	}
+	idx = gc_live_hash(lba, map->capacity);
+	while (map->entries[idx].used)
+		idx = (idx + 1) & (map->capacity - 1);
+	map->entries[idx].used = true;
+	map->entries[idx].lba = lba;
+	map->entries[idx].phys = phys;
+	map->count++;
+	return 0;
+}
 
 /* [락] 호출자가 c->lock을 쥐고 있어야 한다. */
 static unsigned int gc_count_free_zones(struct zone_pool *zp)
@@ -2308,60 +2395,13 @@ static unsigned int gc_select_victim(struct zns_base_c *c)
 	return victim;
 }
 
-/* lba의 현재 진짜 물리 위치를 조회 — memtable 우선, 없으면 SSTable 전체를 훑어 seq_no 최대.
- * GC가 SSTable에서 찾은 후보가 아직 살아있는지(아니면 이미 덮어써진 stale entry인지) 검증할 때 쓴다. 못 찾으면 0, 찾으면 1 반환.
- * [호출 컨텍스트] gc_work_fn 전용 process context(submit_bio_wait 안전). */
-static int gc_lookup_current_phys(struct zns_base_c *c, u64 lba, sector_t *phys_out)
+static void sstable_snapshot_unpin(struct zns_base_c *c,
+				   struct sstable_info *snapshot, unsigned int count)
 {
-	struct sstable_info *candidates;
-	unsigned int nr_sst, actual_nr, i;
-	int best_found = 0;
-	u64 best_seq = 0;
-	sector_t best_phys = 0;
+	unsigned int i;
 
-	spin_lock_irq(&c->lock);
-	if (mapping_get(c, lba, phys_out)) {
-		spin_unlock_irq(&c->lock);
-		return 1;
-	}
-	nr_sst = c->nr_sstables;
-	spin_unlock_irq(&c->lock);
-
-	if (nr_sst == 0)
-		return 0;
-
-	candidates = kmalloc_array(nr_sst, sizeof(*candidates), GFP_KERNEL);
-	if (!candidates)
-		return 0;
-
-	spin_lock_irq(&c->lock);
-	actual_nr = min(nr_sst, c->nr_sstables);
-	memcpy(candidates, c->sstables, actual_nr * sizeof(*candidates));
-	spin_unlock_irq(&c->lock);
-
-	for (i = 0; i < actual_nr; i++) {
-		struct sstable_info *si = &candidates[i];
-		sector_t phys;
-
-		if (lba < si->min_lba || lba > si->max_lba)
-			continue;
-		if (best_found && si->seq_no < best_seq)
-			continue;  /* 이미 더 최신 걸 찾았으면 더 오래된 건 안 봐도 됨 */
-
-		/* on-disk binary search — SSTable 전체를 읽지 않고 필요한 섹터만 */
-		if (sstable_bsearch_ondisk_sync(c, si, lba, &phys)) {
-			if (!best_found || si->seq_no > best_seq) {
-				best_found = 1;
-				best_seq = si->seq_no;
-				best_phys = phys;
-			}
-		}
-	}
-
-	kfree(candidates);
-	if (best_found)
-		*phys_out = best_phys;
-	return best_found;
+	for (i = 0; i < count; i++)
+		zone_read_put(c->zp, zone_of(c->zp, snapshot[i].phys));
 }
 
 /* GC가 512B를 phys에 써서 durable까지 블로킹. 반드시 async gate (zone_dispatch_write)로 제출.
@@ -2418,7 +2458,8 @@ static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512,
  * 없으면 재배치 매핑이 memtable에만 있어(SSTable flush전) 크래시 시 replay가 곧 reset될 옛 위치로 복원해 유실된다.
  * WAL 배정은 gc_ctx=true(GC 예비 zone까지) — 아니면 free 부족 시 데드락.
  * [반환값] 0 성공, 실패 시 호출자는 라운드 중단(victim 유지). process context 전용. */
-static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys)
+static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys,
+			  sector_t expected_old)
 {
 	sector_t wal_phys;
 	int new_wal_zone = -1;
@@ -2461,9 +2502,10 @@ static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys)
 		zone_dispatch_cancel(c, wal_phys, 1);
 		return -ENOMEM;
 	}
-	rec->type = cpu_to_le32(WAL_REC_PUT);
-	rec->put.lba = cpu_to_le64(lba);
-	rec->put.phys = cpu_to_le64(phys);
+	rec->type = cpu_to_le32(WAL_REC_GC_PUT);
+	rec->gc_put.lba = cpu_to_le64(lba);
+	rec->gc_put.phys = cpu_to_le64(phys);
+	rec->gc_put.expected_old = cpu_to_le64(expected_old);
 	ret = gc_sync_gate_write(c, wal_phys, rec, true);
 	kfree(rec);
 	return ret;
@@ -2472,7 +2514,8 @@ static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys)
 /* lba의 4KB를 old_phys에서 읽어 GC_DATA zone에 새로 쓰고 mapping_put으로 갱신 (compaction과 달리 진짜 사용자 데이터를 옮김).
  * zone 쓰기는 dispatch_wait_turn 게이트를 거친다.
  * [반환값] 0 성공, 음수면 라운드 중단(victim reset 안 함 — 안전 후퇴). process context 전용. */
-static int gc_relocate_one(struct zns_base_c *c, u64 lba, sector_t old_phys)
+static int gc_relocate_one(struct zns_base_c *c, u64 lba, sector_t old_phys,
+			   sector_t *current_phys_out)
 {
 	void *buf;
 	struct bio *bio;
@@ -2553,7 +2596,7 @@ static int gc_relocate_one(struct zns_base_c *c, u64 lba, sector_t old_phys)
 
 	/* 데이터가 durable해진 뒤 WAL에 lba->new_phys를 남겨야 크래시 후 replay가 옛 위치(곧 reset될 victim) 대신 새 위치로 복원한다.
 	 * 이게 없으면 재배치 매핑이 memtable에만 있어(SSTable flush 전) 크래시 시 유실된다. */
-	ret = gc_wal_log_put(c, lba, new_phys);
+	ret = gc_wal_log_put(c, lba, new_phys, old_phys);
 	if (ret) {
 		DMERR("gc: failed to WAL-log relocation for lba=%llu (%d), aborting this round",
 		      (unsigned long long)lba, ret);
@@ -2562,6 +2605,10 @@ static int gc_relocate_one(struct zns_base_c *c, u64 lba, sector_t old_phys)
 
 	spin_lock_irq(&c->lock);
 	ret = mapping_put_if_match(c, lba, old_phys, new_phys);
+	if (ret == 0)
+		*current_phys_out = new_phys;
+	else if (ret == 1 && !mapping_get(c, lba, current_phys_out))
+		ret = -EAGAIN;
 	spin_unlock_irq(&c->lock);
 	if (ret < 0) {
 		DMERR("gc: failed to update mapping for lba=%llu after relocation (%d), aborting this round",
@@ -2571,14 +2618,14 @@ static int gc_relocate_one(struct zns_base_c *c, u64 lba, sector_t old_phys)
 	return 0;  /* ret==1: 이주 중 사용자가 덮어써 스킵 — 그 블록은 이미 무효라 GC엔 정상 */
 }
 
-/* GC 본체 — victim 하나 회수. victim 선정 → 걸친 산 LBA를 memtable(검증 없이)과
- * SSTable(gc_lookup_current_phys로 stale 아닌 것만)에서 gc_relocate_one으로 옮김
+/* GC 본체 — victim 하나 회수. worker의 첫 victim에서 전체 latest-map을
+ * 한 번 구축하고 cycle에 보존, 이후 victim은 같은 map을 재사용한다.
  * → 전부 성공했을 때만 zone_reset_hw+mark_free(회수는 안전 확인 후 마지막에만).
  * [반환값] true 회수 성공, false 대상 없음/재배치 실패(reset 안 함, 안전 후퇴).
  * [락] 스냅샷/조회/커밋 각각 짧게, I/O는 락 밖. process context 전용.
- * [미해결 race] 재배치 중 사용자가 같은 lba를 덮어쓰면 GC가 옛 값으로 되돌릴 수 있다.
- * 통합 회수-안전 메커니즘 필요(compaction 읽기 race와 동형, bugfix-log 참고). */
-static bool gc_reclaim_one_victim(struct zns_base_c *c)
+ * foreground 경합은 mapping_put_if_match와 WAL_REC_GC_PUT(expected_old)로
+ * 정상 실행·crash replay 모두에서 최신 mapping을 보존한다. */
+static bool gc_reclaim_one_victim(struct zns_base_c *c, struct gc_cycle *cycle)
 {
 	unsigned int victim;
 	sector_t vstart, vend;
@@ -2586,8 +2633,13 @@ static bool gc_reclaim_one_victim(struct zns_base_c *c)
 	unsigned int nr_mt = 0, mt_cap = 0;
 	struct sstable_info *snapshot = NULL;
 	unsigned int snap_count = 0;
+	unsigned int snap_cap = 0;
+	struct gc_live_map live_map = { 0 };
 	struct skiplist_node *node;
 	unsigned int i;
+	unsigned int nr_relocated = 0;
+	u64 live_sectors = 0;
+	u64 used_sectors;
 	bool ok = true;
 	bool reclaimed = false;
 
@@ -2597,14 +2649,18 @@ static bool gc_reclaim_one_victim(struct zns_base_c *c)
 
 	vstart = (sector_t)victim * c->zp->zone_sectors;
 	vend = vstart + c->zp->zone_sectors;
+	if (cycle->built) {
+		live_map = cycle->latest;
+		snapshot = cycle->sstables;
+		snap_count = cycle->nr_sstables;
+		goto refresh_current;
+	}
 
 	/* 1) memtable 스냅샷. worker process context에서 먼저 크기를 세고 큰
 	 * 배열은 락 밖에서 GFP_KERNEL로 할당한다. 기존의 spinlock 안
 	 * krealloc(GFP_ATOMIC)은 대형 Kafka memtable에서 반복 OOM을 냈다. */
 	spin_lock_irq(&c->lock);
 	for (node = c->memtable->head->forward[0]; node; node = node->forward[0]) {
-		if (node->phys < vstart || node->phys >= vend)
-			continue;
 		mt_cap++;
 	}
 	spin_unlock_irq(&c->lock);
@@ -2619,40 +2675,42 @@ static bool gc_reclaim_one_victim(struct zns_base_c *c)
 	spin_lock_irq(&c->lock);
 	for (node = c->memtable->head->forward[0]; node && nr_mt < mt_cap;
 	     node = node->forward[0]) {
-		if (node->phys < vstart || node->phys >= vend)
-			continue;
 		mt_candidates[nr_mt].lba = node->lba;
 		mt_candidates[nr_mt].phys = node->phys;
 		nr_mt++;
 	}
 	spin_unlock_irq(&c->lock);
 
-	for (i = 0; i < nr_mt && ok; i++)
-		ok = (gc_relocate_one(c, mt_candidates[i].lba, mt_candidates[i].phys) == 0);
-
-	if (!ok) {
-		DMERR("gc: relocation failed, aborting this round without resetting victim zone %u", victim);
+	/* 2) SSTable 스캔 — 오래된 세대부터 한 번씩 순차 스캔하며
+	 * victim을 한 번이라도 가리킨 LBA의 latest phys만 해시에 남긴다. */
+	/* SSTable 수에 비례하는 할당은 락 밖 process context에서 한다.
+	 * snapshot 중 인덱스가 커지면 이번 라운드의 상한까지만 본다.
+	 * 복사와 pin은 같은 락 안에서 해 compaction reset과 경쟁하지 않는다. */
+	spin_lock_irq(&c->lock);
+	snap_cap = c->nr_sstables;
+	spin_unlock_irq(&c->lock);
+	if (snap_cap)
+		snapshot = kvmalloc_array(snap_cap, sizeof(*snapshot), GFP_KERNEL);
+	if (snap_cap && !snapshot) {
+		DMERR("gc: out of memory snapshotting SSTable index, aborting this round");
 		goto out_free_mt;
 	}
-
-	/* 2) SSTable 스캔 — victim에 걸친 레코드를 gc_lookup_current_phys로 "지금도
-	 * 진짜 현재 위치"인지 검증한 것만 재배치(아니면 이미 덮어써진 stale). */
 	spin_lock_irq(&c->lock);
-	snap_count = c->nr_sstables;
-	if (snap_count) {
-		snapshot = kmalloc_array(snap_count, sizeof(*snapshot), GFP_ATOMIC);
-		if (!snapshot) {
-			spin_unlock_irq(&c->lock);
-			DMERR("gc: out of memory snapshotting SSTable index, aborting this round");
-			goto out_free_mt;
-		}
+	snap_count = min(snap_cap, c->nr_sstables);
+	if (snap_count)
 		memcpy(snapshot, c->sstables, snap_count * sizeof(*snapshot));
-	}
+	for (i = 0; i < snap_count; i++)
+		zone_read_get(c->zp, zone_of(c->zp, snapshot[i].phys));
 	spin_unlock_irq(&c->lock);
+	/* latest overwrite가 뒤에 오도록 오래된 SSTable부터 처리. */
+	if (snap_count > 1)
+		sort(snapshot, snap_count, sizeof(*snapshot), sstable_info_cmp_seq_asc, NULL);
 
 	for (i = 0; i < snap_count && ok; i++) {
 		struct sstable_info *si = &snapshot[i];
-		size_t alloc_bytes = round_up(si->record_count * sizeof(struct sstable_record), PAGE_SIZE);
+		size_t record_bytes = si->record_count * sizeof(struct sstable_record);
+		size_t alloc_bytes = round_up(record_bytes, PAGE_SIZE);
+		sector_t record_sectors = DIV_ROUND_UP(record_bytes, 512);
 		struct sstable_record *recs;
 		void *buf;
 		unsigned int r;
@@ -2661,29 +2719,27 @@ static bool gc_reclaim_one_victim(struct zns_base_c *c)
 		/* 큰 SSTable도 담을 수 있게 kvmalloc + 청크 읽기 */
 		buf = kvzalloc(alloc_bytes, GFP_KERNEL);
 		if (!buf) {
-			DMERR("gc: out of memory reading SSTable (seq=%llu), skipping its entries this round",
+			DMERR("gc: out of memory reading SSTable (seq=%llu), aborting this round without reset",
 			      (unsigned long long)si->seq_no);
-			continue;
+			ok = false;
+			break;
 		}
-		ret = sstable_io_sync(c, REQ_OP_READ, si->phys + 1, buf, alloc_bytes / 512);
+		ret = sstable_io_sync(c, REQ_OP_READ, si->phys + 1, buf, record_sectors);
 		if (ret) {
-			DMERR("gc: failed to read SSTable (seq=%llu, err=%d), skipping its entries this round",
+			DMERR("gc: failed to read SSTable (seq=%llu, err=%d), aborting this round without reset",
 			      (unsigned long long)si->seq_no, ret);
 			kvfree(buf);
-			continue;
+			ok = false;
+			break;
 		}
 
 		recs = buf;
 		for (r = 0; r < si->record_count; r++) {
 			sector_t phys = le64_to_cpu(recs[r].phys);
 			u64 rlba = le64_to_cpu(recs[r].lba);
-			sector_t cur_phys;
 
-			if (phys < vstart || phys >= vend)
-				continue;
-			if (!gc_lookup_current_phys(c, rlba, &cur_phys) || cur_phys != phys)
-				continue;  /* 이미 다른 곳에서 덮어써진 stale entry — 재배치 불필요 */
-			if (gc_relocate_one(c, rlba, phys)) {
+			if (gc_live_map_update(&live_map, rlba, phys, true)) {
+				DMERR("gc: out of memory building victim latest-map, aborting this round without reset");
 				ok = false;
 				break;
 			}
@@ -2692,9 +2748,75 @@ static bool gc_reclaim_one_victim(struct zns_base_c *c)
 	}
 
 	if (!ok) {
-		DMERR("gc: relocation failed, aborting this round without resetting victim zone %u", victim);
+		DMERR("gc: failed to build a complete latest-map, aborting without resetting victim zone %u", victim);
 		goto out_free_snapshot;
 	}
+
+	/* memtable이 모든 SSTable보다 최신. 스냅샷 시점에 victim을
+	 * 가리킨 엔트리를 등록/갱신해 SSTable 결과를 덮어쓴다. */
+	for (i = 0; i < nr_mt; i++) {
+		if (gc_live_map_update(&live_map, mt_candidates[i].lba,
+				       mt_candidates[i].phys, true)) {
+			DMERR("gc: out of memory merging memtable into latest-map, aborting without reset");
+			ok = false;
+			break;
+		}
+	}
+	if (!ok)
+		goto out_free_snapshot;
+	cycle->latest = live_map;
+	cycle->sstables = snapshot;
+	cycle->nr_sstables = snap_count;
+	cycle->built = true;
+
+refresh_current:
+	/* snapshot 후 도착한 foreground overwrite를 반영. gc_active 덕분에
+	 * 이 순회 중 memtable이 frozen 상태로 숨지 않는다. 새 엔트리
+	 * 삽입은 필요 없고, 이미 victim 후보인 LBA의 최신 phys만 갱신. */
+	spin_lock_irq(&c->lock);
+	for (node = c->memtable->head->forward[0]; node; node = node->forward[0]) {
+		struct gc_live_entry *entry = gc_live_map_find(&live_map, node->lba);
+
+		if (entry)
+			entry->phys = node->phys;
+	}
+	spin_unlock_irq(&c->lock);
+
+	for (i = 0; i < live_map.capacity; i++) {
+		struct gc_live_entry *entry = &live_map.entries[i];
+
+		if (entry->used && entry->phys >= vstart && entry->phys < vend)
+			live_sectors += BLOCK_SECTORS;
+	}
+	used_sectors = READ_ONCE(c->zp->wp[victim]);
+	used_sectors = used_sectors > 0 ? used_sectors - 1 : 0;
+	/* 이주 data와 각 PUT의 1-sector WAL까지 감안해 물리 공간
+	 * 순이익이 없는 fallback victim은 건드리지 않는다. 안 그러면
+	 * 100% live zone을 GC_DATA로 복사하며 reserve만 소모할 수 있다. */
+	if (live_sectors + DIV_ROUND_UP_ULL(live_sectors, BLOCK_SECTORS) >=
+	    used_sectors) {
+		DMINFO("gc: skipping victim %u: no positive reclaim gain (used=%llu, live=%llu)",
+		       victim, (unsigned long long)used_sectors,
+		       (unsigned long long)live_sectors);
+		goto out_free_snapshot;
+	}
+
+	/* latest phys가 아직 victim 안인 LBA만 live. 이주 직전/직후의
+	 * 사용자 overwrite는 gc_relocate_one의 mapping_put_if_match가 마지막으로 걸러낸다. */
+	for (i = 0; i < live_map.capacity; i++) {
+		struct gc_live_entry *entry = &live_map.entries[i];
+
+		if (!entry->used || entry->phys < vstart || entry->phys >= vend)
+			continue;
+		if (gc_relocate_one(c, entry->lba, entry->phys, &entry->phys)) {
+			DMERR("gc: relocation failed, aborting this round without resetting victim zone %u", victim);
+			ok = false;
+			break;
+		}
+		nr_relocated++;
+	}
+	if (!ok)
+		goto out_free_snapshot;
 
 	/* 전부 성공 — victim zone에 더 이상 살아있는 데이터가 없다고 확신할 수 있으므로 실제로 회수.
 	 * reset 직전 진행 중인 읽기(read pin)가 전부 끝나길 기다린다(회수 안전). */
@@ -2705,12 +2827,18 @@ static bool gc_reclaim_one_victim(struct zns_base_c *c)
 		spin_lock_irq(&c->lock);
 		zone_pool_mark_free(c->zp, victim);
 		spin_unlock_irq(&c->lock);
-		DMINFO("gc: reclaimed zone %u (%u memtable entries relocated)", victim, nr_mt);
+		DMINFO("gc: reclaimed zone %u (%u live entries relocated, %u cycle mappings)",
+		       victim, nr_relocated, live_map.count);
 		reclaimed = true;
 	}
 
 out_free_snapshot:
-	kfree(snapshot);
+	if (!cycle->built)
+		kvfree(live_map.entries);
+	if (!cycle->built && snapshot) {
+		sstable_snapshot_unpin(c, snapshot, snap_count);
+		kvfree(snapshot);
+	}
 out_free_mt:
 	kvfree(mt_candidates);
 	return reclaimed;
@@ -2745,9 +2873,25 @@ static void gc_work_fn(struct work_struct *work)
 	struct zns_base_c *c = container_of(work, struct zns_base_c, gc_work);
 	bool still_low;
 	unsigned int rounds;
+	bool deferred = false;
+	struct gc_cycle cycle = { 0 };
+
+	/* frozen memtable은 active memtable에서는 빠졌지만 SSTable 색인에
+	 * 아직 등록되지 않은 순간이 있다. 그 때 latest-map을 만들면
+	 * 최신 overwrite를 놓칠 수 있으므로 진행 중 flush가 있으면 미루고,
+	 * GC가 끝날 때까지 새 memtable swap을 막는다. */
+	spin_lock_irq(&c->lock);
+	if (c->wal_ckpt_inflight > 0) {
+		deferred = true;
+	} else {
+		c->gc_active = true;
+	}
+	spin_unlock_irq(&c->lock);
+	if (deferred)
+		return;
 
 	for (rounds = 0; rounds < c->zp->nr_zones; rounds++) {
-		if (!gc_reclaim_one_victim(c))
+		if (!gc_reclaim_one_victim(c, &cycle))
 			break;
 		spin_lock_irq(&c->lock);
 		still_low = gc_count_free_zones(c->zp) <= gc_low_watermark;
@@ -2758,6 +2902,15 @@ static void gc_work_fn(struct work_struct *work)
 	if (rounds == c->zp->nr_zones)
 		DMERR("gc: hit the per-trigger round cap (%u) — free zones may still be low, will retry on next trigger",
 		      c->zp->nr_zones);
+	if (cycle.built) {
+		sstable_snapshot_unpin(c, cycle.sstables, cycle.nr_sstables);
+		kvfree(cycle.sstables);
+		kvfree(cycle.latest.entries);
+	}
+
+	spin_lock_irq(&c->lock);
+	c->gc_active = false;
+	spin_unlock_irq(&c->lock);
 }
 
 /* zns_wal_reclaim_wq 워커 — 온전히 flush된 WAL zone 회수. 대상 3조건(전부 락 하):
@@ -3091,6 +3244,15 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		int new_data_zone;
 		struct zns_io_ctx *ctx;
 
+		/* 매핑/WAL/GC의 최소 단위는 4KB다. 부분 write를 그대로
+		 * append하면 read-modify-write 없이 나머지 섹터를 잃게 되므로
+		 * 조용히 잘못된 mapping을 만드는 대신 명시적으로 거절한다. */
+		if (offset_in_block || nr != BLOCK_SECTORS) {
+			bio->bi_status = BLK_STS_NOTSUPP;
+			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
+
 		ret = zone_pool_alloc_with_gc_retry(c, ZONE_TAG_USER_DATA, nr, &phys, &new_data_zone);
 		if (ret == -EAGAIN)
 			return DM_MAPIO_REQUEUE;
@@ -3108,7 +3270,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		}
 		ctx->c = c;
 		ctx->orig_bio = bio;
-		ctx->lba = lba;
+		ctx->lba = block_lba;
 		ctx->reserved_phys = phys;
 		ctx->reserved_nr = nr;
 
@@ -3197,6 +3359,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 
 		rctx = kzalloc(sizeof(*rctx), GFP_NOIO);
 		if (!rctx) {
+			sstable_snapshot_unpin(c, candidates, nmatch);
 			kfree(candidates);
 			bio->bi_status = BLK_STS_RESOURCE;
 			bio_endio(bio);
@@ -3206,6 +3369,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		rctx->sec_buf = kzalloc(512, GFP_NOIO);
 		if (!rctx->sec_buf) {
 			kfree(rctx);
+			sstable_snapshot_unpin(c, candidates, nmatch);
 			kfree(candidates);
 			bio->bi_status = BLK_STS_RESOURCE;
 			bio_endio(bio);
