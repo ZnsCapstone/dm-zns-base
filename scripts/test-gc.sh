@@ -138,6 +138,10 @@ if [ "$GC_COUNT" -lt 1 ]; then
 	exit 3
 fi
 dmesg | grep "gc:" | tail -10
+if dmesg | grep -q "gc: failed to build a complete latest-map"; then
+	echo "[FAIL] GC latest-map 구축이 완전하지 않아 회수가 중단됨" >&2
+	exit 3
+fi
 echo "[OK]"
 
 echo

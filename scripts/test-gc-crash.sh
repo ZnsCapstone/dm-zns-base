@@ -89,8 +89,8 @@ echo "[OK]"
 
 echo
 echo "=== [3/6] GC가 '살아있는 데이터'를 실제로 재배치했는지 확인 (M>0) ==="
-RELOC=$(dmesg | grep -oE "reclaimed zone [0-9]+ \([0-9]+ memtable" | grep -oE "\([0-9]+" | tr -d '(' | awk '{s+=$1} END{print s+0}')
-echo "    총 재배치된 memtable 엔트리 수: ${RELOC}"
+RELOC=$(dmesg | grep -oE "reclaimed zone [0-9]+ \([0-9]+ live entries" | grep -oE "\([0-9]+" | tr -d '(' | awk '{s+=$1} END{print s+0}')
+echo "    총 재배치된 live 엔트리 수: ${RELOC}"
 dmesg | grep "gc: reclaimed zone" | tail -5
 if [ "${RELOC:-0}" -lt 1 ]; then
 	echo "[FAIL] GC가 살아있는 데이터를 한 번도 재배치 안 함 — 이 테스트가 취약 경로를 못 탐." >&2
