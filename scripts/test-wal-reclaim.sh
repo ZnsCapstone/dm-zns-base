@@ -61,8 +61,8 @@ dmesg -C
 
 sectors=$(blockdev --getsz "$UNDERLYING")
 
-echo "=== [1/5] insmod (flush_threshold=$FLUSH_THRESHOLD) + ${WRITE_MB}MB 기록 ==="
-insmod "$KO_PATH" flush_threshold="$FLUSH_THRESHOLD" || { echo "[!] insmod failed" >&2; exit 1; }
+echo "=== [1/5] insmod (flush_threshold=$FLUSH_THRESHOLD, batching off for rollover coverage) + ${WRITE_MB}MB 기록 ==="
+insmod "$KO_PATH" flush_threshold="$FLUSH_THRESHOLD" wal_batch_max_records=1 || { echo "[!] insmod failed" >&2; exit 1; }
 echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" || {
 	echo "[!] dmsetup create failed" >&2; exit 1;
 }
@@ -94,7 +94,7 @@ echo
 echo "=== [3/5] '크래시' 시뮬레이션 — zone reset 없이 모듈만 내렸다 다시 올림 ==="
 dmsetup remove "$DM_NAME"
 rmmod $MOD_NAME
-insmod "$KO_PATH" flush_threshold="$FLUSH_THRESHOLD" || { echo "[!] insmod(재적재) failed" >&2; exit 1; }
+insmod "$KO_PATH" flush_threshold="$FLUSH_THRESHOLD" wal_batch_max_records=1 || { echo "[!] insmod(재적재) failed" >&2; exit 1; }
 echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" || {
 	echo "[!] dmsetup create(재생성) failed" >&2; exit 1;
 }
