@@ -17,6 +17,8 @@
 #include <linux/wait.h>
 #include <linux/atomic.h>
 #include <linux/crc32.h>
+#include <linux/jiffies.h>
+#include <linux/math64.h>
 
 #include "skiplist.h"
 
@@ -2876,6 +2878,8 @@ static enum gc_reclaim_result gc_reclaim_one_victim(struct zns_base_c *c,
 						      struct gc_cycle *cycle)
 {
 	unsigned int victim;
+	unsigned int invalid_hint;
+	unsigned int free_at_start;
 	sector_t vstart, vend;
 	struct gc_candidate *mt_candidates = NULL;
 	unsigned int nr_mt = 0, mt_cap = 0;
@@ -2890,10 +2894,18 @@ static enum gc_reclaim_result gc_reclaim_one_victim(struct zns_base_c *c,
 	u64 used_sectors;
 	bool ok = true;
 	bool reclaimed = false;
+	unsigned long victim_started = jiffies;
+	unsigned long relocation_started;
 
 	victim = gc_select_victim(c, cycle->excluded);
 	if (victim == ZONE_NONE)
 		return GC_RECLAIM_STOP;  /* 회수할 만한 zone이 없음 */
+	spin_lock_irq(&c->lock);
+	invalid_hint = c->zp->invalid_count[victim];
+	free_at_start = gc_count_free_zones(c->zp);
+	spin_unlock_irq(&c->lock);
+	DMINFO("gc: selected victim %u (invalid_hint=%u, free_zones=%u, cached_map=%u)",
+	       victim, invalid_hint, free_at_start, cycle->built ? 1 : 0);
 
 	vstart = (sector_t)victim * c->zp->zone_sectors;
 	vend = vstart + c->zp->zone_sectors;
@@ -3016,6 +3028,9 @@ static enum gc_reclaim_result gc_reclaim_one_victim(struct zns_base_c *c,
 	cycle->sstables = snapshot;
 	cycle->nr_sstables = snap_count;
 	cycle->built = true;
+	DMINFO("gc: latest-map ready for victim %u (entries=%u, memtable=%u, sstables=%u, elapsed=%ums)",
+	       victim, live_map.count, nr_mt, snap_count,
+	       jiffies_to_msecs(jiffies - victim_started));
 
 refresh_current:
 	/* snapshot 후 도착한 foreground overwrite를 반영. gc_active 덕분에
@@ -3050,6 +3065,13 @@ refresh_current:
 		kvfree(mt_candidates);
 		return GC_RECLAIM_TRY_NEXT;
 	}
+	DMINFO("gc: relocating victim %u (used=%llu, live=%llu, invalid=%llu, entries=%llu, free_zones=%u)",
+	       victim, (unsigned long long)used_sectors,
+	       (unsigned long long)live_sectors,
+	       (unsigned long long)(used_sectors - live_sectors),
+	       (unsigned long long)(live_sectors / BLOCK_SECTORS),
+	       free_at_start);
+	relocation_started = jiffies;
 
 	/* latest phys가 아직 victim 안인 LBA만 live. 이주 직전/직후의
 	 * 사용자 overwrite는 gc_relocate_one의 mapping_put_if_match가 마지막으로 걸러낸다. */
@@ -3064,6 +3086,16 @@ refresh_current:
 			break;
 		}
 		nr_relocated++;
+		if (!(nr_relocated & 0x7fff)) {
+			u64 elapsed_ms = jiffies_to_msecs(jiffies - relocation_started);
+
+			DMINFO("gc: victim %u progress relocated=%u/%llu (%llums, %llu entries/s)",
+			       victim, nr_relocated,
+			       (unsigned long long)(live_sectors / BLOCK_SECTORS),
+			       (unsigned long long)elapsed_ms,
+			       (unsigned long long)(elapsed_ms ?
+				div64_u64((u64)nr_relocated * 1000, elapsed_ms) : 0));
+		}
 	}
 	if (!ok)
 		goto out_free_snapshot;
@@ -3077,8 +3109,10 @@ refresh_current:
 		spin_lock_irq(&c->lock);
 		zone_pool_mark_free(c->zp, victim);
 		spin_unlock_irq(&c->lock);
-		DMINFO("gc: reclaimed zone %u (%u live entries relocated, %u cycle mappings)",
-		       victim, nr_relocated, live_map.count);
+		DMINFO("gc: reclaimed zone %u (%u live entries relocated, %u cycle mappings, relocation=%ums, total=%ums)",
+		       victim, nr_relocated, live_map.count,
+		       jiffies_to_msecs(jiffies - relocation_started),
+		       jiffies_to_msecs(jiffies - victim_started));
 		reclaimed = true;
 	}
 
@@ -3137,20 +3171,29 @@ static void gc_work_fn(struct work_struct *work)
 	bool deferred = false;
 	struct gc_cycle cycle = { 0 };
 	enum gc_reclaim_result result;
+	unsigned int free_at_start;
+	unsigned int ckpt_inflight;
 
 	/* frozen memtable은 active memtable에서는 빠졌지만 SSTable 색인에
 	 * 아직 등록되지 않은 순간이 있다. 그 때 latest-map을 만들면
 	 * 최신 overwrite를 놓칠 수 있으므로 진행 중 flush가 있으면 미루고,
 	 * GC가 끝날 때까지 새 memtable swap을 막는다. */
 	spin_lock_irq(&c->lock);
+	free_at_start = gc_count_free_zones(c->zp);
+	ckpt_inflight = c->wal_ckpt_inflight;
 	if (c->wal_ckpt_inflight > 0) {
 		deferred = true;
 	} else {
 		c->gc_active = true;
 	}
 	spin_unlock_irq(&c->lock);
-	if (deferred)
+	if (deferred) {
+		DMINFO("gc: deferred while checkpoint/flush is in flight (inflight=%u, free_zones=%u)",
+		       ckpt_inflight, free_at_start);
 		return;
+	}
+	DMINFO("gc: worker started (free_zones=%u, low_watermark=%u)",
+	       free_at_start, gc_low_watermark);
 
 	cycle.excluded = kvcalloc(c->zp->nr_zones, sizeof(*cycle.excluded), GFP_KERNEL);
 	if (!cycle.excluded) {
@@ -3160,8 +3203,11 @@ static void gc_work_fn(struct work_struct *work)
 
 	for (attempts = 0; attempts < c->zp->nr_zones; attempts++) {
 		result = gc_reclaim_one_victim(c, &cycle);
-		if (result == GC_RECLAIM_STOP)
+		if (result == GC_RECLAIM_STOP) {
+			DMINFO("gc: stopped without a reclaimable victim (attempt=%u, reclaimed=%u)",
+			       attempts, reclaimed);
 			break;
+		}
 		if (result == GC_RECLAIM_TRY_NEXT)
 			continue;
 		reclaimed++;
@@ -3188,7 +3234,10 @@ out_finish:
 	else if (c->gc_no_progress < UINT_MAX)
 		c->gc_no_progress++;
 	c->gc_active = false;
+	free_at_start = gc_count_free_zones(c->zp);
 	spin_unlock_irq(&c->lock);
+	DMINFO("gc: worker finished (reclaimed=%u, free_zones=%u, no_progress=%u)",
+	       reclaimed, free_at_start, READ_ONCE(c->gc_no_progress));
 	/* WAL 공간 부족으로 보류된 foreground bio가 있으면 100ms 타이머를
 	 * 기다리지 않고 방금 회수한 공간을 즉시 사용하게 한다. */
 	if (reclaimed && READ_ONCE(c->wal_pending_count))
