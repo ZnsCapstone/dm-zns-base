@@ -3043,6 +3043,19 @@ refresh_current:
 	}
 	used_sectors = READ_ONCE(c->zp->wp[victim]);
 	used_sectors = used_sectors > 0 ? used_sectors - 1 : 0;
+	/* 여유 zone이 reserve보다 남아 있는 동안에는 아주 작은 순이익을
+	 * 위해 거의 전체 zone을 복사하지 않는다. FEMU의 2GiB zone에서는
+	 * invalid 1% 미만 victim 하나가 foreground를 60초 이상 막을 수 있다.
+	 * reserve까지 내려간 긴급 상황에서는 양의 순이익만 있으면 허용한다. */
+	if (free_at_start > gc_reserved_zones &&
+	    used_sectors - live_sectors < used_sectors / 20) {
+		DMINFO("gc: skipping victim %u: reclaim gain below 5%% (used=%llu, live=%llu)",
+		       victim, (unsigned long long)used_sectors,
+		       (unsigned long long)live_sectors);
+		cycle->excluded[victim] = true;
+		kvfree(mt_candidates);
+		return GC_RECLAIM_TRY_NEXT;
+	}
 	/* 이주 data와 batch WAL page까지 감안해 물리 공간
 	 * 순이익이 없는 fallback victim은 건드리지 않는다. 안 그러면
 	 * 100% live zone을 GC_DATA로 복사하며 reserve만 소모할 수 있다. */
@@ -3191,6 +3204,7 @@ static void gc_work_fn(struct work_struct *work)
 	enum gc_reclaim_result result;
 	unsigned int free_at_start;
 	unsigned int ckpt_inflight;
+	unsigned int sealed_zone = ZONE_NONE;
 
 	/* frozen memtable은 active memtable에서는 빠졌지만 SSTable 색인에
 	 * 아직 등록되지 않은 순간이 있다. 그 때 latest-map을 만들면
@@ -3202,6 +3216,18 @@ static void gc_work_fn(struct work_struct *work)
 	if (c->wal_ckpt_inflight > 0) {
 		deferred = true;
 	} else {
+		unsigned int active = c->zp->active_zone[ZONE_TAG_USER_DATA];
+
+		/* 압박을 만든 overwrite는 대개 현재 USER_DATA zone에 몰려 있다.
+		 * active zone은 victim 후보에서 제외되므로, 이를 그대로 두면 GC가
+		 * 오래된 거의-live zone부터 복사한다. 새 foreground zone과 GC 이주
+		 * 공간이 모두 남아 있을 때 dirty active zone을 조기 seal한다. */
+		if (active != ZONE_NONE &&
+		    c->zp->invalid_count[active] > 0 &&
+		    free_at_start > gc_reserved_zones + 1) {
+			c->zp->active_zone[ZONE_TAG_USER_DATA] = ZONE_NONE;
+			sealed_zone = active;
+		}
 		c->gc_active = true;
 	}
 	spin_unlock_irq(&c->lock);
@@ -3210,6 +3236,10 @@ static void gc_work_fn(struct work_struct *work)
 		       ckpt_inflight, free_at_start);
 		return;
 	}
+	if (sealed_zone != ZONE_NONE)
+		DMINFO("gc: sealed active USER_DATA zone %u early (invalid_hint=%u, free_zones=%u)",
+		       sealed_zone, READ_ONCE(c->zp->invalid_count[sealed_zone]),
+		       free_at_start);
 	DMINFO("gc: worker started (free_zones=%u, start=%u, stop=%u, reserve=%u)",
 	       free_at_start, gc_low_watermark, gc_stop_watermark(),
 	       gc_reserved_zones);
