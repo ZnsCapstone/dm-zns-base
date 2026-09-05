@@ -3247,9 +3247,28 @@ static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag
 					   sector_t *phys_out, int *new_zone_out)
 {
 	int ret;
+	bool borrowed_reserve = false;
+	unsigned int free_count = 0;
+	unsigned int z;
 
 	spin_lock_irq(&c->lock);
 	ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out, false);
+	/* 모든 논리 LBA가 한 번씩 기록된 직후에는 기존 data zone이 전부
+	 * live라 GC victim이 없다. 이때 reserve 전체를 foreground에서 막으면
+	 * overwrite가 invalid block을 만들 수도 없어 영구 교착한다. GC가 한
+	 * cycle 무진전을 확인한 뒤 USER_DATA에 reserve 하나만 seed로 빌려주고,
+	 * 마지막 한 zone은 GC relocation용으로 반드시 남긴다. */
+	if (ret == -ENOSPC && tag == ZONE_TAG_USER_DATA &&
+	    c->gc_no_progress > 0) {
+		for (z = 0; z < c->zp->nr_zones; z++)
+			if (c->zp->zone_tag[z] == ZONE_TAG_FREE)
+				free_count++;
+		if (free_count > 1) {
+			ret = zone_pool_alloc(c->zp, tag, nr, phys_out,
+					      new_zone_out, true);
+			borrowed_reserve = !ret;
+		}
+	}
 	if (!ret) {
 		c->gc_no_progress = 0;
 	} else if (ret == -ENOSPC &&
@@ -3265,6 +3284,9 @@ static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag
 	 * 느린 대형-zone GC가 잠시 뒤 성공해도 파일시스템은 먼저 I/O error를
 	 * 받아 손상된다. */
 	spin_unlock_irq(&c->lock);
+	if (borrowed_reserve)
+		DMINFO("foreground borrowed one GC reserve zone to seed invalidation (new_zone=%d, free_before=%u)",
+		       new_zone_out ? *new_zone_out : -1, free_count);
 
 	if (ret) {
 		if (ret == -ENOSPC)
