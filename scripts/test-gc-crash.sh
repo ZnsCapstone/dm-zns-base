@@ -125,9 +125,9 @@ echo "[OK] 유실 없음 — GC 재배치가 크래시에 안전함"
 
 echo
 echo "=== [6/6] 커널 에러 확인 ==="
-if dmesg | grep -qi "blk_update_request\|hung_task\|BUG:\|reclaimed while dispatch waiters"; then
+if dmesg | grep -qi "blk_update_request\|hung_task\|BUG:\|reclaimed while dispatch waiters\|WAL scan: invalid/torn page"; then
 	echo "[FAIL] 커널 에러/행 감지됨" >&2
-	dmesg | grep -i "blk_update_request\|hung_task\|BUG:\|reclaimed while dispatch waiters"
+	dmesg | grep -i "blk_update_request\|hung_task\|BUG:\|reclaimed while dispatch waiters\|WAL scan: invalid/torn page"
 	exit 3
 fi
 echo "[OK] 에러 없음"
