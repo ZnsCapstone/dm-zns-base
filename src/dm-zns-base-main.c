@@ -120,6 +120,12 @@ static unsigned int wal_batch_delay_ms = 2;
 module_param(wal_batch_delay_ms, uint, 0444);
 MODULE_PARM_DESC(wal_batch_delay_ms, "maximum foreground WAL group-commit delay in ms");
 
+/* 회귀 테스트에서 WAL 공간 부족 경로를 결정적으로 재현하기 위한 fault
+ * injection. 0(기본값)이면 실제 동작에는 아무 영향이 없다. */
+static unsigned int wal_batch_alloc_failures;
+module_param(wal_batch_alloc_failures, uint, 0444);
+MODULE_PARM_DESC(wal_batch_alloc_failures, "number of foreground WAL allocations to fail for testing");
+
 // zone pool
 struct zone_pool {
 	sector_t zone_sectors;
@@ -174,6 +180,7 @@ struct zns_base_c {
 	struct list_head wal_pending;
 	unsigned int wal_pending_count;
 	bool wal_batch_busy;
+	bool stopping;
 	atomic_t foreground_writes;
 
 	/* WAL zone 회수 판정용 — 자세한 건 flush_chain_end/wal_reclaim_work_fn 참고.
@@ -1437,13 +1444,43 @@ static void wal_batch_work_fn(struct work_struct *work)
 	}
 	more = !list_empty(&c->wal_pending);
 	wal_sectors = count == 1 ? 1 : WAL_PAGE_SECTORS;
-	if (!ret && count)
-		ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, wal_sectors,
-				      &wal_phys, &new_zone, false);
+	if (!ret && count) {
+		if (unlikely(wal_batch_alloc_failures)) {
+			wal_batch_alloc_failures--;
+			ret = -ENOSPC;
+		} else {
+			ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, wal_sectors,
+					      &wal_phys, &new_zone, false);
+		}
+	}
 	spin_unlock_irq(&c->lock);
 
 	if (!count)
 		goto out;
+	if (ret == -ENOSPC) {
+		bool stopping;
+
+		/* data append는 이미 끝났지만 WAL이 durable하지 않으므로 원 bio를
+		 * 실패시키면 ext4가 손상 상태로 전환된다. pending 앞쪽에 원래
+		 * 순서대로 되돌리고 GC가 공간을 만든 뒤 다시 시도한다. */
+		spin_lock_irq(&c->lock);
+		stopping = c->stopping;
+		if (!stopping) {
+			list_splice_init(&batch, &c->wal_pending);
+			c->wal_pending_count += count;
+			c->wal_batch_busy = false;
+		}
+		spin_unlock_irq(&c->lock);
+		if (!stopping) {
+			free_page((unsigned long)page);
+			queue_work(zns_gc_wq, &c->gc_work);
+			mod_delayed_work(zns_wq, &c->wal_batch_work,
+					 msecs_to_jiffies(100));
+			return;
+		}
+		/* target 종료 중에는 더 이상 재큐잉할 수 없으므로 아래 공통
+		 * 완료 경로에서 오류로 정리한다. */
+	}
 	if (ret)
 		goto complete;
 
@@ -3152,6 +3189,10 @@ out_finish:
 		c->gc_no_progress++;
 	c->gc_active = false;
 	spin_unlock_irq(&c->lock);
+	/* WAL 공간 부족으로 보류된 foreground bio가 있으면 100ms 타이머를
+	 * 기다리지 않고 방금 회수한 공간을 즉시 사용하게 한다. */
+	if (reclaimed && READ_ONCE(c->wal_pending_count))
+		mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
 }
 
 /* zns_wal_reclaim_wq 워커 — 온전히 flush된 WAL zone 회수. 대상 3조건(전부 락 하):
@@ -3412,6 +3453,9 @@ static void zns_base_dtr(struct dm_target *ti)
 {
 	struct zns_base_c *c = ti->private;
 
+	spin_lock_irq(&c->lock);
+	c->stopping = true;
+	spin_unlock_irq(&c->lock);
 	flush_delayed_work(&c->wal_batch_work);
 
 	/* worker가 SSTable/checkpoint 비동기 체인을 시작하게 한 뒤, 마지막 callback의
