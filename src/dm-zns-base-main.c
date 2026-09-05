@@ -16,6 +16,7 @@
 #include <linux/completion.h>
 #include <linux/wait.h>
 #include <linux/atomic.h>
+#include <linux/crc32.h>
 
 #include "skiplist.h"
 
@@ -111,6 +112,14 @@ static unsigned int gc_reserved_zones = 2;
 module_param(gc_reserved_zones, uint, 0444);
 MODULE_PARM_DESC(gc_reserved_zones, "free zones reserved exclusively for GC relocation");
 
+static unsigned int wal_batch_max_records = 127;
+module_param(wal_batch_max_records, uint, 0444);
+MODULE_PARM_DESC(wal_batch_max_records, "maximum PUT records per 4KB WAL page");
+
+static unsigned int wal_batch_delay_ms = 2;
+module_param(wal_batch_delay_ms, uint, 0444);
+MODULE_PARM_DESC(wal_batch_delay_ms, "maximum foreground WAL group-commit delay in ms");
+
 // zone pool
 struct zone_pool {
 	sector_t zone_sectors;
@@ -161,6 +170,11 @@ struct zns_base_c {
 	struct work_struct compaction_work;  // compaction_wq에 큐잉되는 백그라운드 작업
 	struct work_struct gc_work;          // gc_wq에 큐잉되는 백그라운드 작업
 	struct work_struct wal_reclaim_work; // wal_reclaim_wq에 큐잉되는 백그라운드 작업
+	struct delayed_work wal_batch_work;
+	struct list_head wal_pending;
+	unsigned int wal_pending_count;
+	bool wal_batch_busy;
+	atomic_t foreground_writes;
 
 	/* WAL zone 회수 판정용 — 자세한 건 flush_chain_end/wal_reclaim_work_fn 참고.
 	 * split_gen이 durable_split_gen보다 작은(= 온전히 flush된) WAL zone만 회수.
@@ -221,6 +235,9 @@ struct sstable_info {
 #define WAL_REC_PUT        1
 #define WAL_REC_CHECKPOINT 2
 #define WAL_REC_GC_PUT     3
+#define WAL_PAGE_MAGIC     0x57414C50U /* "WALP" */
+#define WAL_PAGE_VERSION   1
+#define WAL_PAGE_SECTORS   (PAGE_SIZE / 512)
 
 /* 고정 크기(512/4096에 나머지 없이 나눠떨어짐). 체크포인트는 스왑 시점의
  * WAL 스트림 위치를 (split_gen, split_off) = (활성 WAL zone의 generation,
@@ -236,6 +253,16 @@ struct wal_record {
         struct { __le64 lba; __le64 phys; __le64 expected_old; } gc_put;
         struct { __le64 seq_no; __le64 split_gen; __le64 split_off; } checkpoint;
     };
+};
+
+#define WAL_PAGE_MAX_RECORDS ((PAGE_SIZE - 16) / sizeof(struct wal_record))
+struct wal_page {
+	__le32 magic;
+	__le16 version;
+	__le16 count;
+	__le32 crc32;
+	__le32 reserved;
+	struct wal_record records[WAL_PAGE_MAX_RECORDS];
 };
 
 /* zone_pool_alloc이 새로 배정한 zone 하나 — 헤더를 비동기로 써줘야 할 대상 */
@@ -257,6 +284,7 @@ struct zns_io_ctx {
 	int header_idx;
 	void *hdr_buf;              /* submit_header_async가 할당, header_write_done이 해제 */
 	void (*on_headers_done)(struct zns_io_ctx *ctx);
+	struct list_head wal_link;
 
 	/* WAL 레코드 쓰기 공용 — WRITE 경로에선 PUT, flush 경로 뒷단에선
 	 * CHECKPOINT를 쓸 때 재사용 */
@@ -810,14 +838,9 @@ static void wal_zone_for_each_record(struct zns_base_c *c, unsigned int zone_id,
 	page = virt_to_page(buf);
 
 	while (cur < wp) {
-		sector_t chunk = wp - cur;
-		sector_t max_chunk = PAGE_SIZE / 512;
+		sector_t chunk = min_t(sector_t, wp - cur, WAL_PAGE_SECTORS);
 		struct bio *bio;
-		sector_t i;
 		int ret;
-
-		if (chunk > max_chunk)
-			chunk = max_chunk;
 
 		bio = bio_alloc(GFP_KERNEL, 1);
 		bio_set_dev(bio, c->dev->bdev);
@@ -832,10 +855,30 @@ static void wal_zone_for_each_record(struct zns_base_c *c, unsigned int zone_id,
 			break;
 		}
 
-		for (i = 0; i < chunk; i++)
-			fn(fn_ctx, (struct wal_record *)(buf + i * 512), cur + i);
+		if (le32_to_cpu(((struct wal_page *)buf)->magic) == WAL_PAGE_MAGIC) {
+			struct wal_page *page_rec = buf;
+			u16 count = le16_to_cpu(page_rec->count);
+			u32 stored_crc = le32_to_cpu(page_rec->crc32);
+			u32 actual_crc;
+			unsigned int i;
 
-		cur += chunk;
+			page_rec->crc32 = 0;
+			actual_crc = crc32(~0U, buf, PAGE_SIZE);
+			if (chunk < WAL_PAGE_SECTORS || count > WAL_PAGE_MAX_RECORDS ||
+			    le16_to_cpu(page_rec->version) != WAL_PAGE_VERSION ||
+			    actual_crc != stored_crc) {
+				DMERR("WAL scan: invalid/torn page at zone %u sector %llu",
+				      zone_id, (unsigned long long)cur);
+				break;
+			}
+			for (i = 0; i < count; i++)
+				fn(fn_ctx, &page_rec->records[i], cur);
+			cur += WAL_PAGE_SECTORS;
+		} else {
+			/* v1 compatibility: one record in the first 512B sector. */
+			fn(fn_ctx, (struct wal_record *)buf, cur);
+			cur++;
+		}
 	}
 
 	kfree(buf);
@@ -1053,7 +1096,8 @@ static int recovery_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
 #define SSTABLE_IO_MAX_SECTORS ((sector_t)BIO_MAX_VECS * (PAGE_SIZE / 512))
 
 static void header_write_done(struct bio *bio);
-static void wal_put_done(struct bio *wal_bio);
+static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
+			   bool allow_flush);
 static void submit_wal_async(struct zns_io_ctx *ctx);
 static void submit_data_append_async(struct zns_io_ctx *ctx);
 static void data_append_done(struct bio *bio);
@@ -1066,6 +1110,7 @@ static void flush_chain_end(struct zns_base_c *c);
 static unsigned int gc_count_free_zones(struct zone_pool *zp);
 static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memtable,
 				   u64 seq_no, u64 split_gen, sector_t split_off);
+static void wal_batch_work_fn(struct work_struct *work);
 
 /* 새 zone의 헤더가 없으면 그 뒤의 데이터는 재시작 후 식별할 수 없다.
  * 해당 zone들을 현재 태그의 active slot에서 떼어 재사용하지 못하게 하고,
@@ -1088,12 +1133,14 @@ static void abort_after_header_failure(struct zns_io_ctx *ctx,
 	if (ctx->on_headers_done == submit_data_append_async) {
 		zone_dispatch_cancel(c, ctx->reserved_phys, ctx->reserved_nr);
 		ctx->orig_bio->bi_status = status;
+		atomic_dec(&c->foreground_writes);
 		bio_endio(ctx->orig_bio);
 		kfree(ctx);
 	} else if (ctx->on_headers_done == submit_wal_async) {
 		zone_dispatch_cancel(c, ctx->wal_phys, 1);
 		zone_dispatch_cancel(c, ctx->reserved_phys, ctx->reserved_nr);
 		ctx->orig_bio->bi_status = status;
+		atomic_dec(&c->foreground_writes);
 		bio_endio(ctx->orig_bio);
 		kfree(ctx);
 	} else if (ctx->on_headers_done == submit_sstable_write_async) {
@@ -1125,46 +1172,15 @@ static void flush_memtable_work_fn(struct work_struct *work)
 static void submit_wal_async(struct zns_io_ctx *ctx)
 {
 	struct zns_base_c *c = ctx->c;
-	struct wal_record *rec;
-	struct bio *wal_bio;
-	struct page *page;
+	bool full;
 
-	/* 섹터 하나(512B) 전체를 kzalloc — 레코드는 앞 32바이트뿐이지만 디바이스에 512B보다 작은 단위로는 쓸 수 없어 나머지는 패딩. */
-	rec = kzalloc(512, GFP_ATOMIC);
-	if (!rec)
-		goto fail;
-	rec->type = cpu_to_le32(WAL_REC_PUT);
-	rec->put.lba = cpu_to_le64(ctx->lba);
-	rec->put.phys = cpu_to_le64(ctx->phys);
-	ctx->wal_buf = rec;
-
-	wal_bio = bio_alloc(GFP_ATOMIC, 1);
-	if (!wal_bio) {
-		kfree(rec);
-		goto fail;
-	}
-	bio_set_dev(wal_bio, c->dev->bdev);
-	wal_bio->bi_iter.bi_sector =
-		(zone_of(c->zp, ctx->wal_phys) * c->zp->zone_sectors);
-	wal_bio->bi_opf = REQ_OP_ZONE_APPEND;
-	page = virt_to_page(rec);
-	bio_add_page(wal_bio, page, 512, offset_in_page(rec));
-	wal_bio->bi_end_io = wal_put_done;
-	wal_bio->bi_private = ctx;
-	if (zone_append_write(c, zone_of(c->zp, ctx->wal_phys), wal_bio)) {
-		wal_bio->bi_status = BLK_STS_RESOURCE;
-		bio_endio(wal_bio);
-	}
-	return;
-
-fail:
-	/* 예약 공간은 재사용하지 않고 hole로 남기되, 발행 완료 회계는 반드시
-	 * 전진시킨다. 그렇지 않으면 GC가 이 zone을 영원히 in-flight로 본다. */
-	zone_dispatch_cancel(c, ctx->wal_phys, 1);
-	zone_dispatch_cancel(c, ctx->reserved_phys, ctx->reserved_nr);
-	ctx->orig_bio->bi_status = BLK_STS_RESOURCE;
-	bio_endio(ctx->orig_bio);
-	kfree(ctx);
+	INIT_LIST_HEAD(&ctx->wal_link);
+	spin_lock_irq(&c->lock);
+	list_add_tail(&ctx->wal_link, &c->wal_pending);
+	full = ++c->wal_pending_count >= wal_batch_max_records;
+	spin_unlock_irq(&c->lock);
+	mod_delayed_work(zns_wq, &c->wal_batch_work,
+			 full ? 0 : msecs_to_jiffies(wal_batch_delay_ms));
 }
 
 /* ctx->headers[ctx->header_idx]의 zone 태그 헤더를 비동기로 제출.
@@ -1262,9 +1278,6 @@ static void data_append_done(struct bio *bio)
 {
 	struct zns_io_ctx *ctx = bio->bi_private;
 	struct zns_base_c *c = ctx->c;
-	sector_t wal_phys;
-	int new_wal_zone;
-	int ret;
 
 	if (bio->bi_status) {
 		zone_dispatch_cancel(c, ctx->reserved_phys, ctx->reserved_nr);
@@ -1273,6 +1286,7 @@ static void data_append_done(struct bio *bio)
 		bio->bi_iter.bi_sector = ctx->orig_sector;
 		bio->bi_opf = ctx->orig_opf;
 		kfree(ctx);
+		atomic_dec(&c->foreground_writes);
 		bio_endio(bio);
 		return;
 	}
@@ -1282,46 +1296,20 @@ static void data_append_done(struct bio *bio)
 	bio->bi_iter.bi_sector = ctx->orig_sector;
 	bio->bi_opf = ctx->orig_opf;
 
-	spin_lock_irq(&c->lock);
-	ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, 1, &wal_phys,
-			      &new_wal_zone, false);
-	spin_unlock_irq(&c->lock);
-	if (ret) {
-		zone_dispatch_cancel(c, ctx->reserved_phys, ctx->reserved_nr);
-		bio->bi_status = BLK_STS_NOSPC;
-		kfree(ctx);
-		bio_endio(bio);
-		return;
-	}
-	ctx->wal_phys = wal_phys;
-	ctx->nr_headers = 0;
-	if (new_wal_zone >= 0) {
-		ctx->headers[0].zone_id = new_wal_zone;
-		ctx->headers[0].tag = ZONE_TAG_WAL;
-		ctx->headers[0].gen = c->zp->wal_gen[new_wal_zone];
-		ctx->nr_headers = 1;
-	}
-	ctx->header_idx = 0;
-	ctx->on_headers_done = submit_wal_async;
-	if (ctx->nr_headers)
-		submit_header_async(ctx);
-	else
-		submit_wal_async(ctx);
+	submit_wal_async(ctx);
 }
 
 /* data Zone Append 완료 후 제출한 WAL의 완료 콜백. WAL이 durable해진
  * 시점에 매핑을 공개하고 원본 bio를 완료한다. */
-static void wal_put_done(struct bio *wal_bio)
+static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
+			   bool allow_flush)
 {
-	struct zns_io_ctx *ctx = wal_bio->bi_private;
 	struct zns_base_c *c = ctx->c;
 	struct bio *orig = ctx->orig_bio;
-	blk_status_t wal_status = wal_bio->bi_status;
 	u64 lba = ctx->lba;
 	sector_t phys = ctx->phys;
 	sector_t reserved_phys = ctx->reserved_phys;
 	sector_t reserved_nr = ctx->reserved_nr;
-	sector_t wal_phys = ctx->wal_phys;
 	struct skiplist *flushed_memtable = NULL;
 	struct memtable_flush_work *flush_work = NULL;
 	u64 flushed_seq = 0;
@@ -1329,21 +1317,19 @@ static void wal_put_done(struct bio *wal_bio)
 	sector_t flushed_split_off = 0;
 	int ret;
 
-	kfree(ctx->wal_buf);
-	bio_put(wal_bio);
-
 	if (wal_status) {
-		zone_dispatch_cancel(c, wal_phys, 1);
 		zone_dispatch_cancel(c, reserved_phys, reserved_nr);
 		kfree(ctx);
 		orig->bi_status = wal_status;
+		atomic_dec(&c->foreground_writes);
 		bio_endio(orig);
 		return;
 	}
 
 	spin_lock_irq(&c->lock);
 	ret = mapping_put(c, lba, phys);
-	if (!ret && !c->gc_active && c->memtable->count >= flush_threshold) {
+	if (!ret && allow_flush && !c->gc_active &&
+	    c->memtable->count >= flush_threshold) {
 		/* memtable 교체는 이 락 안에서 — skiplist_init도 GFP_ATOMIC이라 atomic 컨텍스트에서 불러도 안전하다. */
 		struct skiplist *new_memtable = kzalloc(sizeof(*new_memtable), GFP_ATOMIC);
 
@@ -1379,12 +1365,12 @@ static void wal_put_done(struct bio *wal_bio)
 	/* Zone Append는 일반 dispatch gate를 통과하지 않으므로 완료 시점에
 	 * 예약 순서 회계를 직접 전진시킨다. data는 mapping_put 뒤에 완료
 	 * 처리해야 dispatch_wp==wp가 곧 "모든 매핑 공개 완료"를 뜻한다. */
-	zone_dispatch_cancel(c, wal_phys, 1);
 	zone_dispatch_cancel(c, reserved_phys, reserved_nr);
 	kfree(ctx);
 
 	if (ret) {
 		orig->bi_status = BLK_STS_RESOURCE;
+		atomic_dec(&c->foreground_writes);
 		bio_endio(orig);
 		return;
 	}
@@ -1393,7 +1379,134 @@ static void wal_put_done(struct bio *wal_bio)
 	if (flush_work)
 		queue_work(zns_flush_wq, &flush_work->work);
 
+	atomic_dec(&c->foreground_writes);
 	bio_endio(orig);
+}
+
+static int wal_page_append_sync(struct zns_base_c *c, sector_t reserved_phys,
+				void *buf, sector_t nr_sectors)
+{
+	struct bio *bio = bio_alloc(GFP_KERNEL, 1);
+	int ret;
+
+	if (!bio)
+		return -ENOMEM;
+	bio_set_dev(bio, c->dev->bdev);
+	bio->bi_iter.bi_sector = (sector_t)zone_of(c->zp, reserved_phys) *
+				 c->zp->zone_sectors;
+	bio->bi_opf = REQ_OP_ZONE_APPEND | REQ_SYNC | REQ_FUA;
+	if (bio_add_page(bio, virt_to_page(buf), nr_sectors * 512, 0) !=
+	    nr_sectors * 512) {
+		bio_put(bio);
+		zone_dispatch_cancel(c, reserved_phys, nr_sectors);
+		return -EIO;
+	}
+	zone_dispatch_wait_turn(c, reserved_phys, nr_sectors);
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+	return ret;
+}
+
+static void wal_batch_work_fn(struct work_struct *work)
+{
+	struct zns_base_c *c = container_of(to_delayed_work(work),
+					     struct zns_base_c, wal_batch_work);
+	LIST_HEAD(batch);
+	struct zns_io_ctx *ctx, *tmp;
+	struct wal_page *page;
+	sector_t wal_phys = 0;
+	int new_zone = -1;
+	unsigned int count = 0;
+	sector_t wal_sectors;
+	int ret;
+	bool more;
+
+	page = (struct wal_page *)get_zeroed_page(GFP_KERNEL);
+	if (!page)
+		ret = -ENOMEM;
+	else
+		ret = 0;
+
+	spin_lock_irq(&c->lock);
+	c->wal_batch_busy = true;
+	while (!list_empty(&c->wal_pending) && count < wal_batch_max_records) {
+		ctx = list_first_entry(&c->wal_pending, struct zns_io_ctx, wal_link);
+		list_move_tail(&ctx->wal_link, &batch);
+		c->wal_pending_count--;
+		count++;
+	}
+	more = !list_empty(&c->wal_pending);
+	wal_sectors = count == 1 ? 1 : WAL_PAGE_SECTORS;
+	if (!ret && count)
+		ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, wal_sectors,
+				      &wal_phys, &new_zone, false);
+	spin_unlock_irq(&c->lock);
+
+	if (!count)
+		goto out;
+	if (ret)
+		goto complete;
+
+	count = 0;
+	list_for_each_entry(ctx, &batch, wal_link) {
+		struct wal_record *rec = wal_sectors == 1 ?
+			(struct wal_record *)page : &page->records[count];
+
+		rec->type = cpu_to_le32(WAL_REC_PUT);
+		rec->put.lba = cpu_to_le64(ctx->lba);
+		rec->put.phys = cpu_to_le64(ctx->phys);
+		count++;
+	}
+	if (wal_sectors > 1) {
+		page->magic = cpu_to_le32(WAL_PAGE_MAGIC);
+		page->version = cpu_to_le16(WAL_PAGE_VERSION);
+		page->count = cpu_to_le16(count);
+		page->crc32 = 0;
+		page->crc32 = cpu_to_le32(crc32(~0U, page, PAGE_SIZE));
+	}
+
+	if (new_zone >= 0) {
+		struct zone_header *hdr = kzalloc(512, GFP_KERNEL);
+
+		if (!hdr) {
+			zone_dispatch_cancel(c, (sector_t)new_zone * c->zp->zone_sectors, 1);
+			ret = -ENOMEM;
+		} else {
+			hdr->magic = cpu_to_le32(ZONE_HEADER_MAGIC);
+			hdr->tag = cpu_to_le32(ZONE_TAG_WAL);
+			hdr->gen = cpu_to_le64(c->zp->wal_gen[new_zone]);
+			zone_dispatch_wait_turn(c,
+				(sector_t)new_zone * c->zp->zone_sectors, 1);
+			ret = sstable_io_sync(c, REQ_OP_WRITE,
+				(sector_t)new_zone * c->zp->zone_sectors, hdr, 1);
+			kfree(hdr);
+		}
+		if (ret) {
+			zone_quarantine(c, new_zone, ZONE_TAG_WAL, BLK_STS_IOERR);
+			zone_dispatch_cancel(c, wal_phys, wal_sectors);
+		} else
+			zone_append_header_done(c, new_zone, 0);
+	}
+	if (!ret) {
+		ret = wal_page_append_sync(c, wal_phys, page, wal_sectors);
+	}
+
+complete:
+	list_for_each_entry_safe(ctx, tmp, &batch, wal_link) {
+		bool last = list_is_last(&ctx->wal_link, &batch);
+
+		list_del_init(&ctx->wal_link);
+		wal_commit_ctx(ctx, ret ? BLK_STS_IOERR : 0, last);
+	}
+out:
+	if (page)
+		free_page((unsigned long)page);
+	spin_lock_irq(&c->lock);
+	c->wal_batch_busy = false;
+	more = !list_empty(&c->wal_pending);
+	spin_unlock_irq(&c->lock);
+	if (more)
+		mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
 }
 
 /* flush 체인(memtable → SSTable → checkpoint)의 모든 종료 지점에서 정확히 한 번 호출 — 성공/실패 무관.
@@ -3123,7 +3236,11 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	c->zp->zone_sectors = bdev_zone_sectors(c->dev->bdev);
-	if (bdev_max_zone_append_sectors(c->dev->bdev) < BLOCK_SECTORS) {
+	if (!wal_batch_max_records || wal_batch_max_records > WAL_PAGE_MAX_RECORDS) {
+		ti->error = "wal_batch_max_records is outside the WAL page capacity";
+		return -EINVAL;
+	}
+	if (bdev_max_zone_append_sectors(c->dev->bdev) < WAL_PAGE_SECTORS) {
 		ti->error = "underlying device does not support 4KB zone append";
 		return -EOPNOTSUPP;
 	}
@@ -3230,6 +3347,10 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->error = "failed to init memtable";
 		return ret;
 	}
+	spin_lock_init(&c->lock);
+	INIT_LIST_HEAD(&c->wal_pending);
+	INIT_DELAYED_WORK(&c->wal_batch_work, wal_batch_work_fn);
+	atomic_set(&c->foreground_writes, 0);
 
 	/* zone 스캔으로 크래시/재로드 이전 상태 복원(zone_tag[]/wp[] + WAL
 	 * checkpoint 위치 파악 후 replay + 살아있는 SSTable들 색인 재구성).
@@ -3270,8 +3391,6 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	INIT_WORK(&c->wal_reclaim_work, wal_reclaim_work_fn);
 	init_waitqueue_head(&c->flush_waitq);
 
-	spin_lock_init(&c->lock);
-
 	ti->private = c;
 	ti->num_flush_bios = 1;
 	ti->num_discard_bios = 0;
@@ -3292,6 +3411,8 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 static void zns_base_dtr(struct dm_target *ti)
 {
 	struct zns_base_c *c = ti->private;
+
+	flush_delayed_work(&c->wal_batch_work);
 
 	/* worker가 SSTable/checkpoint 비동기 체인을 시작하게 한 뒤, 마지막 callback의
 	 * flush_chain_end까지 기다려 c와 frozen memtable의 수명을 보장한다. */
@@ -3349,6 +3470,16 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 	/* 순수 flush 요청(nr=0)은 특정 LBA와 무관하므로 매핑 로직을 타면 안 됨.
 	 * bi_sector에 남은 임의값을 lba로 오인해 엉뚱한 매핑을 덮어쓰게 된다. */
 	if (nr == 0) {
+		bool wal_busy;
+
+		spin_lock_irq(&c->lock);
+		wal_busy = c->wal_batch_busy || !list_empty(&c->wal_pending) ||
+			atomic_read(&c->foreground_writes) > 0;
+		spin_unlock_irq(&c->lock);
+		if (wal_busy) {
+			mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
+			return DM_MAPIO_REQUEUE;
+		}
 		bio_set_dev(bio, c->dev->bdev);
 		return DM_MAPIO_REMAPPED;
 	}
@@ -3401,6 +3532,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		ctx->lba = block_lba;
 		ctx->reserved_phys = phys;
 		ctx->reserved_nr = nr;
+		atomic_inc(&c->foreground_writes);
 
 		/* 새로 배정받은 zone이 있으면(태그별 최대 1개) 헤더부터 비동기로 써야 재부팅 후 recovery_zone_cb가 zone_tag[]/wp[]를 되찾을 수 있다. */
 		ctx->nr_headers = 0;
