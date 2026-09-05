@@ -2958,7 +2958,11 @@ static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag
 	ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out, false);
 	if (!ret)
 		c->gc_no_progress = 0;
-	else if (c->gc_no_progress >= 3)
+	/* 이전 무진전 횟수가 임계치를 넘었더라도 지금 GC가 victim을 이주
+	 * 중이면 결과가 날 때까지 requeue해야 한다. 여기서 ENOSPC를 내면
+	 * 느린 대형-zone GC가 잠시 뒤 성공해도 파일시스템은 먼저 I/O error를
+	 * 받아 손상된다. */
+	else if (c->gc_no_progress >= 3 && !c->gc_active)
 		ret = -ENOSPC;
 	spin_unlock_irq(&c->lock);
 
