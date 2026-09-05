@@ -191,6 +191,8 @@ struct zns_base_c {
 	struct list_head wal_pending;
 	unsigned int wal_pending_count;
 	bool wal_batch_busy;
+	struct delayed_work pending_flush_work;
+	struct list_head pending_flush_bios;
 	bool stopping;
 	atomic_t foreground_writes;
 
@@ -206,6 +208,11 @@ struct zns_base_c {
 	unsigned int gc_no_progress;        // 연속으로 공간을 못 만든 GC cycle 수
 
 	spinlock_t 		lock;
+};
+
+struct pending_flush_bio {
+	struct list_head link;
+	struct bio *bio;
 };
 
 struct memtable_flush_work {
@@ -1139,6 +1146,13 @@ static unsigned int gc_count_free_zones(struct zone_pool *zp);
 static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memtable,
 				   u64 seq_no, u64 split_gen, sector_t split_off);
 static void wal_batch_work_fn(struct work_struct *work);
+static void pending_flush_work_fn(struct work_struct *work);
+
+static void foreground_write_done(struct zns_base_c *c)
+{
+	if (atomic_dec_and_test(&c->foreground_writes))
+		mod_delayed_work(zns_wq, &c->pending_flush_work, 0);
+}
 
 /* 새 zone의 헤더가 없으면 그 뒤의 데이터는 재시작 후 식별할 수 없다.
  * 해당 zone들을 현재 태그의 active slot에서 떼어 재사용하지 못하게 하고,
@@ -1161,14 +1175,14 @@ static void abort_after_header_failure(struct zns_io_ctx *ctx,
 	if (ctx->on_headers_done == submit_data_append_async) {
 		zone_dispatch_cancel(c, ctx->reserved_phys, ctx->reserved_nr);
 		ctx->orig_bio->bi_status = status;
-		atomic_dec(&c->foreground_writes);
+		foreground_write_done(c);
 		bio_endio(ctx->orig_bio);
 		kfree(ctx);
 	} else if (ctx->on_headers_done == submit_wal_async) {
 		zone_dispatch_cancel(c, ctx->wal_phys, 1);
 		zone_dispatch_cancel(c, ctx->reserved_phys, ctx->reserved_nr);
 		ctx->orig_bio->bi_status = status;
-		atomic_dec(&c->foreground_writes);
+		foreground_write_done(c);
 		bio_endio(ctx->orig_bio);
 		kfree(ctx);
 	} else if (ctx->on_headers_done == submit_sstable_write_async) {
@@ -1321,7 +1335,7 @@ static void data_append_done(struct bio *bio)
 		bio->bi_iter.bi_sector = ctx->orig_sector;
 		bio->bi_opf = ctx->orig_opf;
 		kfree(ctx);
-		atomic_dec(&c->foreground_writes);
+		foreground_write_done(c);
 		bio_endio(bio);
 		return;
 	}
@@ -1356,7 +1370,7 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 		zone_dispatch_cancel(c, reserved_phys, reserved_nr);
 		kfree(ctx);
 		orig->bi_status = wal_status;
-		atomic_dec(&c->foreground_writes);
+		foreground_write_done(c);
 		bio_endio(orig);
 		return;
 	}
@@ -1405,7 +1419,7 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 
 	if (ret) {
 		orig->bi_status = BLK_STS_RESOURCE;
-		atomic_dec(&c->foreground_writes);
+		foreground_write_done(c);
 		bio_endio(orig);
 		return;
 	}
@@ -1414,7 +1428,7 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 	if (flush_work)
 		queue_work(zns_flush_wq, &flush_work->work);
 
-	atomic_dec(&c->foreground_writes);
+	foreground_write_done(c);
 	bio_endio(orig);
 }
 
@@ -1577,6 +1591,43 @@ out:
 	spin_unlock_irq(&c->lock);
 	if (more)
 		mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
+	else
+		mod_delayed_work(zns_wq, &c->pending_flush_work, 0);
+}
+
+/* flush bio를 DM core에 반복 반환하면 대형-zone GC 동안 재큐잉이 수만 번
+ * 누적되어 상위 파일시스템에 IOERR로 끝날 수 있다. 매핑 PUT의 WAL이 전부
+ * durable해진 뒤에만 하위 장치로 제출하되, 그동안 bio 소유권은 타깃이
+ * 유지한다. 이 worker는 기다리지 않고 재예약하므로 WAL worker와 같은
+ * 단일 zns_wq에서도 순환 대기가 생기지 않는다. */
+static void pending_flush_work_fn(struct work_struct *work)
+{
+	struct zns_base_c *c = container_of(to_delayed_work(work),
+					     struct zns_base_c, pending_flush_work);
+	LIST_HEAD(ready);
+	struct pending_flush_bio *pending, *tmp;
+	bool wal_busy;
+
+	spin_lock_irq(&c->lock);
+	wal_busy = c->wal_batch_busy || !list_empty(&c->wal_pending) ||
+		atomic_read(&c->foreground_writes) > 0;
+	if (!wal_busy)
+		list_splice_init(&c->pending_flush_bios, &ready);
+	spin_unlock_irq(&c->lock);
+
+	if (wal_busy) {
+		mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
+		mod_delayed_work(zns_wq, &c->pending_flush_work,
+				 msecs_to_jiffies(20));
+		return;
+	}
+
+	list_for_each_entry_safe(pending, tmp, &ready, link) {
+		list_del(&pending->link);
+		bio_set_dev(pending->bio, c->dev->bdev);
+		submit_bio_deferred(pending->bio);
+		kfree(pending);
+	}
 }
 
 /* flush 체인(memtable → SSTable → checkpoint)의 모든 종료 지점에서 정확히 한 번 호출 — 성공/실패 무관.
@@ -2727,15 +2778,25 @@ static int gc_relocate_batch(struct zns_base_c *c,
 		ret = -ENOMEM;
 		goto out;
 	}
-	for (i = 0; i < count; i++) {
+	for (i = 0; i < count;) {
+		unsigned int run = 1;
+
+		/* victim 엔트리는 phys 순으로 정렬되어 있다. 연속 블록을
+		 * 개별 4KiB sync read로 내지 않고 하나의 큰 read로 합쳐 FEMU
+		 * 왕복 비용과 GC 시간을 줄인다. */
+		while (i + run < count &&
+		       entries[i + run]->phys ==
+		       entries[i]->phys + (sector_t)run * BLOCK_SECTORS)
+			run++;
 		ret = sstable_io_sync(c, REQ_OP_READ, entries[i]->phys,
 				       (char *)data + (size_t)i * PAGE_SIZE,
-				       BLOCK_SECTORS);
+				       (sector_t)run * BLOCK_SECTORS);
 		if (ret) {
 			DMERR("gc: batch source read failed at phys=%llu (%d)",
 			      (unsigned long long)entries[i]->phys, ret);
 			goto out;
 		}
+		i += run;
 	}
 
 	spin_lock_irq(&c->lock);
@@ -2861,6 +2922,18 @@ enum gc_reclaim_result {
 	GC_RECLAIM_DONE,
 	GC_RECLAIM_TRY_NEXT,
 };
+
+static int gc_live_entry_phys_cmp(const void *a, const void *b)
+{
+	const struct gc_live_entry * const *ea = a;
+	const struct gc_live_entry * const *eb = b;
+
+	if ((*ea)->phys < (*eb)->phys)
+		return -1;
+	if ((*ea)->phys > (*eb)->phys)
+		return 1;
+	return 0;
+}
 
 static enum gc_reclaim_result gc_reclaim_one_victim(struct zns_base_c *c,
 						      struct gc_cycle *cycle)
@@ -3077,30 +3150,39 @@ refresh_current:
 	       (unsigned long long)(live_sectors / BLOCK_SECTORS),
 	       free_at_start);
 	relocation_started = jiffies;
-	reloc_batch = kcalloc(WAL_PAGE_MAX_RECORDS, sizeof(*reloc_batch), GFP_KERNEL);
+	reloc_batch = kvmalloc_array(live_sectors / BLOCK_SECTORS,
+				     sizeof(*reloc_batch), GFP_KERNEL);
 	if (!reloc_batch) {
 		ok = false;
 		goto out_free_snapshot;
 	}
 
-	/* latest phys가 아직 victim 안인 LBA만 live. 이주 중 사용자
-	 * overwrite는 batch 마지막의 mapping_put_if_match가 걸러낸다. */
+	/* 최신 phys가 victim 안인 엔트리를 모두 모아 물리 주소순으로 정렬한다.
+	 * 이후 batch read가 연속 구간을 병합할 수 있다. */
 	for (i = 0; i < live_map.capacity; i++) {
 		struct gc_live_entry *entry = &live_map.entries[i];
 
 		if (!entry->used || entry->phys < vstart || entry->phys >= vend)
 			continue;
 		reloc_batch[reloc_count++] = entry;
-		if (reloc_count < WAL_PAGE_MAX_RECORDS)
-			continue;
-		if (gc_relocate_batch(c, reloc_batch, reloc_count)) {
+	}
+	sort(reloc_batch, reloc_count, sizeof(*reloc_batch),
+	     gc_live_entry_phys_cmp, NULL);
+
+	/* 이주 중 사용자 overwrite는 각 batch 마지막의
+	 * mapping_put_if_match가 걸러낸다. */
+	for (i = 0; i < reloc_count; i += WAL_PAGE_MAX_RECORDS) {
+		unsigned int batch_count = min_t(unsigned int,
+			WAL_PAGE_MAX_RECORDS, reloc_count - i);
+
+		if (gc_relocate_batch(c, &reloc_batch[i], batch_count)) {
 			DMERR("gc: relocation failed, aborting this round without resetting victim zone %u", victim);
 			ok = false;
 			break;
 		}
-		nr_relocated += reloc_count;
-		reloc_count = 0;
-		if (nr_relocated / 32768 != (nr_relocated - WAL_PAGE_MAX_RECORDS) / 32768) {
+		nr_relocated += batch_count;
+		if (nr_relocated / 32768 !=
+		    (nr_relocated - batch_count) / 32768) {
 			u64 elapsed_ms = jiffies_to_msecs(jiffies - relocation_started);
 
 			DMINFO("gc: victim %u progress relocated=%u/%llu (%llums, %llu entries/s)",
@@ -3111,15 +3193,7 @@ refresh_current:
 				div64_u64((u64)nr_relocated * 1000, elapsed_ms) : 0));
 		}
 	}
-	if (ok && reloc_count) {
-		if (gc_relocate_batch(c, reloc_batch, reloc_count)) {
-			DMERR("gc: final relocation batch failed, preserving victim zone %u", victim);
-			ok = false;
-		} else {
-			nr_relocated += reloc_count;
-		}
-	}
-	kfree(reloc_batch);
+	kvfree(reloc_batch);
 	reloc_batch = NULL;
 	if (!ok)
 		goto out_free_snapshot;
@@ -3141,7 +3215,7 @@ refresh_current:
 	}
 
 out_free_snapshot:
-	kfree(reloc_batch);
+	kvfree(reloc_batch);
 	if (!cycle->built)
 		kvfree(live_map.entries);
 	if (!cycle->built && snapshot) {
@@ -3493,6 +3567,8 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	spin_lock_init(&c->lock);
 	INIT_LIST_HEAD(&c->wal_pending);
 	INIT_DELAYED_WORK(&c->wal_batch_work, wal_batch_work_fn);
+	INIT_LIST_HEAD(&c->pending_flush_bios);
+	INIT_DELAYED_WORK(&c->pending_flush_work, pending_flush_work_fn);
 	atomic_set(&c->foreground_writes, 0);
 
 	/* zone 스캔으로 크래시/재로드 이전 상태 복원(zone_tag[]/wp[] + WAL
@@ -3559,6 +3635,7 @@ static void zns_base_dtr(struct dm_target *ti)
 	c->stopping = true;
 	spin_unlock_irq(&c->lock);
 	flush_delayed_work(&c->wal_batch_work);
+	flush_delayed_work(&c->pending_flush_work);
 
 	/* worker가 SSTable/checkpoint 비동기 체인을 시작하게 한 뒤, 마지막 callback의
 	 * flush_chain_end까지 기다려 c와 frozen memtable의 수명을 보장한다. */
@@ -3617,14 +3694,27 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 	 * bi_sector에 남은 임의값을 lba로 오인해 엉뚱한 매핑을 덮어쓰게 된다. */
 	if (nr == 0) {
 		bool wal_busy;
+		struct pending_flush_bio *pending;
 
 		spin_lock_irq(&c->lock);
 		wal_busy = c->wal_batch_busy || !list_empty(&c->wal_pending) ||
 			atomic_read(&c->foreground_writes) > 0;
 		spin_unlock_irq(&c->lock);
 		if (wal_busy) {
+			pending = kmalloc(sizeof(*pending), GFP_NOWAIT);
+			if (!pending) {
+				mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
+				return DM_MAPIO_REQUEUE;
+			}
+			pending->bio = bio;
+			INIT_LIST_HEAD(&pending->link);
+			spin_lock_irq(&c->lock);
+			list_add_tail(&pending->link, &c->pending_flush_bios);
+			spin_unlock_irq(&c->lock);
 			mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
-			return DM_MAPIO_REQUEUE;
+			mod_delayed_work(zns_wq, &c->pending_flush_work,
+					 msecs_to_jiffies(20));
+			return DM_MAPIO_SUBMITTED;
 		}
 		bio_set_dev(bio, c->dev->bdev);
 		return DM_MAPIO_REMAPPED;
