@@ -85,6 +85,10 @@ else
 	echo "[FAIL] hash 불일치 — WAL replay가 매핑을 복원 못함" >&2
 	exit 3
 fi
+if dmesg | grep -q "WAL scan: invalid/torn page"; then
+	echo "[FAIL] WAL batch checksum/torn-page 검증 실패" >&2
+	exit 3
+fi
 
 echo
 echo "=== ALL CRASH-RECOVERY CHECKS PASSED ==="
