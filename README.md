@@ -23,6 +23,7 @@ flowchart TB
     subgraph DM["dm-zns-base"]
         MAP[".map()\nbio 접수"]
         IOWQ["foreground io_work\nread/write 처리"]
+        DATAWQ["data completion work\n순차 제출 완료 처리"]
         MT["MemTable\nRB-tree · RAM"]
         WAL["WAL\n4 KiB FUA append"]
         SST["persistent SSTable\nLBA 정렬 · metadata zone"]
@@ -33,10 +34,11 @@ flowchart TB
     DEV["ZNS device\nnull_blk 또는 ZNS SSD"]
 
     FS -->|bio| MAP --> IOWQ
-    IOWQ --> MT
+    DEV -->|completion| DATAWQ
+    DATAWQ -->|mapping record stage| WAL
+    WAL -->|durable publish| MT
     MT -->|frozen flush| SST
     SST -->|descriptor publish| MAN
-    IOWQ -->|durable mapping log| WAL
     IOWQ --> ZONE -->|sequential lower I/O| DEV
 ```
 
@@ -102,10 +104,10 @@ struct mapping_entry {
 
 ### MemTable
 
-- active MemTable은 현재 write를 받는 사전 할당 RB-tree입니다. 하나의 table은 최대
-  4,096개 고유 LBA를 담습니다.
+- active MemTable은 현재 write를 받는 사전 할당 RB-tree입니다. 운영 기본값으로 하나의
+  table은 최대 65,536개 고유 LBA를 담습니다.
 - 같은 LBA overwrite는 기존 node를 갱신하므로 새 node를 소비하지 않습니다.
-- MemTable pool은 4개입니다. active table이 가득 차면 spare table을 새 active로
+- MemTable pool은 8개입니다. active table이 가득 차면 spare table을 새 active로
   전환하고 이전 table을 frozen list에 넣습니다.
 - flush worker는 frozen RB-tree를 in-order로 읽어 LBA 정렬 SSTable로 기록합니다.
   SSTable과 새 Manifest가 durable하게 publish된 뒤에만 frozen table을 spare pool로
@@ -119,7 +121,7 @@ struct mapping_entry {
 - MemTable miss는 Manifest catalog의 SSTable을 `min_lba/max_lba`로 먼저 거르고,
   후보 SSTable에서 필요한 4 KiB page만 읽는 on-disk binary search를 수행합니다.
 - 여러 SSTable에서 같은 LBA가 발견되면 가장 큰 `seq`를 선택합니다.
-- 여러 SSTable은 현재 SSTable zone 안에 연속 append됩니다. SSTable 수가 4개에
+- 여러 SSTable은 현재 SSTable zone 안에 연속 append됩니다. 운영 기본값에서는 SSTable 수가 16개에
   도달하면 그 zone의 모든 live table을 병합하여 반대편 빈 zone에 기록합니다. 같은
   LBA는 최신 entry만 남기고, 새 Manifest publish 성공 뒤에만 이전 SSTable zone을
   reset합니다. 두 zone은 이 과정을 A/B ping-pong으로 반복합니다.
@@ -147,10 +149,9 @@ sequenceDiagram
     participant MAP as mapping / MemTable
 
     FS->>IO: write bio
-    IO->>IO: 4 KiB chunk 분할 / PBA 예약
-    IO->>DATA: lower data write
-    DATA-->>IO: 성공
-    IO->>IO: DATA wp commit + pending slot 예약
+    IO->>IO: 4 KiB mapping/PBA 예약
+    IO->>DATA: 최대 128 KiB lower data write
+    DATA-->>IO: 전용 completion worker로 성공 전달
     IO->>WAL: PUT record를 pending WAL page에 stage
     IO-->>FS: 일반 write bio_endio (writeback)
     WAL->>WAL: page-full 또는 FLUSH/FUA 시 4 KiB FUA append
@@ -159,8 +160,9 @@ sequenceDiagram
 
 현재 보장하는 순서는 다음과 같습니다.
 
-1. DATA zone에 새 4 KiB 블록을 기록합니다.
-2. 실제 data write 성공 후 DATA write pointer를 commit하고 새 slot을 `pending`으로 예약합니다.
+1. 하나의 ACTIVE DATA zone에서 PBA와 reverse-map `pending` slot을 순서대로 예약합니다.
+2. 연속되고 정렬된 요청은 하위 디바이스 한도 내에서 최대 128 KiB로 묶어 기록합니다.
+   zone을 넘는 요청은 경계에서 나누며, 다음 extent는 이전 extent가 완료된 뒤 제출합니다.
 3. 일반 write는 WAL PUT을 in-memory pending page에 stage한 뒤 완료합니다. 후속 read는
    pending WAL overlay에서 이 최신 PBA를 찾습니다.
 4. page-full, `FLUSH`, `FUA`에서 WAL page를 FUA로 기록한 뒤 `LBA -> new PBA` 매핑,
@@ -269,13 +271,16 @@ foreground write와 GC가 같은 LBA를 갱신할 수 있으므로 GC는 이전 
 | 보호 대상 | 동기화 방식 | 이유 |
 |---|---|---|
 | 매핑, zone state, slot, pending bio list | `c->lock` spinlock | 짧은 공유 상태 갱신 |
-| WAL/Manifest/SSTable metadata append | `metadata.lock` mutex | lower I/O를 기다리는 순차 append 직렬화 |
+| WAL staging/append | `wal.lock` mutex | WAL page와 pending commit 직렬화 |
+| Manifest/SSTable append와 compaction | `metadata.lock` mutex | catalog 변경과 metadata I/O 직렬화 |
 | WAL 순서와 mapping publish | `mapping_wal_lock` mutex | foreground write와 GC의 stale publish 방지 |
+| SSTable catalog reader 수명 | `seqcount` + `SRCU` | compaction 중 lookup 허용, old zone reset 전 reader drain |
 | victim reset과 lower read | `inflight_reads` + `read_waitq` | 읽는 중인 old PBA reset 방지 |
 
-I/O worker는 하나의 foreground queue로 ACTIVE zone의 write pointer 순서를 보장하고,
-GC worker는 GC destination을 별도로 관리합니다. metadata I/O는 mutex를 잡은 process
-context에서 수행하므로 spinlock 안에서 block I/O를 기다리지 않습니다.
+foreground worker가 ACTIVE zone의 PBA를 한 방향으로 예약하고, 별도 DATA completion
+worker가 한 번에 하나의 extent만 완료 순서대로 제출합니다. 따라서 같은 zone의 순차 쓰기
+규칙을 지키면서 foreground dispatcher와 completion 사이의 순환 대기를 피합니다. GC는
+별도 destination과 worker를 사용합니다.
 
 ---
 
@@ -287,6 +292,7 @@ context에서 수행하므로 spinlock 안에서 block I/O를 기다리지 않�
 - GC 실행/zone reset/moved block 수와 최근 오류
 - 현재 WAL zone, generation, 사용 block, staged record, WAL 오류
 - persistent SSTable 수, checkpoint sequence/generation, Manifest/SSTable active zone
+- DATA inflight/queue block 수, MemTable 예약 수, compaction 횟수와 소요 시간
 
 기본 실행:
 
@@ -313,6 +319,10 @@ sudo bash scripts/test-failure-injection.sh
 | `test-checkpoint-recovery.sh` | persistent SSTable, Manifest A/B rotation, checkpoint 복구 |
 | `test-failure-injection.sh` | data/WAL/SSTable/Manifest 실패 및 CRC 복구 경로 |
 
+`test-m1.sh`와 `test-failure-injection.sh`는 짧은 시간 안에 flush/compaction 경로를
+재현하기 위해 MemTable 용량을 4,096개로 낮춰 모듈을 적재합니다. 운영 기본값은
+65,536개이며 Kafka 실행 스크립트에는 별도 설정이 필요하지 않습니다.
+
 테스트 정리는 `dmsetup remove <target>`을 먼저 수행한 뒤 module 또는 `null_blk`를
 내려야 합니다. target이 mount되었거나 `dumpe2fs` 같은 프로세스가 열고 있으면
 `Device or resource busy`가 발생합니다.
@@ -335,8 +345,9 @@ sudo -E bash scripts/test-m3.sh
   timer 기반 추가 지연은 없지만, 일반 write는 writeback semantics를 사용합니다.
 - on-disk SSTable lookup은 binary search지만 block cache나 bloom filter가 없어 cold read의
   metadata I/O 비용이 남습니다.
-- SSTable compaction은 live table 수가 4개가 되면 현재 packed zone 전체를 병합하는
-  단순 정책입니다. level 기반 compaction과 workload-aware scheduling은 아직 없습니다.
+- SSTable compaction은 기본 16개 live table을 현재 packed zone 전체 단위로 병합합니다.
+  임계값은 read-only module parameter `sstable_compaction_threshold`로 조정할 수 있습니다.
+  level 기반 compaction과 workload-aware scheduling은 아직 없습니다.
 - partial write는 즉시 RMW합니다. dirty-block cache/write coalescing이 없습니다.
 - GC policy는 최소 `valid_blocks`를 고르는 단순 greedy입니다. copy budget, tail latency
   제어, workload-aware victim selection이 남아 있습니다.

@@ -65,7 +65,8 @@ cleanup() {
 trap cleanup EXIT
 
 load_target() {
-	insmod "$KO_PATH" || fail "insmod failed"
+	insmod "$KO_PATH" memtable_capacity_entries="$MEMTABLE_ENTRIES" ||
+		fail "insmod failed"
 	echo "0 $SECTORS zns-base $UNDERLYING" | dmsetup create "$DM_NAME" ||
 		fail "dmsetup create failed"
 }

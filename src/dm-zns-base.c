@@ -27,14 +27,19 @@
 #include <linux/build_bug.h>
 #include <linux/byteorder/generic.h>
 #include <linux/mutex.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
+#include <linux/seqlock.h>
+#include <linux/srcu.h>
 
 #define DM_MSG_PREFIX "zns-base"
 #define ZNS_BASE_BLOCK_SIZE 4096
 #define ZNS_BASE_SECTOR_SIZE 512
 #define SECTORS_PER_BLOCK 8
 #define ZNS_BASE_SECTORS_PER_MIB (1024 * 1024 / ZNS_BASE_SECTOR_SIZE)
-#define MEMTABLE_POOL_SIZE 4
+#define MEMTABLE_POOL_SIZE 8
 #define IO_POOL_SIZE 128
+#define ZNS_BASE_DATA_BATCH_BLOCKS 32 /* 128 KiB per lower DATA command */
 #define GC_RESERVE_ZONES 2
 #define GC_DEFAULT_LOW_WATERMARK 3
 #define GC_DEFAULT_TARGET_FREE_ZONES 4
@@ -56,7 +61,6 @@
 #define ZNS_BASE_MAX_MANIFEST_SSTABLES \
 	((ZNS_BASE_BLOCK_SIZE - sizeof(struct zns_base_manifest_header_disk)) / \
 	 sizeof(struct zns_base_sstable_descriptor_disk))
-#define ZNS_BASE_SSTABLE_COMPACTION_THRESHOLD 4
 
 /* Keep the production default at the device-reported capacity.  Large-zone
  * emulators can set this read-only parameter to exercise rollover and GC over
@@ -80,14 +84,19 @@ module_param(gc_target_free_zones, uint, 0444);
 MODULE_PARM_DESC(gc_target_free_zones,
 	"free data-zone count at which a background GC run stops");
 
-/* The default remains the original 4096 entries.  M3 raises this slightly so
- * its first generation is persistent while the deterministic overwrite
- * generation stays RAM-resident; GC then tests migration rather than spending
- * the timeout on thousands of synchronous SSTable probes. */
-static unsigned int memtable_capacity_entries = 4096;
+/* Production generations must amortize SSTable and Manifest traffic.  Eight
+ * 64K-entry tables also leave enough foreground headroom for compaction. */
+static unsigned int memtable_capacity_entries = 65536;
 module_param(memtable_capacity_entries, uint, 0444);
 MODULE_PARM_DESC(memtable_capacity_entries,
 	"mapping entries per MemTable generation");
+
+/* Compact less often in production so foreground writes amortize metadata
+ * traffic. Tests may lower this value to exercise compaction quickly. */
+static unsigned int sstable_compaction_threshold = 16;
+module_param(sstable_compaction_threshold, uint, 0444);
+MODULE_PARM_DESC(sstable_compaction_threshold,
+	"published SSTable count that triggers compaction");
 
 enum zns_base_failpoint {
 	ZNS_BASE_FAIL_NONE = 0,
@@ -147,6 +156,7 @@ struct mapping_state {
 	u64 next_seq;
 
 	size_t spare_count;
+	size_t reserved_slots;
 	struct work_struct flush_work;
 	bool flush_pending;
 	int flush_error;
@@ -211,19 +221,24 @@ struct zns_base_io {
   	bool completed;
 };
 
-/* One physical data-block write in flight.  The foreground dispatcher issues
- * these in allocated-PBA order; completion work runs in process context to
- * join the durable WAL batch. */
+struct zns_base_data_mapping {
+	struct zns_base_zone *zone;
+	size_t logical_block;
+	sector_t physical_sector;
+	unsigned int slot;
+	bool mapping_slot_reserved;
+};
+
+/* One completion-ordered physical DATA extent.  Full aligned upper writes are
+ * coalesced to 128 KiB; partial RMW remains a one-block extent. */
 struct zns_base_data_write {
 	struct work_struct complete_work;
 	struct list_head node;
 	struct zns_base_c *c;
 	struct zns_base_io *io;
 	struct bio *lower_bio;
-	struct zns_base_zone *new_zone;
-	size_t logical_block;
-	sector_t physical_sector;
-	unsigned int new_slot;
+	struct zns_base_data_mapping *mappings;
+	unsigned int mapping_count;
 	struct page *scratch_page; /* non-NULL for partial-block RMW */
 	blk_status_t status;
 };
@@ -350,8 +365,9 @@ struct zns_base_wal_pending_commit {
   	sector_t new_physical_sector;
   	u64 seq;
 
-  	struct zns_base_zone *new_zone;
-  	unsigned int new_slot;
+	struct zns_base_zone *new_zone;
+	unsigned int new_slot;
+	bool mapping_slot_reserved;
 
   	bool had_old_mapping;
   	struct zns_base_zone *old_zone;
@@ -367,6 +383,8 @@ struct zns_base_wal_pending_commit {
 };
 
 struct zns_base_wal_state {
+	/* WAL staging must not wait behind SSTable compaction. */
+	struct mutex lock;
   	struct zns_base_metadata_stream stream;
   	bool header_written;
 
@@ -392,7 +410,14 @@ struct zns_base_metadata_state {
 	struct zns_base_sstable_descriptor_disk
 		sstables[ZNS_BASE_MAX_MANIFEST_SSTABLES];
 	unsigned int sstable_count;
-   struct mutex lock;
+	bool compaction_running;
+	u64 compaction_count;
+	u64 compaction_last_ns;
+	u64 compaction_max_ns;
+	seqcount_t catalog_seq;
+	struct srcu_struct catalog_srcu;
+	bool catalog_srcu_initialized;
+	struct mutex lock;
 };
 
 struct zns_base_c {
@@ -406,6 +431,7 @@ struct zns_base_c {
 	struct list_head pending_bios;
 	
 	struct workqueue_struct *io_wq;
+	struct workqueue_struct *data_wq;
 	struct workqueue_struct *gc_wq;
 	struct workqueue_struct *wal_wq;
 	
@@ -454,12 +480,17 @@ static int mapping_update(struct zns_base_c *c, size_t logical_block, sector_t p
 static int mapping_lookup(struct zns_base_c *c, size_t logical_block, struct mapping_entry *entry);
 static int mapping_lookup_visible(struct zns_base_c *c, size_t logical_block,
 				  struct mapping_entry *entry);
-static int mapping_wait_for_write_slot(struct zns_base_c *c,
-				       size_t logical_block);
+static int mapping_reserve_write_slot(struct zns_base_c *c,
+				      size_t logical_block);
+static void mapping_release_write_slot(struct zns_base_c *c);
 static struct mapping_memtable_entry *
 mapping_memtable_find(struct mapping_memtable *memtable,
 			      size_t logical_block);
 static int zns_base_allocate_block(struct zns_base_c *c, sector_t *physical_sector);
+static int zns_base_write_full_blocks(struct zns_base_c *c,
+		struct zns_base_io *io, size_t first_logical_block,
+		unsigned int bio_offset_bytes, unsigned int requested_blocks,
+		unsigned int *submitted_blocks);
 static int zns_base_get_zone_slot(struct zns_base_c *c,sector_t physical_sector,
   				  struct zns_base_zone **zone_out, unsigned int *slot_out);
 static void zns_base_gc_work(struct work_struct *work);
@@ -484,7 +515,7 @@ static int zns_base_wal_rotate(struct zns_base_c *c);
 static int zns_base_checkpoint_locked(struct zns_base_c *c);
 static int zns_base_persist_memtable_locked(struct zns_base_c *c,
 		const struct mapping_entry *entries, size_t entry_count);
-static int zns_base_sstable_lookup_locked(struct zns_base_c *c,
+static int zns_base_sstable_lookup(struct zns_base_c *c,
 		size_t logical_block, struct mapping_entry *entry);
 static int zns_base_manifest_rotate_and_write_locked(struct zns_base_c *c,
 	const struct zns_base_sstable_descriptor_disk *descriptors,
@@ -1001,16 +1032,24 @@ static void zns_base_fail_queued_data_writes(struct zns_base_c *c,
 {
 	struct zns_base_data_write *write;
 	struct zns_base_data_write *next;
+	unsigned int i;
 
 	list_for_each_entry_safe(write, next, failed_writes, node) {
 		list_del_init(&write->node);
 		bio_put(write->lower_bio);
 		write->lower_bio = NULL;
-		zns_base_release_pending_slot(c, write->new_zone,
-			write->new_slot, write->logical_block);
+		for (i = 0; i < write->mapping_count; i++) {
+			struct zns_base_data_mapping *mapping = &write->mappings[i];
+
+			zns_base_release_pending_slot(c, mapping->zone,
+				mapping->slot, mapping->logical_block);
+			if (mapping->mapping_slot_reserved)
+				mapping_release_write_slot(c);
+		}
 		if (write->scratch_page)
 			__free_page(write->scratch_page);
 		zns_base_io_finish_data(c, write->io, error);
+		kfree(write->mappings);
 		kfree(write);
 	}
 }
@@ -1023,7 +1062,9 @@ static void zns_base_data_write_complete_work(struct work_struct *work)
 	struct zns_base_data_write *next;
 	LIST_HEAD(failed_writes);
 	bool wal_page_full = false;
+	bool wal_flush_needed = false;
 	bool first_data_error = false;
+	unsigned int i;
 	int ret = 0;
 
 	if (write->status) {
@@ -1044,28 +1085,62 @@ static void zns_base_data_write_complete_work(struct work_struct *work)
 			first_data_error = true;
 		}
 		spin_unlock(&c->lock);
+		wake_up_all(&c->spare_waitq);
 		if (first_data_error)
 			DMERR("DATA write pipeline stopped: zone=%u sector=%llu status=%d",
-			      (unsigned int)(write->new_zone -
+			      (unsigned int)(write->mappings[0].zone -
 					     c->zone_state.zones),
-			      (unsigned long long)write->physical_sector, ret);
-		zns_base_release_pending_slot(c, write->new_zone, write->new_slot,
-			write->logical_block);
+			      (unsigned long long)write->mappings[0].physical_sector,
+			      ret);
+		for (i = 0; i < write->mapping_count; i++) {
+			struct zns_base_data_mapping *mapping = &write->mappings[i];
+
+			zns_base_release_pending_slot(c, mapping->zone,
+				mapping->slot, mapping->logical_block);
+			if (mapping->mapping_slot_reserved) {
+				mapping_release_write_slot(c);
+				mapping->mapping_slot_reserved = false;
+			}
+		}
 	} else {
-		ret = zns_base_wal_stage_foreground(c, write->io,
-			write->logical_block, write->physical_sector,
-			write->new_zone, write->new_slot,
-			write->io->requires_durable_commit, &wal_page_full);
-		if (ret)
-			zns_base_release_pending_slot(c, write->new_zone,
-				write->new_slot, write->logical_block);
-		else if (wal_page_full || write->io->requires_durable_commit)
+		for (i = 0; i < write->mapping_count; i++) {
+			struct zns_base_data_mapping *mapping = &write->mappings[i];
+
+			ret = zns_base_wal_stage_foreground(c, write->io,
+				mapping->logical_block, mapping->physical_sector,
+				mapping->zone, mapping->slot,
+				write->io->requires_durable_commit, &wal_page_full);
+			/* The WAL staging call owns this reservation on entry. */
+			mapping->mapping_slot_reserved = false;
+			if (ret) {
+				zns_base_release_pending_slot(c, mapping->zone,
+					mapping->slot, mapping->logical_block);
+				i++;
+				break;
+			}
+			wal_flush_needed |= wal_page_full ||
+				write->io->requires_durable_commit;
+		}
+		if (wal_flush_needed)
 			zns_base_wal_schedule_flush(c, true);
+		/* A failed record leaves the remainder of this already-written extent
+		 * unreachable; release its reservations without publishing mappings. */
+		for (; i < write->mapping_count; i++) {
+			struct zns_base_data_mapping *mapping = &write->mappings[i];
+
+			zns_base_release_pending_slot(c, mapping->zone,
+				mapping->slot, mapping->logical_block);
+			if (mapping->mapping_slot_reserved) {
+				mapping_release_write_slot(c);
+				mapping->mapping_slot_reserved = false;
+			}
+		}
 	}
 
 	if (write->scratch_page)
 		__free_page(write->scratch_page);
 	zns_base_io_finish_data(c, write->io, ret);
+	kfree(write->mappings);
 	kfree(write);
 
 	next = zns_base_finish_data_dispatch(c, &failed_writes);
@@ -1083,7 +1158,27 @@ static void zns_base_data_write_endio(struct bio *bio)
 	write->status = bio->bi_status;
 	write->lower_bio = NULL;
 	bio_put(bio);
-	queue_work(write->c->io_wq, &write->complete_work);
+	queue_work(write->c->data_wq, &write->complete_work);
+}
+
+static void zns_base_queue_data_write(struct zns_base_c *c,
+				      struct zns_base_data_write *write,
+				      struct bio *lower)
+{
+	lower->bi_end_io = zns_base_data_write_endio;
+	lower->bi_private = write;
+	write->lower_bio = lower;
+	zns_base_io_add_pending_data(c, write->io);
+
+	spin_lock(&c->lock);
+	if (!c->data_write_inflight && list_empty(&c->data_write_queue)) {
+		c->data_write_inflight = true;
+		spin_unlock(&c->lock);
+		zns_base_submit_data_write(write);
+	} else {
+		list_add_tail(&write->node, &c->data_write_queue);
+		spin_unlock(&c->lock);
+	}
 }
 
 /* The caller already reserved both the data PBA and its pending reverse-map
@@ -1101,12 +1196,19 @@ static int zns_base_submit_data_write_async(struct zns_base_c *c,
 	write = kzalloc(sizeof(*write), GFP_KERNEL);
 	if (!write)
 		return -ENOMEM;
+	write->mappings = kcalloc(1, sizeof(*write->mappings), GFP_KERNEL);
+	if (!write->mappings) {
+		kfree(write);
+		return -ENOMEM;
+	}
 	write->c = c;
 	write->io = io;
-	write->new_zone = new_zone;
-	write->logical_block = chunk->logical_block;
-	write->physical_sector = physical_sector;
-	write->new_slot = new_slot;
+	write->mapping_count = 1;
+	write->mappings[0].zone = new_zone;
+	write->mappings[0].logical_block = chunk->logical_block;
+	write->mappings[0].physical_sector = physical_sector;
+	write->mappings[0].slot = new_slot;
+	write->mappings[0].mapping_slot_reserved = true;
 	write->scratch_page = scratch_page;
 	INIT_LIST_HEAD(&write->node);
 	INIT_WORK(&write->complete_work, zns_base_data_write_complete_work);
@@ -1129,27 +1231,18 @@ static int zns_base_submit_data_write_async(struct zns_base_c *c,
 			goto out_free_write;
 		bio_trim(lower, chunk->bio_offset_bytes / ZNS_BASE_SECTOR_SIZE,
 			 chunk->length_bytes / ZNS_BASE_SECTOR_SIZE);
+		/* Durability is established once, immediately before the WAL FUA.
+		 * Replaying upper flush flags on every split DATA clone is redundant. */
+		lower->bi_opf &= ~(REQ_PREFLUSH | REQ_FUA);
 		bio_set_dev(lower, c->dev->bdev);
 		lower->bi_iter.bi_sector = physical_sector;
 	}
 
-	lower->bi_end_io = zns_base_data_write_endio;
-	lower->bi_private = write;
-	write->lower_bio = lower;
-	zns_base_io_add_pending_data(c, io);
-
-	spin_lock(&c->lock);
-	if (!c->data_write_inflight && list_empty(&c->data_write_queue)) {
-		c->data_write_inflight = true;
-		spin_unlock(&c->lock);
-		zns_base_submit_data_write(write);
-	} else {
-		list_add_tail(&write->node, &c->data_write_queue);
-		spin_unlock(&c->lock);
-	}
+	zns_base_queue_data_write(c, write, lower);
 	return 0;
 
 out_free_write:
+	kfree(write->mappings);
 	kfree(write);
 	return -ENOMEM;
 }
@@ -1228,12 +1321,14 @@ static int zns_base_write_chunk(struct zns_base_c *c,
 	unsigned int old_slot;
   	unsigned int new_slot;
 	bool old_zone_pinned;
+	bool mapping_slot_reserved;
 	int ret;
 
   	full_block = chunk->block_offset_bytes == 0 &&
   		     chunk->length_bytes == ZNS_BASE_BLOCK_SIZE;
 	scratch_page = NULL;
 	old_zone_pinned = false;
+	mapping_slot_reserved = false;
 
   	if (!full_block) {
   		scratch_page = alloc_page(GFP_KERNEL);
@@ -1289,9 +1384,10 @@ static int zns_base_write_chunk(struct zns_base_c *c,
   		kunmap_local(scratch_addr);
   	}
 
-	  	ret = mapping_wait_for_write_slot(c, chunk->logical_block);
+	ret = mapping_reserve_write_slot(c, chunk->logical_block);
   	if (ret)
   		goto out_free_page;
+	mapping_slot_reserved = true;
 
 	for (;;) {
 		spin_lock(&c->lock);
@@ -1332,14 +1428,18 @@ static int zns_base_write_chunk(struct zns_base_c *c,
 		if (!c->data_write_error)
 			c->data_write_error = ret;
 		spin_unlock(&c->lock);
+		wake_up_all(&c->spare_waitq);
 		zns_base_release_pending_slot(c, new_zone, new_slot,
 					      chunk->logical_block);
 		goto out_free_page;
 	}
 	/* Ownership moved to zns_base_data_write for partial RMW. */
 	scratch_page = NULL;
+	mapping_slot_reserved = false;
 	
   out_free_page:
+	if (mapping_slot_reserved)
+		mapping_release_write_slot(c);
   	if (scratch_page)
   		__free_page(scratch_page);
 
@@ -1354,6 +1454,7 @@ static void zns_base_process_write_bio(struct zns_base_c *c,
   	sector_t current_sector;
   	unsigned int remaining_bytes;
   	unsigned int bio_offset_bytes;
+	unsigned int max_batch_blocks;
   	int ret;
 
   	if (bio->bi_iter.bi_size % ZNS_BASE_SECTOR_SIZE) {
@@ -1361,9 +1462,37 @@ static void zns_base_process_write_bio(struct zns_base_c *c,
   		return;
   	}
 
-  	current_sector = bio->bi_iter.bi_sector;
+	current_sector = bio->bi_iter.bi_sector;
   	remaining_bytes = bio->bi_iter.bi_size;
-  	bio_offset_bytes = 0;
+	bio_offset_bytes = 0;
+	max_batch_blocks = min_t(unsigned int, ZNS_BASE_DATA_BATCH_BLOCKS,
+		queue_max_sectors(bdev_get_queue(c->dev->bdev)) /
+		SECTORS_PER_BLOCK);
+	if (!max_batch_blocks)
+		max_batch_blocks = 1;
+
+	if (current_sector % SECTORS_PER_BLOCK == 0 &&
+	    remaining_bytes % ZNS_BASE_BLOCK_SIZE == 0) {
+		while (remaining_bytes) {
+			unsigned int requested = min_t(unsigned int,
+				remaining_bytes / ZNS_BASE_BLOCK_SIZE,
+				max_batch_blocks);
+			unsigned int submitted = 0;
+
+			ret = zns_base_write_full_blocks(c, io,
+				current_sector / SECTORS_PER_BLOCK,
+				bio_offset_bytes, requested, &submitted);
+			if (ret || !submitted) {
+				zns_base_io_finish_staging(c, io, ret ?: -EIO);
+				return;
+			}
+			current_sector += (sector_t)submitted * SECTORS_PER_BLOCK;
+			bio_offset_bytes += submitted * ZNS_BASE_BLOCK_SIZE;
+			remaining_bytes -= submitted * ZNS_BASE_BLOCK_SIZE;
+		}
+		zns_base_io_finish_staging(c, io, 0);
+		return;
+	}
 
   	while (remaining_bytes > 0) {
   		zns_base_next_chunk(current_sector, remaining_bytes,
@@ -1391,24 +1520,36 @@ static void zns_base_process_write_bio(struct zns_base_c *c,
 
 static bool mapping_write_ready(struct zns_base_c *c, size_t logical_block){
 	bool ready;
+	size_t available;
+
+	(void)logical_block;
 
 	spin_lock(&c -> lock);
 
+	available = c->mapping.active_memtable->entry_capacity -
+		c->mapping.active_memtable->entry_count +
+		c->mapping.spare_count *
+		c->mapping.active_memtable->entry_capacity;
 	ready = c -> stopping ||
 			c -> mapping.flush_error ||
-			c -> mapping.active_memtable -> entry_count < c -> mapping.active_memtable -> entry_capacity ||
-			mapping_memtable_find(c->mapping.active_memtable,
-					       logical_block) ||
-			!list_empty(&c -> mapping.spare_memtables);
+			c->data_write_error ||
+			available > c->mapping.reserved_slots;
 		
 	spin_unlock(&c -> lock);
 
 	return ready;
 }
 
-static int mapping_wait_for_write_slot(struct zns_base_c *c,
-				       size_t logical_block){
+/* Reserve MemTable capacity before issuing a physical DATA write.  Every
+ * successful caller must release exactly once after mapping_update() or on an
+ * error path.  This turns WAL publication into a non-blocking operation. */
+static int mapping_reserve_write_slot(struct zns_base_c *c,
+				      size_t logical_block){
+	(void)logical_block;
+
 	for(;;){
+		size_t available;
+
 		spin_lock(&c -> lock);
 
 		if(c -> stopping){
@@ -1420,11 +1561,19 @@ static int mapping_wait_for_write_slot(struct zns_base_c *c,
 			spin_unlock(&c -> lock);
 			return c -> mapping.flush_error;
 		}
+		if (c->data_write_error) {
+			int error = c->data_write_error;
 
-		if(c -> mapping.active_memtable -> entry_count < c -> mapping.active_memtable -> entry_capacity ||
-			mapping_memtable_find(c->mapping.active_memtable,
-					       logical_block) ||
-			!list_empty(&c -> mapping.spare_memtables)){
+			spin_unlock(&c->lock);
+			return error;
+		}
+
+		available = c->mapping.active_memtable->entry_capacity -
+			c->mapping.active_memtable->entry_count +
+			c->mapping.spare_count *
+			c->mapping.active_memtable->entry_capacity;
+		if (available > c->mapping.reserved_slots) {
+			c->mapping.reserved_slots++;
 				spin_unlock(&c -> lock);
 				return 0;
 		}
@@ -1434,6 +1583,18 @@ static int mapping_wait_for_write_slot(struct zns_base_c *c,
 		wait_event(c -> spare_waitq,
 			   mapping_write_ready(c, logical_block));
 	}
+}
+
+static void mapping_release_write_slot(struct zns_base_c *c)
+{
+	spin_lock(&c->lock);
+	if (WARN_ON_ONCE(!c->mapping.reserved_slots)) {
+		spin_unlock(&c->lock);
+		return;
+	}
+	c->mapping.reserved_slots--;
+	spin_unlock(&c->lock);
+	wake_up_all(&c->spare_waitq);
 }
 
 static bool zns_base_process_bio(struct zns_base_c *c, struct zns_base_io *io){
@@ -1747,11 +1908,9 @@ static void mapping_flush_work(struct work_struct *work) {
 		/* The frozen rbtree is immutable, unique, and LBA-sorted. */
 		mapping_memtable_copy_sorted(memtable, entries);
 
-		mutex_lock(&c->mapping_wal_lock);
 		mutex_lock(&c->metadata.lock);
 		ret = zns_base_persist_memtable_locked(c, entries, entry_count);
 		mutex_unlock(&c->metadata.lock);
-		mutex_unlock(&c->mapping_wal_lock);
 		kvfree(entries);
 		if (ret) {
 			DMERR("persistent MemTable flush failed: entries=%zu ret=%d sstables=%u",
@@ -1796,6 +1955,7 @@ static int mapping_init(struct zns_base_c *c, sector_t target_sectors)
 	INIT_LIST_HEAD(&c -> mapping.frozen_memtables);
 
 	c -> mapping.spare_count = 0;
+	c->mapping.reserved_slots = 0;
 
 	for(i = 0; i < MEMTABLE_POOL_SIZE; i++){
 		memtable = kzalloc(sizeof(*memtable), GFP_KERNEL);
@@ -1842,6 +2002,7 @@ out_free_pool:
 	}
 
 	c->mapping.spare_count = 0;
+	c->mapping.reserved_slots = 0;
 
 	return ret;
 }
@@ -1868,6 +2029,7 @@ static void mapping_destroy(struct zns_base_c *c)
 
 	c -> nr_logical_blocks = 0;
 	c->mapping.spare_count = 0;
+	c->mapping.reserved_slots = 0;
 	c -> mapping.next_seq = 0;
 	c -> mapping.flush_pending = false;
 	c -> mapping.flush_error = 0;
@@ -1951,25 +2113,8 @@ static int mapping_lookup(struct zns_base_c *c, size_t logical_block,
 	if (ret != -ENOENT)
 		return ret;
 
-	mutex_lock(&c->metadata.lock);
-	ret = zns_base_sstable_lookup_locked(c, logical_block, entry);
-	mutex_unlock(&c->metadata.lock);
+	ret = zns_base_sstable_lookup(c, logical_block, entry);
 	return ret;
-}
-
-/* Caller already holds metadata.lock, so taking it again would deadlock. */
-static int mapping_lookup_metadata_locked(struct zns_base_c *c,
-					  size_t logical_block,
-					  struct mapping_entry *entry)
-{
-	int ret;
-
-	spin_lock(&c->lock);
-	ret = mapping_lookup_ram_locked(c, logical_block, entry);
-	spin_unlock(&c->lock);
-	if (ret != -ENOENT)
-		return ret;
-	return zns_base_sstable_lookup_locked(c, logical_block, entry);
 }
 
 /* Includes writes that reached the data zone but are waiting for WAL FUA. */
@@ -1978,7 +2123,7 @@ static int mapping_lookup_visible(struct zns_base_c *c, size_t logical_block,
 {
 	struct zns_base_wal_pending_commit *commit;
 
-	mutex_lock(&c->metadata.lock);
+	mutex_lock(&c->metadata.wal.lock);
 	list_for_each_entry_reverse(commit, &c->metadata.wal.pending_commits,
 				    node) {
 		if (commit->logical_block != logical_block)
@@ -1987,10 +2132,10 @@ static int mapping_lookup_visible(struct zns_base_c *c, size_t logical_block,
 		entry->logical_block = logical_block;
 		entry->physical_sector = commit->new_physical_sector;
 		entry->seq = commit->seq;
-		mutex_unlock(&c->metadata.lock);
+		mutex_unlock(&c->metadata.wal.lock);
 		return 0;
 	}
-	mutex_unlock(&c->metadata.lock);
+	mutex_unlock(&c->metadata.wal.lock);
 
 	return mapping_lookup(c, logical_block, entry);
 }
@@ -2579,6 +2724,7 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
 	u64 victim_seq;
 	unsigned int new_slot;
 	bool wal_page_full;
+	bool mapping_slot_reserved = false;
 	int ret;
 
   	/*
@@ -2629,16 +2775,25 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
   		return ret;
   	}
 
-  	spin_unlock(&c->lock);
+	spin_unlock(&c->lock);
+
+	ret = mapping_reserve_write_slot(c, logical_block);
+	if (ret)
+		return ret;
+	mapping_slot_reserved = true;
 
 	ret = zns_base_allocate_gc_block(c, &new_physical_sector,
 					 &new_zone, &new_slot);
-  	if (ret)
+	if (ret) {
+		mapping_release_write_slot(c);
   		return ret;
+	}
 
   	page = alloc_page(GFP_KERNEL);
-  	if (!page)
+	if (!page) {
+		mapping_release_write_slot(c);
   		return -ENOMEM;
+	}
 
   	ret = zns_base_submit_page(c, page, REQ_OP_READ, 0,
   				   old_physical_sector);
@@ -2665,6 +2820,8 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
 	ret = zns_base_wal_stage_gc(c, logical_block, new_physical_sector,
 					    new_zone, new_slot, victim, victim_slot,
 					    &expected_entry, &wal_page_full);
+	/* zns_base_wal_stage_gc() owns the reservation on entry. */
+	mapping_slot_reserved = false;
 	if (ret) {
 		zns_base_release_pending_slot(c, new_zone, new_slot,
 					      logical_block);
@@ -2678,6 +2835,8 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
 	ret = 0;
 	
   out_free_page:
+	if (mapping_slot_reserved)
+		mapping_release_write_slot(c);
   	__free_page(page);
   	return ret;
 }
@@ -2807,6 +2966,156 @@ static int zns_base_allocate_block(struct zns_base_c *c,
 	return 0;
 }
 
+static int zns_base_write_full_blocks(struct zns_base_c *c,
+		struct zns_base_io *io, size_t first_logical_block,
+		unsigned int bio_offset_bytes, unsigned int requested_blocks,
+		unsigned int *submitted_blocks)
+{
+	struct zns_base_data_write *write;
+	struct zns_base_zone *zone;
+	struct bio *lower;
+	sector_t zone_end;
+	sector_t first_physical = 0;
+	unsigned int count;
+	unsigned int reserved = 0;
+	unsigned int allocated = 0;
+	unsigned int i;
+	int ret = 0;
+
+	*submitted_blocks = 0;
+	if (!requested_blocks)
+		return -EINVAL;
+	if (first_logical_block >= c->nr_logical_blocks ||
+	    requested_blocks > c->nr_logical_blocks - first_logical_block)
+		return -EIO;
+
+	/* The foreground worker is the sole DATA allocator.  Select one extent
+	 * that cannot cross the current physical zone. */
+retry_zone:
+	spin_lock(&c->lock);
+	zone = &c->zone_state.zones[c->zone_state.active_zone_idx];
+	zone_end = zone->start_sector + zone->capacity_sectors;
+	if (zone->state != ZNS_BASE_ZONE_ACTIVE ||
+	    zone->write_pointer + SECTORS_PER_BLOCK > zone_end) {
+		zone->state = ZNS_BASE_ZONE_FULL;
+		ret = zns_base_activate_next_zone(c);
+		if (!ret) {
+			zone = &c->zone_state.zones[c->zone_state.active_zone_idx];
+			zone_end = zone->start_sector + zone->capacity_sectors;
+		}
+	}
+	if (!ret && c->data_write_error)
+		ret = c->data_write_error;
+	if (!ret)
+		count = min_t(unsigned int, requested_blocks,
+			(zone_end - zone->write_pointer) / SECTORS_PER_BLOCK);
+	else
+		count = 0;
+	spin_unlock(&c->lock);
+	if (ret == -EAGAIN) {
+		ret = zns_base_wait_for_gc_space(c);
+		if (!ret)
+			goto retry_zone;
+	}
+	if (ret)
+		return ret;
+	if (!count)
+		return -ENOSPC;
+
+	write = kzalloc(sizeof(*write), GFP_KERNEL);
+	if (!write)
+		return -ENOMEM;
+	write->mappings = kcalloc(count, sizeof(*write->mappings), GFP_KERNEL);
+	if (!write->mappings) {
+		kfree(write);
+		return -ENOMEM;
+	}
+	lower = bio_clone_fast(io->bio, GFP_KERNEL, &fs_bio_set);
+	if (!lower) {
+		kfree(write->mappings);
+		kfree(write);
+		return -ENOMEM;
+	}
+	bio_trim(lower, bio_offset_bytes / ZNS_BASE_SECTOR_SIZE,
+		 count * SECTORS_PER_BLOCK);
+	/* The WAL worker flushes all completed DATA before publishing mappings. */
+	lower->bi_opf &= ~(REQ_PREFLUSH | REQ_FUA);
+	bio_set_dev(lower, c->dev->bdev);
+
+	write->c = c;
+	write->io = io;
+	write->mapping_count = count;
+	write->scratch_page = NULL;
+	INIT_LIST_HEAD(&write->node);
+	INIT_WORK(&write->complete_work, zns_base_data_write_complete_work);
+
+	for (i = 0; i < count; i++) {
+		ret = mapping_reserve_write_slot(c, first_logical_block + i);
+		if (ret)
+			goto out_release;
+		write->mappings[i].logical_block = first_logical_block + i;
+		write->mappings[i].mapping_slot_reserved = true;
+		reserved++;
+	}
+
+	for (i = 0; i < count; i++) {
+		struct zns_base_data_mapping *mapping = &write->mappings[i];
+		sector_t physical;
+
+		spin_lock(&c->lock);
+		ret = zns_base_allocate_block(c, &physical);
+		if (!ret)
+			ret = zns_base_get_zone_slot(c, physical,
+				&mapping->zone, &mapping->slot);
+		if (!ret && (mapping->zone != zone ||
+			(mapping->zone->slots[mapping->slot].valid ||
+			 mapping->zone->slots[mapping->slot].pending)))
+			ret = -EIO;
+		if (!ret)
+			ret = zns_base_reserve_pending_slot_locked(mapping->zone,
+				mapping->slot, mapping->logical_block);
+		spin_unlock(&c->lock);
+		if (ret)
+			goto out_pipeline_error;
+
+		mapping->physical_sector = physical;
+		allocated++;
+		if (!i)
+			first_physical = physical;
+		else if (physical != first_physical +
+				 (sector_t)i * SECTORS_PER_BLOCK) {
+			ret = -EIO;
+			goto out_pipeline_error;
+		}
+	}
+
+	lower->bi_iter.bi_sector = first_physical;
+	zns_base_queue_data_write(c, write, lower);
+	*submitted_blocks = count;
+	return 0;
+
+out_pipeline_error:
+	/* At least one physical write pointer may already be reserved.  Continuing
+	 * would create an illegal hole, so latch a permanent pipeline error. */
+	spin_lock(&c->lock);
+	if (!c->data_write_error)
+		c->data_write_error = ret ?: -EIO;
+	spin_unlock(&c->lock);
+	wake_up_all(&c->spare_waitq);
+out_release:
+	for (i = 0; i < allocated; i++)
+		zns_base_release_pending_slot(c, write->mappings[i].zone,
+			write->mappings[i].slot,
+			write->mappings[i].logical_block);
+	for (i = 0; i < reserved; i++)
+		if (write->mappings[i].mapping_slot_reserved)
+			mapping_release_write_slot(c);
+	bio_put(lower);
+	kfree(write->mappings);
+	kfree(write);
+	return ret;
+}
+
 static void zns_base_metadata_stream_init(
   	struct zns_base_metadata_stream *stream,
   	enum zns_base_zone_role role,
@@ -2822,7 +3131,15 @@ static void zns_base_metadata_stream_init(
 
 static int zns_base_metadata_init(struct zns_base_c *c)
 {
+	int ret;
+
   	mutex_init(&c->metadata.lock);
+	mutex_init(&c->metadata.wal.lock);
+	seqcount_init(&c->metadata.catalog_seq);
+	ret = init_srcu_struct(&c->metadata.catalog_srcu);
+	if (ret)
+		return ret;
+	c->metadata.catalog_srcu_initialized = true;
 
   	zns_base_metadata_stream_init(&c->metadata.manifest,
   		ZNS_BASE_ZONE_MANIFEST, 0,
@@ -2876,6 +3193,10 @@ static void zns_base_metadata_destroy(struct zns_base_c *c)
   	c->metadata.wal.first_seq = 0;
 	c->metadata.wal.flush_scheduled = false;
   	c->metadata.wal.flush_error = 0;
+	if (c->metadata.catalog_srcu_initialized) {
+		cleanup_srcu_struct(&c->metadata.catalog_srcu);
+		c->metadata.catalog_srcu_initialized = false;
+	}
 }
 
 static struct zns_base_wal_record_disk 
@@ -2907,7 +3228,7 @@ static struct zns_base_wal_record_disk
 {
   	struct zns_base_wal_state *wal = &c->metadata.wal;
 
-  	/* 호출자는 c->metadata.lock을 잡은 상태여야 한다. */
+	/* Caller holds wal.lock. */
   	if (wal->flush_error)
   		return wal->flush_error;
 
@@ -2952,9 +3273,11 @@ static int zns_base_wal_stage_foreground(
   	if (page_full)
   		*page_full = false;
 
-  	commit = kzalloc(sizeof(*commit), GFP_KERNEL);
-  	if (!commit)
+	commit = kzalloc(sizeof(*commit), GFP_KERNEL);
+	if (!commit) {
+		mapping_release_write_slot(c);
   		return -ENOMEM;
+	}
 
   	INIT_LIST_HEAD(&commit->node);
 
@@ -2969,7 +3292,8 @@ static int zns_base_wal_stage_foreground(
   	commit->seq = 0;
 
   	commit->new_zone = new_zone;
-  	commit->new_slot = new_slot;
+	commit->new_slot = new_slot;
+	commit->mapping_slot_reserved = true;
 
   	commit->had_old_mapping = false;
 	commit->old_zone = NULL;
@@ -2984,13 +3308,11 @@ static int zns_base_wal_stage_foreground(
 		zns_base_io_add_pending_commit(c, io);
 
 	for (;;) {
-		mutex_lock(&c->mapping_wal_lock);
-		mutex_lock(&c->metadata.lock);
+		mutex_lock(&c->metadata.wal.lock);
 
 		ret = zns_base_wal_stage_commit_locked(c, commit, &full);
 
-		mutex_unlock(&c->metadata.lock);
-		mutex_unlock(&c->mapping_wal_lock);
+		mutex_unlock(&c->metadata.wal.lock);
 
 		if (ret != -EAGAIN)
 			break;
@@ -3003,7 +3325,9 @@ static int zns_base_wal_stage_foreground(
   	if (ret) {
 		if (durable)
 			zns_base_io_finish_commit(c, io, ret);
-  		kfree(commit);
+		mapping_release_write_slot(c);
+		commit->mapping_slot_reserved = false;
+		kfree(commit);
   		return ret;
   	}
 
@@ -3036,8 +3360,10 @@ static int zns_base_wal_stage_gc(
 		*page_full = false;
 
 	commit = kzalloc(sizeof(*commit), GFP_KERNEL);
-	if (!commit)
+	if (!commit) {
+		mapping_release_write_slot(c);
 		return -ENOMEM;
+	}
 
 	INIT_LIST_HEAD(&commit->node);
 	commit->type = ZNS_BASE_WAL_COMMIT_GC;
@@ -3045,6 +3371,7 @@ static int zns_base_wal_stage_gc(
 	commit->new_physical_sector = new_physical_sector;
 	commit->new_zone = new_zone;
 	commit->new_slot = new_slot;
+	commit->mapping_slot_reserved = true;
 	commit->old_zone = old_zone;
 	commit->old_slot = old_slot;
 	commit->expected_physical_sector = expected_entry->physical_sector;
@@ -3052,13 +3379,11 @@ static int zns_base_wal_stage_gc(
 	commit->io = NULL;
 
 	for (;;) {
-		mutex_lock(&c->mapping_wal_lock);
-		mutex_lock(&c->metadata.lock);
+		mutex_lock(&c->metadata.wal.lock);
 
 		ret = zns_base_wal_stage_commit_locked(c, commit, &full);
 
-		mutex_unlock(&c->metadata.lock);
-		mutex_unlock(&c->mapping_wal_lock);
+		mutex_unlock(&c->metadata.wal.lock);
 
 		if (ret != -EAGAIN)
 			break;
@@ -3069,6 +3394,8 @@ static int zns_base_wal_stage_gc(
 	}
 
 	if (ret) {
+		mapping_release_write_slot(c);
+		commit->mapping_slot_reserved = false;
 		kfree(commit);
 		return ret;
 	}
@@ -3119,14 +3446,6 @@ static int zns_base_wal_publish_foreground_locked(
   	unsigned int old_slot;
   	bool had_old_mapping;
   	int ret;
-
-	/*
-	 * 호출자는 c->mapping_wal_lock을 잡은 상태여야 한다.
-	 * 이 함수 안에서는 sleep하지 않는다.
-	 */
-	ret = mapping_wait_for_write_slot(c, commit->logical_block);
-	if (ret)
-		return ret;
 
 	spin_lock(&c->lock);
 	if (!commit->new_zone->slots[commit->new_slot].pending ||
@@ -3189,6 +3508,10 @@ static int zns_base_wal_publish_foreground_locked(
 
   out_unlock:
   	spin_unlock(&c->lock);
+	if (commit->mapping_slot_reserved) {
+		mapping_release_write_slot(c);
+		commit->mapping_slot_reserved = false;
+	}
   	return ret;
 }
 
@@ -3602,9 +3925,11 @@ static int zns_base_publish_catalog_locked(
 	if (zns_base_failpoint_hit(ZNS_BASE_FAIL_AFTER_MANIFEST_WRITE))
 		return -EIO;
 
+	write_seqcount_begin(&c->metadata.catalog_seq);
 	memcpy(c->metadata.sstables, descriptors,
 	       descriptor_count * sizeof(*descriptors));
 	c->metadata.sstable_count = descriptor_count;
+	write_seqcount_end(&c->metadata.catalog_seq);
 	c->metadata.checkpoint_seq = checkpoint_seq;
 	c->metadata.checkpoint_generation++;
 	c->metadata.checkpoint_manifest_zone_idx = manifest_idx;
@@ -3773,6 +4098,8 @@ static int zns_base_compact_sstables_locked(struct zns_base_c *c)
 	unsigned int output_zone;
 	size_t entry_count = 0;
 	u64 max_seq = 0;
+	u64 started_ns;
+	u64 elapsed_ns;
 	size_t i;
 	int ret;
 
@@ -3782,6 +4109,12 @@ static int zns_base_compact_sstables_locked(struct zns_base_c *c)
 		GFP_KERNEL);
 	if (!input_descriptors)
 		return -ENOMEM;
+	started_ns = ktime_get_ns();
+	c->metadata.compaction_running = true;
+	c->metadata.compaction_count++;
+	DMINFO("compaction start: inputs=%u catalog_generation=%llu",
+	       input_count,
+	       (unsigned long long)c->metadata.checkpoint_generation);
 	memcpy(input_descriptors, c->metadata.sstables,
 	       input_count * sizeof(*input_descriptors));
 	input_zone = le32_to_cpu(input_descriptors[0].zone_idx);
@@ -3856,13 +4189,23 @@ static int zns_base_compact_sstables_locked(struct zns_base_c *c)
 	}
 	/* Every live input was packed into one zone.  Reset it once, after the
 	 * replacement SSTable and its Manifest are durable. */
-	if (input_zone != output_zone)
+	if (input_zone != output_zone) {
+		synchronize_srcu(&c->metadata.catalog_srcu);
 		ret = zns_base_reset_metadata_zone_locked(c, input_zone);
+	}
 out_entries:
 	kvfree(entries);
 out_snapshot:
 	kvfree(snapshot);
 out_descriptors:
+	elapsed_ns = ktime_get_ns() - started_ns;
+	c->metadata.compaction_running = false;
+	c->metadata.compaction_last_ns = elapsed_ns;
+	c->metadata.compaction_max_ns =
+		max(c->metadata.compaction_max_ns, elapsed_ns);
+	DMINFO("compaction end: inputs=%u entries=%zu ret=%d duration_ms=%llu",
+	       input_count, entry_count, ret,
+	       (unsigned long long)div_u64(elapsed_ns, NSEC_PER_MSEC));
 	kvfree(input_descriptors);
 	return ret;
 }
@@ -3881,7 +4224,7 @@ static int zns_base_persist_memtable_locked(struct zns_base_c *c,
 	next = kvcalloc(ZNS_BASE_MAX_MANIFEST_SSTABLES, sizeof(*next), GFP_KERNEL);
 	if (!next)
 		return -ENOMEM;
-	if (c->metadata.sstable_count >= ZNS_BASE_SSTABLE_COMPACTION_THRESHOLD) {
+	if (c->metadata.sstable_count >= sstable_compaction_threshold) {
 		ret = zns_base_compact_sstables_locked(c);
 		if (ret)
 			goto out_next;
@@ -3917,7 +4260,7 @@ static int zns_base_persist_memtable_locked(struct zns_base_c *c,
 	if (ret)
 		goto out_next;
 
-	if (c->metadata.sstable_count >= ZNS_BASE_SSTABLE_COMPACTION_THRESHOLD)
+	if (c->metadata.sstable_count >= sstable_compaction_threshold)
 		ret = zns_base_compact_sstables_locked(c);
 out_next:
 	kvfree(next);
@@ -4059,6 +4402,10 @@ static int zns_base_checkpoint_locked(struct zns_base_c *c)
 	}
 	c->metadata.checkpoint_sstable_zone_idx =
 		le32_to_cpu(descriptor.zone_idx);
+	/* Readers that captured the previous catalog may sleep in block I/O.  SRCU
+	 * waits only for that old epoch; readers of the new table do not starve the
+	 * reclaim. */
+	synchronize_srcu(&c->metadata.catalog_srcu);
 
 	for (i = 0; i < old_count; i++) {
 		unsigned int zone_idx = le32_to_cpu(old[i].zone_idx);
@@ -4131,25 +4478,49 @@ static bool zns_base_sstable_header_valid(struct zns_base_sstable_header_disk *h
 	return actual_crc == stored_crc;
 }
 
-/* Caller holds metadata.lock. Reads only the 4 KiB pages needed by binary search. */
-static int zns_base_sstable_lookup_locked(struct zns_base_c *c,
+/* Take a lockless catalog snapshot, then pin all currently published SSTable
+ * zones until the lookup finishes.  Compaction can do body I/O concurrently
+ * and waits for this reader epoch only before resetting an old zone. */
+static int zns_base_sstable_lookup(struct zns_base_c *c,
 					 size_t logical_block,
 					 struct mapping_entry *entry)
 {
 	struct zns_base_sstable_header_disk *header;
 	struct zns_base_sstable_entry_disk *disk_entry;
+	struct zns_base_sstable_descriptor_disk *descriptors;
 	u8 *buffer;
 	struct mapping_entry best = {};
+	unsigned int catalog_seq;
+	unsigned int descriptor_count;
 	unsigned int table;
+	int srcu_idx;
 	int ret = -ENOENT;
 
-	buffer = kvzalloc(ZNS_BASE_BLOCK_SIZE, GFP_KERNEL);
-	if (!buffer)
+	descriptors = kcalloc(ZNS_BASE_MAX_MANIFEST_SSTABLES,
+			      sizeof(*descriptors), GFP_KERNEL);
+	if (!descriptors)
 		return -ENOMEM;
+	buffer = kvzalloc(ZNS_BASE_BLOCK_SIZE, GFP_KERNEL);
+	if (!buffer) {
+		kfree(descriptors);
+		return -ENOMEM;
+	}
 
-	for (table = 0; table < c->metadata.sstable_count; table++) {
+	srcu_idx = srcu_read_lock(&c->metadata.catalog_srcu);
+	do {
+		catalog_seq = read_seqcount_begin(&c->metadata.catalog_seq);
+		descriptor_count = READ_ONCE(c->metadata.sstable_count);
+		if (descriptor_count > ZNS_BASE_MAX_MANIFEST_SSTABLES) {
+			ret = -EIO;
+			goto out;
+		}
+		memcpy(descriptors, c->metadata.sstables,
+		       descriptor_count * sizeof(*descriptors));
+	} while (read_seqcount_retry(&c->metadata.catalog_seq, catalog_seq));
+
+	for (table = 0; table < descriptor_count; table++) {
 		const struct zns_base_sstable_descriptor_disk *descriptor =
-			&c->metadata.sstables[table];
+			&descriptors[table];
 		u64 left, right, entry_count;
 
 		if (logical_block < le64_to_cpu(descriptor->min_logical_block) ||
@@ -4207,7 +4578,9 @@ static int zns_base_sstable_lookup_locked(struct zns_base_c *c,
 		ret = -ENOENT;
 	}
 out:
+	srcu_read_unlock(&c->metadata.catalog_srcu, srcu_idx);
 	kvfree(buffer);
+	kfree(descriptors);
 	return ret;
 }
 
@@ -4382,8 +4755,10 @@ static int zns_base_manifest_recover(struct zns_base_c *c)
 	c->metadata.checkpoint_generation = latest_generation;
 	c->metadata.checkpoint_manifest_zone_idx = latest_manifest_idx;
 	c->metadata.manifest.active_zone_idx = latest_manifest_idx;
+	write_seqcount_begin(&c->metadata.catalog_seq);
 	memcpy(c->metadata.sstables, latest, latest_count * sizeof(*latest));
 	c->metadata.sstable_count = latest_count;
+	write_seqcount_end(&c->metadata.catalog_seq);
 	c->metadata.checkpoint_sstable_zone_idx = latest_count == 1 ?
 		le32_to_cpu(latest[0].zone_idx) : ZNS_BASE_NO_ZONE;
 	c->mapping.next_seq = max_seq + 1;
@@ -4435,14 +4810,18 @@ static int zns_base_replay_wal_put(struct zns_base_c *c,
 		return -EINVAL;
 
 	/* Recovery can rebuild more entries than one MemTable generation holds. */
-	ret = mapping_wait_for_write_slot(c, logical_block);
+	ret = mapping_reserve_write_slot(c, logical_block);
 	if (ret)
 		return ret;
 	ret = mapping_lookup(c, logical_block, &old_entry);
-	if (!ret && old_entry.seq >= seq)
+	if (!ret && old_entry.seq >= seq) {
+		mapping_release_write_slot(c);
 		return 0;
-	if (ret != 0 && ret != -ENOENT)
+	}
+	if (ret != 0 && ret != -ENOENT) {
+		mapping_release_write_slot(c);
 		return ret;
+	}
 
 	spin_lock(&c->lock);
 	if (ret == 0) {
@@ -4468,6 +4847,7 @@ static int zns_base_replay_wal_put(struct zns_base_c *c,
 	if (!ret)
 		ret = mapping_update(c, logical_block, physical_sector, seq);
 	spin_unlock(&c->lock);
+	mapping_release_write_slot(c);
 
 	return ret;
 }
@@ -4710,7 +5090,7 @@ static void zns_base_wal_finalize_page_locked(struct zns_base_c *c)
   	u8 *payload;
   	size_t payload_bytes;
 
-  	/* 호출자는 c->metadata.lock을 잡은 상태여야 한다. */
+	/* Caller holds wal.lock. */
   	header = (struct zns_base_wal_page_header_disk *)
   		wal->page_buffer;
 
@@ -4745,7 +5125,7 @@ static void zns_base_wal_prepare_page_locked(struct zns_base_c *c)
   	struct zns_base_wal_record_disk *record;
   	unsigned int index = 0;
 
-  	/* 호출자는 mapping_wal_lock과 metadata.lock을 잡은 상태여야 한다. */
+	/* Caller holds mapping_wal_lock and wal.lock. */
   	if (wal->record_count == 0)
   		return;
 
@@ -4787,7 +5167,7 @@ static int zns_base_wal_write_page_locked(struct zns_base_c *c)
   	unsigned int needed_blocks;
   	int ret;
 
-	/* 호출자는 c->metadata.lock을 잡은 상태여야 한다. */
+	/* Caller holds mapping_wal_lock and wal.lock. */
 	if (wal->record_count == 0)
 		return 0;
 
@@ -4813,10 +5193,12 @@ static int zns_base_wal_write_page_locked(struct zns_base_c *c)
 		ret = zns_base_wal_rotate(c);
 		if (ret == -ENOSPC) {
 			/*
-			 * Both WAL zones are full. The caller holds mapping_wal_lock and
-			 * metadata.lock, so checkpointing captures a stable published map.
+			 * Both WAL zones are full.  Catalog serialization is needed only
+			 * for this rare checkpoint, not for ordinary WAL page writes.
 			 */
+			mutex_lock(&c->metadata.lock);
 			ret = zns_base_checkpoint_locked(c);
+			mutex_unlock(&c->metadata.lock);
 			if (!ret)
 				ret = zns_base_metadata_has_space(c, &wal->stream,
 								       needed_blocks) ? 0 : -ENOSPC;
@@ -4871,7 +5253,7 @@ static void zns_base_wal_abort_pending(
   	struct zns_base_wal_pending_commit *next;
   	LIST_HEAD(done_commits);
 
-  	mutex_lock(&c->metadata.lock);
+	mutex_lock(&wal->lock);
 
 	list_for_each_entry_safe(commit, next,
 				 &wal->pending_commits, node) {
@@ -4879,13 +5261,17 @@ static void zns_base_wal_abort_pending(
 		zns_base_release_pending_slot(c, commit->new_zone,
 					      commit->new_slot,
 					      commit->logical_block);
+		if (commit->mapping_slot_reserved) {
+			mapping_release_write_slot(c);
+			commit->mapping_slot_reserved = false;
+		}
 		list_move_tail(&commit->node, &done_commits);
   	}
 
   	zns_base_wal_reset_page_locked(wal);
   	wal->flush_scheduled = false;
 
-  	mutex_unlock(&c->metadata.lock);
+	mutex_unlock(&wal->lock);
 
   	zns_base_wal_finish_commits(c, &done_commits);
 }
@@ -4906,12 +5292,10 @@ static void zns_base_wal_flush_work(struct work_struct *work)
   	metadata = container_of(wal, struct zns_base_metadata_state, wal);
   	c = container_of(metadata, struct zns_base_c, metadata);
 
-  	/*
-  	 * WAL 기록 순서와 mapping publish 순서를 하나로 직렬화한다.
-  	 * mapping_wal_lock -> metadata.lock 순서를 항상 유지한다.
-  	 */
-  	mutex_lock(&c->mapping_wal_lock);
-  	mutex_lock(&c->metadata.lock);
+	/* WAL order and mapping publication share one worker.  SSTable compaction
+	 * uses metadata.lock independently and cannot block ordinary WAL pages. */
+	mutex_lock(&c->mapping_wal_lock);
+	mutex_lock(&wal->lock);
 
   	if (wal->record_count == 0)
   		goto out_unlock;
@@ -4927,6 +5311,10 @@ static void zns_base_wal_flush_work(struct work_struct *work)
 		zns_base_release_pending_slot(c, commit->new_zone,
 					      commit->new_slot,
 					      commit->logical_block);
+		if (commit->mapping_slot_reserved) {
+			mapping_release_write_slot(c);
+			commit->mapping_slot_reserved = false;
+		}
 		list_move_tail(&commit->node, &done_commits);
   		}
 
@@ -4970,8 +5358,8 @@ static void zns_base_wal_flush_work(struct work_struct *work)
   out_unlock:
   	wal->flush_scheduled = false;
 
-  	mutex_unlock(&c->metadata.lock);
-  	mutex_unlock(&c->mapping_wal_lock);
+	mutex_unlock(&wal->lock);
+	mutex_unlock(&c->mapping_wal_lock);
 
 	zns_base_wal_finish_commits(c, &done_commits);
 	if (published)
@@ -4987,14 +5375,14 @@ static void zns_base_wal_schedule_flush(struct zns_base_c *c, bool immediate)
 
 	(void)immediate;
 
-	mutex_lock(&c->metadata.lock);
+	mutex_lock(&wal->lock);
 	if (wal->record_count && !wal->flush_error) {
 		if (!wal->flush_scheduled) {
 			wal->flush_scheduled = true;
 			queue = true;
 		}
 	}
-	mutex_unlock(&c->metadata.lock);
+	mutex_unlock(&wal->lock);
 
 	if (queue)
 		queue_work(c->wal_wq, &wal->flush_work);
@@ -5007,12 +5395,12 @@ static int zns_base_wal_flush_sync(struct zns_base_c *c)
 	int ret;
 
 	for (;;) {
-		mutex_lock(&c->metadata.lock);
+		mutex_lock(&wal->lock);
 		has_records = wal->record_count != 0;
 		ret = wal->flush_error;
 		if (has_records && !ret)
 			wal->flush_scheduled = true;
-		mutex_unlock(&c->metadata.lock);
+		mutex_unlock(&wal->lock);
 
 		if (ret || !has_records)
 			return ret;
@@ -5033,12 +5421,8 @@ static int zns_base_wal_publish_gc_locked(
 	struct mapping_entry current_entry;
 	int ret;
 
-	/* Caller holds mapping_wal_lock. */
-	ret = mapping_wait_for_write_slot(c, commit->logical_block);
-	if (ret)
-		return ret;
-	ret = mapping_lookup_metadata_locked(c, commit->logical_block,
-					     &current_entry);
+	/* Capacity was reserved before the GC copy was issued. */
+	ret = mapping_lookup(c, commit->logical_block, &current_entry);
 
 	spin_lock(&c->lock);
 
@@ -5096,6 +5480,10 @@ static int zns_base_wal_publish_gc_locked(
 
 out_unlock:
 	spin_unlock(&c->lock);
+	if (commit->mapping_slot_reserved) {
+		mapping_release_write_slot(c);
+		commit->mapping_slot_reserved = false;
+	}
 	return ret;
 }
 
@@ -5106,6 +5494,11 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	if (argc != 1) {
 		ti->error = "expected one argument: underlying device";
+		return -EINVAL;
+	}
+	if (!sstable_compaction_threshold ||
+	    sstable_compaction_threshold > ZNS_BASE_MAX_MANIFEST_SSTABLES) {
+		ti->error = "invalid sstable_compaction_threshold";
 		return -EINVAL;
 	}
 
@@ -5225,9 +5618,26 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	if (!c->io_wq) {
 		ti->error = "failed to allocate foreground I/O workqueue";
+		mapping_destroy(c);
 		zns_base_metadata_destroy(c);
 		zns_base_zone_destroy(c);
+		dm_put_device(ti, c->dev);
+		kfree(c);
+		return -ENOMEM;
+	}
+
+	/* DATA completions must run independently from the foreground dispatcher.
+	 * The dispatcher may wait for MemTable capacity that only a completion can
+	 * release, so sharing a single-threaded workqueue would self-deadlock. */
+	c->data_wq = alloc_workqueue("zns-base-data",
+				     WQ_MEM_RECLAIM, 1);
+	if (!c->data_wq) {
+		ti->error = "failed to allocate DATA completion workqueue";
+		destroy_workqueue(c->io_wq);
+		c->io_wq = NULL;
 		mapping_destroy(c);
+		zns_base_metadata_destroy(c);
+		zns_base_zone_destroy(c);
 		dm_put_device(ti, c->dev);
 		kfree(c);
 		return -ENOMEM;
@@ -5237,11 +5647,13 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
   			    WQ_MEM_RECLAIM, 1);
 	if (!c->wal_wq) {
 		ti->error = "failed to allocate WAL workqueue";
+		destroy_workqueue(c->data_wq);
+		c->data_wq = NULL;
 		destroy_workqueue(c->io_wq);
 		c->io_wq = NULL;
+		mapping_destroy(c);
 		zns_base_metadata_destroy(c);
 		zns_base_zone_destroy(c);
-		mapping_destroy(c);
 		dm_put_device(ti, c->dev);
 		kfree(c);
 		return -ENOMEM;
@@ -5251,13 +5663,15 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 					WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
 	if (!c->gc_wq) {
 		ti->error = "failed to allocate GC workqueue";
+		destroy_workqueue(c->data_wq);
+		c->data_wq = NULL;
 		destroy_workqueue(c->io_wq);
 		c->io_wq = NULL;
 		destroy_workqueue(c->wal_wq);
   		c->wal_wq = NULL;
+		mapping_destroy(c);
 		zns_base_metadata_destroy(c);
 		zns_base_zone_destroy(c);
-		mapping_destroy(c);
 		dm_put_device(ti, c->dev);
 		kfree(c);
 		return -ENOMEM;
@@ -5271,12 +5685,14 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		c->gc_wq = NULL;
 		destroy_workqueue(c->wal_wq);
  		c->wal_wq = NULL;
+		destroy_workqueue(c->data_wq);
+		c->data_wq = NULL;
 		destroy_workqueue(c->io_wq);
 		c->io_wq = NULL;
 
+		mapping_destroy(c);
 		zns_base_metadata_destroy(c);
 		zns_base_zone_destroy(c);
-		mapping_destroy(c);
 		dm_put_device(ti, c -> dev);
 		kfree(c);
 		return -ENOMEM; 
@@ -5314,6 +5730,7 @@ static void zns_base_dtr(struct dm_target *ti)
 	 * flush after foreground_data_inflight reaches zero. */
 	flush_workqueue(c->io_wq);
 	wait_event(c->data_waitq, !READ_ONCE(c->foreground_data_inflight));
+	flush_workqueue(c->data_wq);
 	flush_workqueue(c->io_wq);
 	spin_lock(&c->lock);
 	WARN_ON_ONCE(c->data_write_inflight ||
@@ -5372,6 +5789,8 @@ static void zns_base_dtr(struct dm_target *ti)
 
 	destroy_workqueue(c -> gc_wq);
 	c -> gc_wq = NULL;
+	destroy_workqueue(c->data_wq);
+	c->data_wq = NULL;
 	destroy_workqueue(c -> io_wq);
 	c -> io_wq = NULL;
 
@@ -5425,9 +5844,15 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	u64 gc_runs;
 	u64 gc_reset_count;
 	u64 gc_moved_blocks;
+	u64 compaction_count;
+	u64 compaction_last_ns;
+	u64 compaction_max_ns;
 	unsigned int persistent_sstables;
+	unsigned int compaction_running;
 	unsigned int data_write_queued = 0;
+	unsigned int data_write_queued_blocks = 0;
 	unsigned int data_write_inflight;
+	size_t mapping_reserved_slots;
 	unsigned int active_data_zone;
 	struct zns_base_data_write *queued_write;
 	sector_t active_data_wp;
@@ -5447,18 +5872,28 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	}
 
 	mutex_lock(&c->metadata.lock);
-	wal_zone_idx = c->metadata.wal.stream.active_zone_idx;
-	wal_records = c->metadata.wal.record_count;
-	wal_generation = c->metadata.wal.stream.generation;
-	wal_error = c->metadata.wal.flush_error;
 	checkpoint_seq = c->metadata.checkpoint_seq;
 	checkpoint_generation = c->metadata.checkpoint_generation;
 	checkpoint_manifest = c->metadata.checkpoint_manifest_zone_idx;
 	checkpoint_sstable = c->metadata.checkpoint_sstable_zone_idx;
 	persistent_sstables = c->metadata.sstable_count;
+	compaction_running = c->metadata.compaction_running;
+	compaction_count = c->metadata.compaction_count;
+	compaction_last_ns = c->metadata.compaction_last_ns;
+	compaction_max_ns = c->metadata.compaction_max_ns;
 	manifest_active = c->metadata.manifest.active_zone_idx;
 	sstable_active = c->metadata.sstable.active_zone_idx;
 	mutex_unlock(&c->metadata.lock);
+
+	mutex_lock(&c->metadata.wal.lock);
+	wal_zone_idx = c->metadata.wal.stream.active_zone_idx;
+	wal_records = c->metadata.wal.record_count;
+	wal_generation = c->metadata.wal.stream.generation;
+	wal_error = c->metadata.wal.flush_error;
+	wal_zone = &c->zone_state.zones[wal_zone_idx];
+	wal_used_sectors = wal_zone->write_pointer - wal_zone->start_sector;
+	wal_capacity_sectors = wal_zone->capacity_sectors;
+	mutex_unlock(&c->metadata.wal.lock);
 
 	spin_lock(&c->lock);
 	for (i = 0; i < c->zone_state.nr_zones; i++) {
@@ -5486,9 +5921,6 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		}
 	}
 
-	wal_zone = &c->zone_state.zones[wal_zone_idx];
-	wal_used_sectors = wal_zone->write_pointer - wal_zone->start_sector;
-	wal_capacity_sectors = wal_zone->capacity_sectors;
 	gc_runs = c->gc_runs;
 	gc_reset_count = c->gc_reset_count;
 	gc_moved_blocks = c->gc_moved_blocks;
@@ -5496,8 +5928,11 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	gc_last_error = c->gc_last_error;
 	data_write_error = c->data_write_error;
 	data_write_inflight = c->data_write_inflight;
-	list_for_each_entry(queued_write, &c->data_write_queue, node)
+	list_for_each_entry(queued_write, &c->data_write_queue, node) {
 		data_write_queued++;
+		data_write_queued_blocks += queued_write->mapping_count;
+	}
+	mapping_reserved_slots = c->mapping.reserved_slots;
 	active_data_zone = c->zone_state.active_zone_idx;
 	active_data_wp = c->zone_state.zones[active_data_zone].write_pointer;
 	spin_unlock(&c->lock);
@@ -5508,8 +5943,9 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		(unsigned long long)gc_runs,
 		(unsigned long long)gc_reset_count,
 		(unsigned long long)gc_moved_blocks, gc_error, gc_last_error);
-	DMEMIT("data_write_inflight=%u data_write_queued=%u data_write_error=%d active_data_zone=%u active_data_wp=%llu ",
-		data_write_inflight, data_write_queued, data_write_error,
+	DMEMIT("data_write_inflight=%u data_write_queued=%u data_write_queued_blocks=%u data_write_error=%d mapping_reserved_slots=%zu active_data_zone=%u active_data_wp=%llu ",
+		data_write_inflight, data_write_queued, data_write_queued_blocks,
+		data_write_error, mapping_reserved_slots,
 		active_data_zone, (unsigned long long)active_data_wp);
 	DMEMIT("wal_zone=%u wal_generation=%llu wal_used_blocks=%llu wal_capacity_blocks=%llu wal_staged_records=%u wal_error=%d ",
 		wal_zone_idx, (unsigned long long)wal_generation,
@@ -5521,6 +5957,10 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		(unsigned long long)checkpoint_seq,
 		(unsigned long long)checkpoint_generation, manifest_active,
 		checkpoint_manifest, sstable_active, checkpoint_sstable);
+	DMEMIT(" compaction_running=%u compaction_count=%llu compaction_last_ms=%llu compaction_max_ms=%llu",
+		compaction_running, (unsigned long long)compaction_count,
+		(unsigned long long)div_u64(compaction_last_ns, NSEC_PER_MSEC),
+		(unsigned long long)div_u64(compaction_max_ns, NSEC_PER_MSEC));
 }
 
 static struct target_type zns_base_target = {

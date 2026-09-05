@@ -131,7 +131,8 @@ if [ "$UNDERLYING" = "/dev/nullb0" ]; then
 fi
 
 echo "[*] insmod $KO_PATH"
-insmod "$KO_PATH" || fail "insmod failed"
+insmod "$KO_PATH" memtable_capacity_entries=4096 \
+	sstable_compaction_threshold=4 || fail "insmod failed"
 
 echo "[*] dmsetup create $DM_NAME (zns-base on $UNDERLYING, $sectors sectors)"
 echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" || fail "dmsetup create failed"
