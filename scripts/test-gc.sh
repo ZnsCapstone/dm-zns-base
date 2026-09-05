@@ -162,9 +162,9 @@ fi
 
 echo
 echo "=== [6/6] 커널 에러 확인 ==="
-if dmesg | grep -qi "blk_update_request\|hung_task\|BUG:"; then
+if dmesg | grep -qi "blk_update_request\|I/O error\|hung_task\|BUG:"; then
 	echo "[FAIL] 커널 에러/행 감지됨" >&2
-	dmesg | grep -i "blk_update_request\|hung_task\|BUG:"
+	dmesg | grep -i "blk_update_request\|I/O error\|hung_task\|BUG:"
 	exit 3
 fi
 echo "[OK] 에러 없음"
