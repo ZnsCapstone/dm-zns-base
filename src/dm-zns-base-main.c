@@ -193,6 +193,8 @@ struct zns_base_c {
 	bool wal_batch_busy;
 	struct delayed_work pending_flush_work;
 	struct list_head pending_flush_bios;
+	struct delayed_work pending_write_work;
+	struct list_head pending_write_bios;
 	bool stopping;
 	atomic_t foreground_writes;
 
@@ -213,6 +215,13 @@ struct zns_base_c {
 struct pending_flush_bio {
 	struct list_head link;
 	struct bio *bio;
+};
+
+struct pending_write_bio {
+	struct list_head link;
+	struct bio *bio;
+	sector_t lba;
+	sector_t nr;
 };
 
 struct memtable_flush_work {
@@ -1147,6 +1156,7 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 				   u64 seq_no, u64 split_gen, sector_t split_off);
 static void wal_batch_work_fn(struct work_struct *work);
 static void pending_flush_work_fn(struct work_struct *work);
+static void pending_write_work_fn(struct work_struct *work);
 
 static void foreground_write_done(struct zns_base_c *c)
 {
@@ -1610,6 +1620,7 @@ static void pending_flush_work_fn(struct work_struct *work)
 
 	spin_lock_irq(&c->lock);
 	wal_busy = c->wal_batch_busy || !list_empty(&c->wal_pending) ||
+		!list_empty(&c->pending_write_bios) ||
 		atomic_read(&c->foreground_writes) > 0;
 	if (!wal_busy)
 		list_splice_init(&c->pending_flush_bios, &ready);
@@ -3264,6 +3275,100 @@ static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag
 	return 0;
 }
 
+/* 이미 DM_MAPIO_SUBMITTED로 인계받은 foreground write를 실제 append 경로에
+ * 올린다. -EAGAIN이면 bio를 완료하지 않았으므로 pending FIFO에서 재시도한다. */
+static int start_foreground_write(struct zns_base_c *c, struct bio *bio,
+				  sector_t block_lba, sector_t nr)
+{
+	sector_t phys;
+	int new_data_zone;
+	struct zns_io_ctx *ctx;
+	int ret;
+
+	ret = zone_pool_alloc_with_gc_retry(c, ZONE_TAG_USER_DATA, nr, &phys,
+					    &new_data_zone);
+	if (ret == -EAGAIN)
+		return ret;
+	if (ret) {
+		bio->bi_status = BLK_STS_NOSPC;
+		bio_endio(bio);
+		return 0;
+	}
+
+	ctx = kmalloc(sizeof(*ctx), GFP_NOIO);
+	if (!ctx) {
+		zone_dispatch_cancel(c, phys, nr);
+		bio->bi_status = BLK_STS_RESOURCE;
+		bio_endio(bio);
+		return 0;
+	}
+	ctx->c = c;
+	ctx->orig_bio = bio;
+	ctx->lba = block_lba;
+	ctx->reserved_phys = phys;
+	ctx->reserved_nr = nr;
+	atomic_inc(&c->foreground_writes);
+
+	ctx->nr_headers = 0;
+	if (new_data_zone >= 0) {
+		ctx->headers[ctx->nr_headers].zone_id = new_data_zone;
+		ctx->headers[ctx->nr_headers].tag = ZONE_TAG_USER_DATA;
+		ctx->headers[ctx->nr_headers].gen = 0;
+		ctx->nr_headers++;
+	}
+	ctx->header_idx = 0;
+	ctx->on_headers_done = submit_data_append_async;
+
+	if (ctx->nr_headers > 0)
+		submit_header_async(ctx);
+	else
+		submit_data_append_async(ctx);
+	maybe_trigger_gc(c);
+	return 0;
+}
+
+static void pending_write_work_fn(struct work_struct *work)
+{
+	struct zns_base_c *c = container_of(to_delayed_work(work),
+					     struct zns_base_c, pending_write_work);
+	struct pending_write_bio *pending;
+	bool stopping;
+
+	for (;;) {
+		spin_lock_irq(&c->lock);
+		if (list_empty(&c->pending_write_bios)) {
+			spin_unlock_irq(&c->lock);
+			mod_delayed_work(zns_wq, &c->pending_flush_work, 0);
+			return;
+		}
+		pending = list_first_entry(&c->pending_write_bios,
+					   struct pending_write_bio, link);
+		stopping = c->stopping;
+		if (stopping)
+			list_del(&pending->link);
+		spin_unlock_irq(&c->lock);
+
+		if (stopping) {
+			pending->bio->bi_status = BLK_STS_IOERR;
+			bio_endio(pending->bio);
+			kfree(pending);
+			continue;
+		}
+
+		if (start_foreground_write(c, pending->bio, pending->lba,
+					   pending->nr) == -EAGAIN) {
+			mod_delayed_work(zns_wq, &c->pending_write_work,
+					 msecs_to_jiffies(20));
+			return;
+		}
+
+		spin_lock_irq(&c->lock);
+		list_del(&pending->link);
+		spin_unlock_irq(&c->lock);
+		kfree(pending);
+	}
+}
+
 /* zns_gc_wq 워커 — free zone이 watermark 이하인 동안 gc_reclaim_one_victim 반복 (한 번에 하나만 회수하면 쓰기를 못 따라잡음).
  * false(대상 없음/실패) 시 종료. per-trigger 상한(nr_zones)은 방어용
  * victim 로직 결함으로 무한 회수 순환에 빠져도 워커가 반드시 끝나게 한다. process context 전용. */
@@ -3365,6 +3470,8 @@ out_finish:
 	 * 기다리지 않고 방금 회수한 공간을 즉시 사용하게 한다. */
 	if (reclaimed && READ_ONCE(c->wal_pending_count))
 		mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
+	if (reclaimed)
+		mod_delayed_work(zns_wq, &c->pending_write_work, 0);
 }
 
 /* zns_wal_reclaim_wq 워커 — 온전히 flush된 WAL zone 회수. 대상 3조건(전부 락 하):
@@ -3569,6 +3676,8 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	INIT_DELAYED_WORK(&c->wal_batch_work, wal_batch_work_fn);
 	INIT_LIST_HEAD(&c->pending_flush_bios);
 	INIT_DELAYED_WORK(&c->pending_flush_work, pending_flush_work_fn);
+	INIT_LIST_HEAD(&c->pending_write_bios);
+	INIT_DELAYED_WORK(&c->pending_write_work, pending_write_work_fn);
 	atomic_set(&c->foreground_writes, 0);
 
 	/* zone 스캔으로 크래시/재로드 이전 상태 복원(zone_tag[]/wp[] + WAL
@@ -3635,6 +3744,8 @@ static void zns_base_dtr(struct dm_target *ti)
 	c->stopping = true;
 	spin_unlock_irq(&c->lock);
 	flush_delayed_work(&c->wal_batch_work);
+	mod_delayed_work(zns_wq, &c->pending_write_work, 0);
+	flush_delayed_work(&c->pending_write_work);
 	flush_delayed_work(&c->pending_flush_work);
 
 	/* worker가 SSTable/checkpoint 비동기 체인을 시작하게 한 뒤, 마지막 callback의
@@ -3734,10 +3845,9 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 
 	switch (bio_op(bio)) {
 	case REQ_OP_WRITE: {
-		sector_t phys;     // append capacity 예약 위치(실제 phys는 완료 시 반환)
 		int ret;
-		int new_data_zone;
-		struct zns_io_ctx *ctx;
+		struct pending_write_bio *pending;
+		bool backlog;
 
 		/* 매핑/WAL/GC의 최소 단위는 4KB다. 부분 write를 그대로
 		 * append하면 read-modify-write 없이 나머지 섹터를 잃게 되므로
@@ -3748,46 +3858,31 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 			return DM_MAPIO_SUBMITTED;
 		}
 
-		ret = zone_pool_alloc_with_gc_retry(c, ZONE_TAG_USER_DATA, nr, &phys, &new_data_zone);
-		if (ret == -EAGAIN)
-			return DM_MAPIO_REQUEUE;
-		if (ret) {
-			bio->bi_status = BLK_STS_NOSPC;
-			bio_endio(bio);
+		/* 먼저 보류된 bio가 있으면 새 write가 회수 직후 공간을 가로채지
+		 * 않도록 동일 FIFO 뒤에 세운다. */
+		spin_lock_irq(&c->lock);
+		backlog = !list_empty(&c->pending_write_bios);
+		spin_unlock_irq(&c->lock);
+		ret = backlog ? -EAGAIN :
+			start_foreground_write(c, bio, block_lba, nr);
+		if (ret != -EAGAIN)
 			return DM_MAPIO_SUBMITTED;
-		}
-		ctx = kmalloc(sizeof(*ctx), GFP_NOIO);
-		if (!ctx) {
-			zone_dispatch_cancel(c, phys, nr);
+
+		pending = kmalloc(sizeof(*pending), GFP_NOIO);
+		if (!pending) {
 			bio->bi_status = BLK_STS_RESOURCE;
 			bio_endio(bio);
 			return DM_MAPIO_SUBMITTED;
 		}
-		ctx->c = c;
-		ctx->orig_bio = bio;
-		ctx->lba = block_lba;
-		ctx->reserved_phys = phys;
-		ctx->reserved_nr = nr;
-		atomic_inc(&c->foreground_writes);
-
-		/* 새로 배정받은 zone이 있으면(태그별 최대 1개) 헤더부터 비동기로 써야 재부팅 후 recovery_zone_cb가 zone_tag[]/wp[]를 되찾을 수 있다. */
-		ctx->nr_headers = 0;
-		if (new_data_zone >= 0) {
-			ctx->headers[ctx->nr_headers].zone_id = new_data_zone;
-			ctx->headers[ctx->nr_headers].tag = ZONE_TAG_USER_DATA;
-			ctx->headers[ctx->nr_headers].gen = 0;  /* WAL 아님 */
-			ctx->nr_headers++;
-		}
-		ctx->header_idx = 0;
-		ctx->on_headers_done = submit_data_append_async;
-
-		if (ctx->nr_headers > 0)
-			submit_header_async(ctx);
-		else
-			submit_data_append_async(ctx);
-
-		/* data append의 실제 phys를 알아야 WAL을 만들 수 있어 data가 먼저다. */
-		maybe_trigger_gc(c);
+		pending->bio = bio;
+		pending->lba = block_lba;
+		pending->nr = nr;
+		INIT_LIST_HEAD(&pending->link);
+		spin_lock_irq(&c->lock);
+		list_add_tail(&pending->link, &c->pending_write_bios);
+		spin_unlock_irq(&c->lock);
+		mod_delayed_work(zns_wq, &c->pending_write_work,
+				 msecs_to_jiffies(20));
 		return DM_MAPIO_SUBMITTED;
 	}
 	case REQ_OP_READ: {
