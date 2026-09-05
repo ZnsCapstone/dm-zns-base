@@ -1308,6 +1308,13 @@ static void data_append_done(struct bio *bio)
 	struct zns_base_c *c = ctx->c;
 
 	if (bio->bi_status) {
+		DMERR("foreground data append failed: err=%d zone=%u reserved=%llu+%llu returned=%llu lba=%llu",
+		      blk_status_to_errno(bio->bi_status),
+		      zone_of(c->zp, ctx->reserved_phys),
+		      (unsigned long long)ctx->reserved_phys,
+		      (unsigned long long)ctx->reserved_nr,
+		      (unsigned long long)bio->bi_iter.bi_sector,
+		      (unsigned long long)ctx->lba);
 		zone_dispatch_cancel(c, ctx->reserved_phys, ctx->reserved_nr);
 		bio->bi_end_io = ctx->orig_end_io;
 		bio->bi_private = ctx->orig_private;
@@ -1547,6 +1554,11 @@ static void wal_batch_work_fn(struct work_struct *work)
 	}
 	if (!ret) {
 		ret = wal_page_append_sync(c, wal_phys, page, wal_sectors);
+		if (ret)
+			DMERR("foreground WAL append failed: err=%d zone=%u reserved=%llu+%llu records=%u new_zone=%d",
+			      ret, zone_of(c->zp, wal_phys),
+			      (unsigned long long)wal_phys,
+			      (unsigned long long)wal_sectors, count, new_zone);
 	}
 
 complete:
