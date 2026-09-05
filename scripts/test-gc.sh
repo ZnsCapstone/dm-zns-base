@@ -10,14 +10,14 @@
 # --size의 1.2배로 주면 같은 영역을 평균 1.2번씩 덮어쓰게 된다.
 #
 # ★ 왜 M3 원 기준인 80%가 아니라 50%인가 ★
-# foreground WAL은 이제 최대 127개 PUT을 4KB page 하나로 묶는다. 다만 GC
-# relocation WAL은 아직 조건부 갱신마다 한 섹터를 동기 기록하고, 작은 null_blk
-# 장치에서는 GC 자체의 여유 공간도 필요하므로 보수적인 기본 fill 비율을 유지한다.
+# foreground와 GC relocation WAL은 최대 127개 PUT을 4KB page 하나로 묶는다.
+# 다만 작은 null_blk 장치에서는 GC 자체의 이주 공간도 필요하므로 보수적인
+# 기본 fill 비율을 유지한다.
 # 그래서 여기서는 GC "로직의 정확성"만 검증할 수 있는 수준으로 채움 비율을
 # 낮춘다. 80% 달성은 WAL zone 회수(implementation plan 13단계)의 몫이며, 그게
 # 되면 FILL_PERCENT=80으로 이 스크립트를 그대로 다시 돌려 확인하면 된다.
 #
-# gc_low_watermark도 기본값(2)보다는 높게 잡되 과하지 않게 둔다 — 너무 높으면
+# gc_low_watermark는 작은 null_blk에서도 GC를 일찍 유발하도록 높게 잡는다 — 너무 높으면
 # (이전 25) 회수할 가치가 없는 zone까지 계속 골라 순증가 0짜리 재배치를
 # 반복하고, 너무 낮으면 GC가 늦게 트리거돼 쓰기가 ENOSPC를 먼저 맞는다.
 #

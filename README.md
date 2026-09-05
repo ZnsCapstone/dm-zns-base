@@ -154,7 +154,8 @@ CHECKPOINT는 memtable 스왑 시점의 WAL 스트림 위치를 `(split_gen, spl
 | `BLOCK_SECTORS` | 8 (=4KB) | 매핑 단위 (fio/ext4 블록과 일치, 섹터 대비 8× 절감) |
 | `flush_threshold` | 1,000,000 | memtable → SSTable flush 트리거 (엔트리 수) |
 | `compaction_k` | 4 | compaction 시 병합할 SSTable 개수 |
-| `gc_low_watermark` | 2 | free zone이 이 이하로 떨어지면 GC 트리거 |
+| `gc_low_watermark` | 4 | free zone이 이 이하로 떨어지면 background GC 시작 |
+| `gc_high_watermark` | 5 | free zone이 이 이상 확보되면 GC 종료(hysteresis) |
 | `gc_reserved_zones` | 2 | GC 이주·WAL 전용 예비 zone (데드락 방지) |
 
 ---

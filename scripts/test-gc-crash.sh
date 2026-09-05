@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # GC 재배치의 크래시 안전성 검증 (A번 이슈 수정 확인용).
 #
-# 버그: gc_relocate_one이 데이터를 새 위치에 durable하게 쓴 뒤 mapping_put으로
+# 버그: GC relocation이 데이터를 새 위치에 durable하게 쓴 뒤 mapping_put으로
 # memtable만 갱신하고 WAL에는 안 남겼다. 그 매핑이 SSTable로 flush되기 전에
 # 크래시가 나면 WAL replay가 옛 위치(곧 reset될 victim)로 복원 → victim이
 # 이미 지워져 그 블록이 0으로 읽힌다(데이터 유실). 수정: 재배치도 WAL PUT을
-# 남겨(gc_wal_log_put) replay가 새 위치로 복원하게 함.
+# 남겨(batch GC WAL) replay가 새 위치로 복원하게 함.
 #
 # 재현 전략:
 #   - flush_threshold를 기본값(매우 큼)으로 둬 flush를 아예 안 나게 한다 →
@@ -84,7 +84,10 @@ fio --name=gc-crash-ow \
     --ioengine=libaio --iodepth=32 --direct=1 \
     2>&1 | grep -E 'WRITE|err' || true
 sync
-sleep 5   # GC(재배치+reset)가 끝날 시간
+for _ in $(seq 1 60); do
+	dmesg | grep -q "gc: reclaimed zone" && break
+	sleep 1
+done
 echo "[OK]"
 
 echo
