@@ -103,9 +103,18 @@ MODULE_PARM_DESC(compaction_k, "number of oldest SSTables merged per compaction 
 
 /* 여유(FREE) zone 개수가 이 값 이하로 떨어지면 GC 트리거 — USER_DATA zone을
  * 소비할 때마다 확인(zns_base_map의 WRITE 분기 끝). */
-static unsigned int gc_low_watermark = 2;
+static unsigned int gc_low_watermark = 4;
 module_param(gc_low_watermark, uint, 0444);
-MODULE_PARM_DESC(gc_low_watermark, "free zone count that triggers GC");
+MODULE_PARM_DESC(gc_low_watermark, "free zone count that starts background GC");
+
+static unsigned int gc_high_watermark = 5;
+module_param(gc_high_watermark, uint, 0444);
+MODULE_PARM_DESC(gc_high_watermark, "free zone count at which background GC stops");
+
+static inline unsigned int gc_stop_watermark(void)
+{
+	return max(gc_high_watermark, gc_low_watermark + 1);
+}
 
 /* free zone 중 마지막 이만큼은 GC_DATA 태그에만 내준다 — GC 자신도 재배치할
  * zone이 필요한데 USER_DATA/WAL이 여유 zone을 전부 먹으면 GC가 회수를 못 해
@@ -763,7 +772,7 @@ static int mapping_get(struct zns_base_c *c, u64 lba, u64 *phys_out)
  * 무효로 표시한다(최신값을 옛 값으로 되돌리지 않기 위함). memtable에 lba가 없으면
  * 현재값이 SSTable의 expected_old이므로 정상 이주로 보고 삽입.
  * 호출자가 c->lock 보유. [반환값] 0 이주 반영, 1 경합으로 스킵(둘 다 GC엔 정상), <0 오류.
- * [한계] memtable 갱신만 — 이미 durable한 gc_wal_log_put 레코드는 못 되돌리므로, 스킵
+	 * [한계] memtable 갱신만 — 이미 durable한 GC batch WAL 레코드는 못 되돌리므로, 스킵
  * 직전 크래시 시 replay가 이주본을 되살릴 수 있다(완전 해결은 per-entry seq 필요). */
 static int mapping_put_if_match(struct zns_base_c *c, u64 lba,
 				u64 expected_old, u64 new_phys)
@@ -2677,188 +2686,145 @@ static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512,
 	return w.status ? -EIO : 0;
 }
 
-/* GC 재배치를 크래시 안전하게 만드는 WAL PUT append — 데이터가 new_phys에 durable해진 "뒤에" 호출.
- * 없으면 재배치 매핑이 memtable에만 있어(SSTable flush전) 크래시 시 replay가 곧 reset될 옛 위치로 복원해 유실된다.
- * WAL 배정은 gc_ctx=true(GC 예비 zone까지) — 아니면 free 부족 시 데드락.
- * [반환값] 0 성공, 실패 시 호출자는 라운드 중단(victim 유지). process context 전용. */
-static int gc_wal_log_put(struct zns_base_c *c, u64 lba, sector_t phys,
-			  sector_t expected_old)
+/* 최대 한 WAL page에 들어가는 live block을 연속 GC_DATA 공간에 기록하고,
+ * 같은 묶음의 조건부 mapping 갱신을 WAL page 하나로 durable하게 만든다. */
+static int gc_relocate_batch(struct zns_base_c *c,
+			     struct gc_live_entry **entries, unsigned int count)
 {
-	sector_t wal_phys;
-	int new_wal_zone = -1;
-	struct wal_record *rec;
-	int ret;
+	void *data = NULL;
+	struct wal_page *wal = NULL;
+	sector_t data_phys, wal_phys;
+	sector_t data_sectors = (sector_t)count * BLOCK_SECTORS;
+	int new_data_zone = -1, new_wal_zone = -1;
+	unsigned int i;
+	int ret = 0;
+
+	data = kvzalloc((size_t)data_sectors * 512, GFP_KERNEL);
+	wal = (struct wal_page *)get_zeroed_page(GFP_KERNEL);
+	if (!data || !wal) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	for (i = 0; i < count; i++) {
+		ret = sstable_io_sync(c, REQ_OP_READ, entries[i]->phys,
+				       (char *)data + (size_t)i * PAGE_SIZE,
+				       BLOCK_SECTORS);
+		if (ret) {
+			DMERR("gc: batch source read failed at phys=%llu (%d)",
+			      (unsigned long long)entries[i]->phys, ret);
+			goto out;
+		}
+	}
 
 	spin_lock_irq(&c->lock);
-	ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, 1, &wal_phys, &new_wal_zone, true);
+	ret = zone_pool_alloc(c->zp, ZONE_TAG_GC_DATA, data_sectors,
+			      &data_phys, &new_data_zone, true);
 	spin_unlock_irq(&c->lock);
 	if (ret)
-		return ret;
+		goto out;
+	if (new_data_zone >= 0) {
+		struct zone_header *hdr = kzalloc(512, GFP_KERNEL);
+		sector_t hdr_phys = (sector_t)new_data_zone * c->zp->zone_sectors;
 
-	if (new_wal_zone >= 0) {
-		sector_t hdr_phys = (sector_t)new_wal_zone * c->zp->zone_sectors;
-		struct zone_header *zhdr = kzalloc(512, GFP_KERNEL);
-
-		if (!zhdr) {
-			/* 헤더를 못 쓰면 그 zone 섹터 0이 미발행이라, 뒤에 쓸 레코드가
-			 * 디바이스 wp를 위반한다 — 둘 다 취소하고 라운드 중단. */
+		if (!hdr) {
 			zone_dispatch_cancel(c, hdr_phys, 1);
-			zone_dispatch_cancel(c, wal_phys, 1);
-			zone_quarantine(c, new_wal_zone, ZONE_TAG_WAL, BLK_STS_RESOURCE);
-			return -ENOMEM;
+			zone_dispatch_cancel(c, data_phys, data_sectors);
+			zone_quarantine(c, new_data_zone, ZONE_TAG_GC_DATA,
+					BLK_STS_RESOURCE);
+			ret = -ENOMEM;
+			goto out;
 		}
-		zhdr->magic = cpu_to_le32(ZONE_HEADER_MAGIC);
-		zhdr->tag = cpu_to_le32(ZONE_TAG_WAL);
-		spin_lock_irq(&c->lock);
-		zhdr->gen = cpu_to_le64(c->zp->wal_gen[new_wal_zone]);
-		spin_unlock_irq(&c->lock);
-		ret = gc_sync_gate_write(c, hdr_phys, zhdr, false);
-		kfree(zhdr);
+		hdr->magic = cpu_to_le32(ZONE_HEADER_MAGIC);
+		hdr->tag = cpu_to_le32(ZONE_TAG_GC_DATA);
+		ret = gc_sync_gate_write(c, hdr_phys, hdr, false);
+		kfree(hdr);
 		if (ret) {
-			zone_dispatch_cancel(c, wal_phys, 1);
+			zone_dispatch_cancel(c, data_phys, data_sectors);
+			zone_quarantine(c, new_data_zone, ZONE_TAG_GC_DATA, BLK_STS_IOERR);
+			goto out;
+		}
+		zone_append_header_done(c, new_data_zone, 0);
+	}
+	zone_dispatch_wait_turn(c, data_phys, data_sectors);
+	ret = sstable_io_sync(c, REQ_OP_WRITE | REQ_FUA, data_phys, data,
+			      data_sectors);
+	if (ret) {
+		DMERR("gc: batch data write failed (%u entries, err=%d)", count, ret);
+		zone_quarantine(c, zone_of(c->zp, data_phys), ZONE_TAG_GC_DATA,
+				BLK_STS_IOERR);
+		goto out;
+	}
+
+	spin_lock_irq(&c->lock);
+	ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, WAL_PAGE_SECTORS,
+			      &wal_phys, &new_wal_zone, true);
+	spin_unlock_irq(&c->lock);
+	if (ret)
+		goto out;
+	if (new_wal_zone >= 0) {
+		struct zone_header *hdr = kzalloc(512, GFP_KERNEL);
+		sector_t hdr_phys = (sector_t)new_wal_zone * c->zp->zone_sectors;
+
+		if (!hdr) {
+			zone_dispatch_cancel(c, hdr_phys, 1);
+			zone_dispatch_cancel(c, wal_phys, WAL_PAGE_SECTORS);
+			zone_quarantine(c, new_wal_zone, ZONE_TAG_WAL,
+					BLK_STS_RESOURCE);
+			ret = -ENOMEM;
+			goto out;
+		}
+		hdr->magic = cpu_to_le32(ZONE_HEADER_MAGIC);
+		hdr->tag = cpu_to_le32(ZONE_TAG_WAL);
+		spin_lock_irq(&c->lock);
+		hdr->gen = cpu_to_le64(c->zp->wal_gen[new_wal_zone]);
+		spin_unlock_irq(&c->lock);
+		ret = gc_sync_gate_write(c, hdr_phys, hdr, false);
+		kfree(hdr);
+		if (ret) {
+			zone_dispatch_cancel(c, wal_phys, WAL_PAGE_SECTORS);
 			zone_quarantine(c, new_wal_zone, ZONE_TAG_WAL, BLK_STS_IOERR);
-			return ret;
+			goto out;
 		}
 		zone_append_header_done(c, new_wal_zone, 0);
 	}
 
-	rec = kzalloc(512, GFP_KERNEL);
-	if (!rec) {
-		zone_dispatch_cancel(c, wal_phys, 1);
-		return -ENOMEM;
+	wal->magic = cpu_to_le32(WAL_PAGE_MAGIC);
+	wal->version = cpu_to_le16(WAL_PAGE_VERSION);
+	wal->count = cpu_to_le16(count);
+	for (i = 0; i < count; i++) {
+		wal->records[i].type = cpu_to_le32(WAL_REC_GC_PUT);
+		wal->records[i].gc_put.lba = cpu_to_le64(entries[i]->lba);
+		wal->records[i].gc_put.phys = cpu_to_le64(data_phys + (sector_t)i * BLOCK_SECTORS);
+		wal->records[i].gc_put.expected_old = cpu_to_le64(entries[i]->phys);
 	}
-	rec->type = cpu_to_le32(WAL_REC_GC_PUT);
-	rec->gc_put.lba = cpu_to_le64(lba);
-	rec->gc_put.phys = cpu_to_le64(phys);
-	rec->gc_put.expected_old = cpu_to_le64(expected_old);
-	ret = gc_sync_gate_write(c, wal_phys, rec, true);
-	kfree(rec);
+	wal->crc32 = cpu_to_le32(crc32(~0U, wal, PAGE_SIZE));
+	ret = wal_page_append_sync(c, wal_phys, wal, WAL_PAGE_SECTORS);
+	if (ret) {
+		DMERR("gc: batch WAL append failed (%u entries, err=%d)", count, ret);
+		zone_quarantine(c, zone_of(c->zp, wal_phys), ZONE_TAG_WAL,
+				BLK_STS_IOERR);
+		goto out;
+	}
+
+	spin_lock_irq(&c->lock);
+	for (i = 0; i < count; i++) {
+		sector_t old_phys = entries[i]->phys;
+		sector_t new_phys = data_phys + (sector_t)i * BLOCK_SECTORS;
+		int put = mapping_put_if_match(c, entries[i]->lba, old_phys, new_phys);
+
+		if (put == 0)
+			entries[i]->phys = new_phys;
+		else if (put == 1 && !mapping_get(c, entries[i]->lba, &entries[i]->phys))
+			ret = -EAGAIN;
+		if (ret)
+			break;
+	}
+	spin_unlock_irq(&c->lock);
+out:
+	if (wal)
+		free_page((unsigned long)wal);
+	kvfree(data);
 	return ret;
-}
-
-/* lba의 4KB를 old_phys에서 읽어 GC_DATA zone에 새로 쓰고 mapping_put으로 갱신 (compaction과 달리 진짜 사용자 데이터를 옮김).
- * zone 쓰기는 dispatch_wait_turn 게이트를 거친다.
- * [반환값] 0 성공, 음수면 라운드 중단(victim reset 안 함 — 안전 후퇴). process context 전용. */
-static int gc_relocate_one(struct zns_base_c *c, u64 lba, sector_t old_phys,
-			   sector_t *current_phys_out)
-{
-	void *buf;
-	struct bio *bio;
-	sector_t new_phys;
-	int new_zone = -1;
-	int ret;
-
-	buf = kzalloc(BLOCK_SECTORS * 512, GFP_KERNEL);
-	if (!buf) {
-		DMERR("gc: out of memory relocating lba=%llu, aborting this round",
-		      (unsigned long long)lba);
-		return -ENOMEM;
-	}
-
-	bio = bio_alloc(GFP_KERNEL, 1);
-	bio_set_dev(bio, c->dev->bdev);
-	bio->bi_iter.bi_sector = old_phys;
-	bio->bi_opf = REQ_OP_READ;
-	bio_add_page(bio, virt_to_page(buf), BLOCK_SECTORS * 512, 0);
-	ret = submit_bio_wait(bio);
-	bio_put(bio);
-	if (ret) {
-		DMERR("gc: failed to read lba=%llu at phys=%llu (%d), aborting this round",
-		      (unsigned long long)lba, (unsigned long long)old_phys, ret);
-		kfree(buf);
-		return ret;
-	}
-
-	spin_lock_irq(&c->lock);
-	ret = zone_pool_alloc(c->zp, ZONE_TAG_GC_DATA, BLOCK_SECTORS, &new_phys, &new_zone, true);
-	spin_unlock_irq(&c->lock);
-	if (ret) {
-		DMERR("gc: zone_pool_alloc failed (%d) relocating lba=%llu, aborting this round",
-		      ret, (unsigned long long)lba);
-		kfree(buf);
-		return ret;
-	}
-
-	if (new_zone >= 0) {
-		struct zone_header *zhdr = kzalloc(512, GFP_KERNEL);
-
-		if (!zhdr) {
-			DMERR("gc: out of memory writing zone header (zone %d), aborting relocation", new_zone);
-			zone_dispatch_cancel(c, (sector_t)new_zone * c->zp->zone_sectors, 1);
-			zone_dispatch_cancel(c, new_phys, BLOCK_SECTORS);
-			zone_quarantine(c, new_zone, ZONE_TAG_GC_DATA, BLK_STS_RESOURCE);
-			kfree(buf);
-			return -ENOMEM;
-		} else {
-			struct bio *hbio = bio_alloc(GFP_KERNEL, 1);
-
-			if (!hbio) {
-				kfree(zhdr);
-				zone_dispatch_cancel(c, (sector_t)new_zone * c->zp->zone_sectors, 1);
-				zone_dispatch_cancel(c, new_phys, BLOCK_SECTORS);
-				zone_quarantine(c, new_zone, ZONE_TAG_GC_DATA, BLK_STS_RESOURCE);
-				kfree(buf);
-				return -ENOMEM;
-			}
-
-			zhdr->magic = cpu_to_le32(ZONE_HEADER_MAGIC);
-			zhdr->tag = cpu_to_le32(ZONE_TAG_GC_DATA);
-			bio_set_dev(hbio, c->dev->bdev);
-			hbio->bi_iter.bi_sector = (sector_t)new_zone * c->zp->zone_sectors;
-			hbio->bi_opf = REQ_OP_WRITE;
-			bio_add_page(hbio, virt_to_page(zhdr), 512, offset_in_page(zhdr));
-			zone_dispatch_wait_turn(c, hbio->bi_iter.bi_sector, 1);
-			ret = submit_bio_wait(hbio);
-			bio_put(hbio);
-			kfree(zhdr);
-			if (ret) {
-				DMERR("gc: zone header write failed (zone %d), aborting relocation", new_zone);
-				zone_dispatch_cancel(c, new_phys, BLOCK_SECTORS);
-				zone_quarantine(c, new_zone, ZONE_TAG_GC_DATA, BLK_STS_IOERR);
-				kfree(buf);
-				return ret;
-			}
-			zone_append_header_done(c, new_zone, 0);
-		}
-	}
-
-	bio = bio_alloc(GFP_KERNEL, 1);
-	bio_set_dev(bio, c->dev->bdev);
-	bio->bi_iter.bi_sector = new_phys;
-	bio->bi_opf = REQ_OP_WRITE;
-	bio_add_page(bio, virt_to_page(buf), BLOCK_SECTORS * 512, 0);
-	zone_dispatch_wait_turn(c, new_phys, BLOCK_SECTORS);
-	ret = submit_bio_wait(bio);
-	bio_put(bio);
-	kfree(buf);
-	if (ret) {
-		DMERR("gc: failed to write relocated data for lba=%llu (%d), aborting this round",
-		      (unsigned long long)lba, ret);
-		return ret;
-	}
-
-	/* 데이터가 durable해진 뒤 WAL에 lba->new_phys를 남겨야 크래시 후 replay가 옛 위치(곧 reset될 victim) 대신 새 위치로 복원한다.
-	 * 이게 없으면 재배치 매핑이 memtable에만 있어(SSTable flush 전) 크래시 시 유실된다. */
-	ret = gc_wal_log_put(c, lba, new_phys, old_phys);
-	if (ret) {
-		DMERR("gc: failed to WAL-log relocation for lba=%llu (%d), aborting this round",
-		      (unsigned long long)lba, ret);
-		return ret;
-	}
-
-	spin_lock_irq(&c->lock);
-	ret = mapping_put_if_match(c, lba, old_phys, new_phys);
-	if (ret == 0)
-		*current_phys_out = new_phys;
-	else if (ret == 1 && !mapping_get(c, lba, current_phys_out))
-		ret = -EAGAIN;
-	spin_unlock_irq(&c->lock);
-	if (ret < 0) {
-		DMERR("gc: failed to update mapping for lba=%llu after relocation (%d), aborting this round",
-		      (unsigned long long)lba, ret);
-		return ret;
-	}
-	return 0;  /* ret==1: 이주 중 사용자가 덮어써 스킵 — 그 블록은 이미 무효라 GC엔 정상 */
 }
 
 /* GC 본체 — victim 하나 회수. worker의 첫 victim에서 전체 latest-map을
@@ -2890,6 +2856,8 @@ static enum gc_reclaim_result gc_reclaim_one_victim(struct zns_base_c *c,
 	struct skiplist_node *node;
 	unsigned int i;
 	unsigned int nr_relocated = 0;
+	struct gc_live_entry **reloc_batch = NULL;
+	unsigned int reloc_count = 0;
 	u64 live_sectors = 0;
 	u64 used_sectors;
 	bool ok = true;
@@ -3053,10 +3021,12 @@ refresh_current:
 	}
 	used_sectors = READ_ONCE(c->zp->wp[victim]);
 	used_sectors = used_sectors > 0 ? used_sectors - 1 : 0;
-	/* 이주 data와 각 PUT의 1-sector WAL까지 감안해 물리 공간
+	/* 이주 data와 batch WAL page까지 감안해 물리 공간
 	 * 순이익이 없는 fallback victim은 건드리지 않는다. 안 그러면
 	 * 100% live zone을 GC_DATA로 복사하며 reserve만 소모할 수 있다. */
-	if (live_sectors + DIV_ROUND_UP_ULL(live_sectors, BLOCK_SECTORS) >=
+	if (live_sectors +
+	    DIV_ROUND_UP_ULL(live_sectors / BLOCK_SECTORS,
+			     WAL_PAGE_MAX_RECORDS) * WAL_PAGE_SECTORS >=
 	    used_sectors) {
 		DMINFO("gc: skipping victim %u: no positive reclaim gain (used=%llu, live=%llu)",
 		       victim, (unsigned long long)used_sectors,
@@ -3072,21 +3042,30 @@ refresh_current:
 	       (unsigned long long)(live_sectors / BLOCK_SECTORS),
 	       free_at_start);
 	relocation_started = jiffies;
+	reloc_batch = kcalloc(WAL_PAGE_MAX_RECORDS, sizeof(*reloc_batch), GFP_KERNEL);
+	if (!reloc_batch) {
+		ok = false;
+		goto out_free_snapshot;
+	}
 
-	/* latest phys가 아직 victim 안인 LBA만 live. 이주 직전/직후의
-	 * 사용자 overwrite는 gc_relocate_one의 mapping_put_if_match가 마지막으로 걸러낸다. */
+	/* latest phys가 아직 victim 안인 LBA만 live. 이주 중 사용자
+	 * overwrite는 batch 마지막의 mapping_put_if_match가 걸러낸다. */
 	for (i = 0; i < live_map.capacity; i++) {
 		struct gc_live_entry *entry = &live_map.entries[i];
 
 		if (!entry->used || entry->phys < vstart || entry->phys >= vend)
 			continue;
-		if (gc_relocate_one(c, entry->lba, entry->phys, &entry->phys)) {
+		reloc_batch[reloc_count++] = entry;
+		if (reloc_count < WAL_PAGE_MAX_RECORDS)
+			continue;
+		if (gc_relocate_batch(c, reloc_batch, reloc_count)) {
 			DMERR("gc: relocation failed, aborting this round without resetting victim zone %u", victim);
 			ok = false;
 			break;
 		}
-		nr_relocated++;
-		if (!(nr_relocated & 0x7fff)) {
+		nr_relocated += reloc_count;
+		reloc_count = 0;
+		if (nr_relocated / 32768 != (nr_relocated - WAL_PAGE_MAX_RECORDS) / 32768) {
 			u64 elapsed_ms = jiffies_to_msecs(jiffies - relocation_started);
 
 			DMINFO("gc: victim %u progress relocated=%u/%llu (%llums, %llu entries/s)",
@@ -3097,6 +3076,16 @@ refresh_current:
 				div64_u64((u64)nr_relocated * 1000, elapsed_ms) : 0));
 		}
 	}
+	if (ok && reloc_count) {
+		if (gc_relocate_batch(c, reloc_batch, reloc_count)) {
+			DMERR("gc: final relocation batch failed, preserving victim zone %u", victim);
+			ok = false;
+		} else {
+			nr_relocated += reloc_count;
+		}
+	}
+	kfree(reloc_batch);
+	reloc_batch = NULL;
 	if (!ok)
 		goto out_free_snapshot;
 
@@ -3117,6 +3106,7 @@ refresh_current:
 	}
 
 out_free_snapshot:
+	kfree(reloc_batch);
 	if (!cycle->built)
 		kvfree(live_map.entries);
 	if (!cycle->built && snapshot) {
@@ -3192,8 +3182,9 @@ static void gc_work_fn(struct work_struct *work)
 		       ckpt_inflight, free_at_start);
 		return;
 	}
-	DMINFO("gc: worker started (free_zones=%u, low_watermark=%u)",
-	       free_at_start, gc_low_watermark);
+	DMINFO("gc: worker started (free_zones=%u, start=%u, stop=%u, reserve=%u)",
+	       free_at_start, gc_low_watermark, gc_stop_watermark(),
+	       gc_reserved_zones);
 
 	cycle.excluded = kvcalloc(c->zp->nr_zones, sizeof(*cycle.excluded), GFP_KERNEL);
 	if (!cycle.excluded) {
@@ -3212,7 +3203,7 @@ static void gc_work_fn(struct work_struct *work)
 			continue;
 		reclaimed++;
 		spin_lock_irq(&c->lock);
-		still_low = gc_count_free_zones(c->zp) <= gc_low_watermark;
+		still_low = gc_count_free_zones(c->zp) < gc_stop_watermark();
 		spin_unlock_irq(&c->lock);
 		if (!still_low)
 			break;
@@ -3326,6 +3317,10 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	c->zp->zone_sectors = bdev_zone_sectors(c->dev->bdev);
+	if (gc_low_watermark <= gc_reserved_zones) {
+		ti->error = "GC low watermark must be greater than the GC reserve";
+		return -EINVAL;
+	}
 	if (!wal_batch_max_records || wal_batch_max_records > WAL_PAGE_MAX_RECORDS) {
 		ti->error = "wal_batch_max_records is outside the WAL page capacity";
 		return -EINVAL;
