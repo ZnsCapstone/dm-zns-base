@@ -685,10 +685,13 @@ static int sstable_io_sync(struct zns_base_c *c, unsigned int op,
 	sector_t cur = phys;
 
 	while (done < total_bytes) {
-		size_t chunk = min(total_bytes - done, (size_t)BIO_MAX_VECS * PAGE_SIZE);
-		unsigned int nr_pages = DIV_ROUND_UP(chunk, PAGE_SIZE);
+		size_t first_off = offset_in_page((char *)buf + done);
+		size_t chunk = min(total_bytes - done,
+				   (size_t)BIO_MAX_VECS * PAGE_SIZE - first_off);
+		unsigned int nr_pages = DIV_ROUND_UP(first_off + chunk, PAGE_SIZE);
 		struct bio *bio;
 		size_t rem = chunk;
+		size_t page_done = 0;
 		unsigned int p;
 		int ret;
 
@@ -699,10 +702,17 @@ static int sstable_io_sync(struct zns_base_c *c, unsigned int op,
 		bio->bi_iter.bi_sector = cur;
 		bio->bi_opf = op;
 		for (p = 0; p < nr_pages; p++) {
-			size_t len = rem < PAGE_SIZE ? rem : PAGE_SIZE;
+			void *addr = (char *)buf + done + page_done;
+			size_t page_off = offset_in_page(addr);
+			size_t len = min(rem, PAGE_SIZE - page_off);
 
-			bio_add_page(bio, buf_page(buf, done + (size_t)p * PAGE_SIZE), len, 0);
+			if (bio_add_page(bio, buf_page(buf, done + page_done),
+					 len, page_off) != len) {
+				bio_put(bio);
+				return -EIO;
+			}
 			rem -= len;
+			page_done += len;
 		}
 		ret = submit_bio_wait(bio);
 		bio_put(bio);
