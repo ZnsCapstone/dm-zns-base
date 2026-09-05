@@ -3140,14 +3140,20 @@ static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag
 
 	spin_lock_irq(&c->lock);
 	ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out, false);
-	if (!ret)
+	if (!ret) {
 		c->gc_no_progress = 0;
+	} else if (ret == -ENOSPC &&
+		   (c->gc_active || c->gc_no_progress < 3)) {
+		/* zone_pool_alloc() 자체가 -ENOSPC를 반환하므로, GC가 아직
+		 * 공간을 만들고 있거나 무진전 판정이 확정되기 전에는 반드시
+		 * transient 상태로 바꿔야 한다. 이전 코드는 ret를 그대로 둬
+		 * gc_active=true인 동안에도 아래에서 영구 ENOSPC를 반환했다. */
+		ret = -EAGAIN;
+	}
 	/* 이전 무진전 횟수가 임계치를 넘었더라도 지금 GC가 victim을 이주
 	 * 중이면 결과가 날 때까지 requeue해야 한다. 여기서 ENOSPC를 내면
 	 * 느린 대형-zone GC가 잠시 뒤 성공해도 파일시스템은 먼저 I/O error를
 	 * 받아 손상된다. */
-	else if (c->gc_no_progress >= 3 && !c->gc_active)
-		ret = -ENOSPC;
 	spin_unlock_irq(&c->lock);
 
 	if (ret) {
