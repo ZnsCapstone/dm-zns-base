@@ -202,10 +202,9 @@ echo "[*] dmsetup create $DM_NAME"
 echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" ||
 	fail "dmsetup create failed"
 
-# Cross the first data-zone boundary and continue through the next complete
-# WAL page.  Merely writing zone_blocks+1 leaves up to 125 mappings in the
-# partial in-memory WAL page; stage 3 deliberately completes the enlarged
-# MemTable after this rollover write.
+# Cross the first data-zone boundary. Stage 3 uses an explicit fsync boundary
+# after completing the enlarged MemTable, so WAL group size does not affect
+# when its mappings become durable.
 
 echo
 echo "=== [1/6] underlying zone geometry ==="
@@ -247,10 +246,9 @@ cmp "$TMP_DIR/overwrite.bin" "$TMP_DIR/overwrite.read" ||
 cmp "$TMP_DIR/neighbor.expected" "$TMP_DIR/neighbor.read" ||
 	fail "overwrite corrupted neighboring logical block"
 
-# Fill the deliberately enlarged first MemTable and cross it once.  These 125
-# records plus the preceding block-0 overwrite make a complete 126-record WAL
-# page, so persistence does not depend on userspace fsync behavior.  The next
-# victim-overwrite generation remains below the new MemTable's capacity.
+# Fill the deliberately enlarged first MemTable and cross it once. The final
+# fsync durably publishes the partial WAL group before persistence is checked.
+# The next victim-overwrite generation remains below the MemTable's capacity.
 dd if=/dev/zero bs="$BLOCK_SIZE" count="$memtable_flush_blocks" status=none |
 	tr '\000' '\307' > "$TMP_DIR/memtable-flush.bin"
 dd if="$TMP_DIR/memtable-flush.bin" of="$DM_DEV" bs="$BLOCK_SIZE" \

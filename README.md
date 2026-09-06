@@ -25,7 +25,7 @@ flowchart TB
         IOWQ["foreground io_work\nread/write 처리"]
         DATAWQ["data completion work\n순차 제출 완료 처리"]
         MT["MemTable\nRB-tree · RAM"]
-        WAL["WAL\n4 KiB FUA append"]
+        WAL["WAL\nmulti-page durability append"]
         SST["persistent SSTable\nLBA 정렬 · metadata zone"]
         MAN["Manifest A/B\nSSTable catalog"]
         ZONE["zone allocator + reverse map\nGC worker"]
@@ -150,23 +150,25 @@ sequenceDiagram
 
     FS->>IO: write bio
     IO->>IO: 4 KiB mapping/PBA 예약
-    IO->>DATA: 최대 128 KiB lower data write
+    IO->>DATA: device/zone/bio 한도까지 lower data write 병합
     DATA-->>IO: 전용 completion worker로 성공 전달
     IO->>WAL: PUT record를 pending WAL page에 stage
     IO-->>FS: 일반 write bio_endio (writeback)
-    WAL->>WAL: page-full 또는 FLUSH/FUA 시 4 KiB FUA append
+    WAL->>WAL: group-full 또는 FLUSH/FUA 시 다중 page durability append
     WAL->>MAP: durable mapping/reverse map publish
 ```
 
 현재 보장하는 순서는 다음과 같습니다.
 
 1. 하나의 ACTIVE DATA zone에서 PBA와 reverse-map `pending` slot을 순서대로 예약합니다.
-2. 연속되고 정렬된 요청은 하위 디바이스 한도 내에서 최대 128 KiB로 묶어 기록합니다.
-   zone을 넘는 요청은 경계에서 나누며, 다음 extent는 이전 extent가 완료된 뒤 제출합니다.
+2. 연속되고 정렬된 요청은 `queue_max_sectors`, bio vector 수, active zone 잔여 공간
+   중 가장 작은 한도까지 묶어 기록합니다. zone을 넘는 요청은 경계에서 나누며,
+   다음 extent는 이전 extent가 완료된 뒤 제출합니다.
 3. 일반 write는 WAL PUT을 in-memory pending page에 stage한 뒤 완료합니다. 후속 read는
    pending WAL overlay에서 이 최신 PBA를 찾습니다.
-4. page-full, `FLUSH`, `FUA`에서 WAL page를 FUA로 기록한 뒤 `LBA -> new PBA` 매핑,
-   새 slot valid, 이전 PBA invalid를 durable하게 publish합니다.
+4. 기본 16개 WAL page가 차거나 `FLUSH`, `FUA`가 들어오면 DATA flush 한 번과 WAL
+   durability group의 마지막 FUA로 전체 group을 영속화합니다. 이후 `LBA -> new PBA`
+   매핑, 새 slot valid, 이전 PBA invalid를 순서대로 publish합니다.
 5. flush/FUA 경계에서 WAL 실패 시 해당 durability 요청은 오류로 끝납니다. 일반 write의
    마지막 아직-flush되지 않은 batch는 전원 손실 시 유실될 수 있습니다.
 
@@ -174,9 +176,11 @@ sequenceDiagram
 read-modify-write 방식입니다. 읽는 동안 대상 zone의 `inflight_reads`를 pin하여 GC가
 해당 zone을 reset하지 못하게 합니다.
 
-> WAL은 최대 126개의 32 B PUT record를 하나의 4 KiB page에 묶어 FUA로 기록합니다.
-> 일반 write는 timer 없이 pending WAL overlay까지 stage된 시점에 완료됩니다. page가
-> 가득 차거나 `FLUSH`/`FUA`/GC가 durability 경계를 요구할 때만 즉시 기록합니다.
+> WAL disk page는 최대 126개의 32 B PUT record를 담으며 페이지마다 독립 CRC를
+> 유지합니다. 기본 `wal_group_pages=16`은 이 페이지들을 최대 16장까지 모아 하나의
+> durability group으로 기록합니다. 일반 write는 timer 없이 pending WAL overlay까지
+> stage된 시점에 완료되며, group이 가득 차거나 `FLUSH`/`FUA`/GC가 durability 경계를
+> 요구할 때 즉시 기록합니다. module parameter를 바꿔도 on-disk 포맷은 동일합니다.
 > 따라서 flush/FUA가 성공한 write는 복구되며, 아직 flush되지 않은 일반 write batch는
 > writeback cache와 같이 전원 손실 시 유실될 수 있습니다.
 
@@ -290,9 +294,10 @@ worker가 한 번에 하나의 extent만 완료 순서대로 제출합니다. �
 
 - DATA zone별 `ACTIVE/FREE/FULL/GC_DEST/GC_VICTIM` 개수
 - GC 실행/zone reset/moved block 수와 최근 오류
-- 현재 WAL zone, generation, 사용 block, staged record, WAL 오류
+- 현재 WAL zone, generation, 사용 block, staged record, WAL 오류와 group commit 시간
 - persistent SSTable 수, checkpoint sequence/generation, Manifest/SSTable active zone
-- DATA inflight/queue block 수, MemTable 예약 수, compaction 횟수와 소요 시간
+- DATA inflight/queue block 수와 동적 최대 batch block 수
+- MemTable 예약 수, SSTable flush block/bio 수와 시간, compaction 횟수와 소요 시간
 
 기본 실행:
 
@@ -341,8 +346,8 @@ sudo -E bash scripts/test-m3.sh
 
 ## 현재 한계와 다음 단계
 
-- WAL group commit은 page boundary와 explicit durability boundary만으로 batch를 만든다.
-  timer 기반 추가 지연은 없지만, 일반 write는 writeback semantics를 사용합니다.
+- WAL group commit은 기본 16-page boundary와 explicit durability boundary로 batch를
+  만듭니다. timer 기반 추가 지연은 없으며 일반 write는 writeback semantics를 사용합니다.
 - on-disk SSTable lookup은 binary search지만 block cache나 bloom filter가 없어 cold read의
   metadata I/O 비용이 남습니다.
 - SSTable compaction은 기본 16개 live table을 현재 packed zone 전체 단위로 병합합니다.

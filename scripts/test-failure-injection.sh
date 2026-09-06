@@ -65,7 +65,10 @@ cleanup() {
 trap cleanup EXIT
 
 load_target() {
-	insmod "$KO_PATH" memtable_capacity_entries="$MEMTABLE_ENTRIES" ||
+	# Keep one-page groups here so the bounded CRC/failpoint cases trigger at
+	# the historical 126-record boundary. Production defaults to 16 pages.
+	insmod "$KO_PATH" memtable_capacity_entries="$MEMTABLE_ENTRIES" \
+		wal_group_pages=1 ||
 		fail "insmod failed"
 	echo "0 $SECTORS zns-base $UNDERLYING" | dmsetup create "$DM_NAME" ||
 		fail "dmsetup create failed"

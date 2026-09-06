@@ -276,6 +276,12 @@ printf '%s\n' "$status" | grep -q 'wal_zone=' ||
 	fail "status is missing WAL state"
 printf '%s\n' "$status" | grep -q 'checkpoint_generation=' ||
 	fail "status is missing checkpoint state"
+printf '%s\n' "$status" | grep -q 'sstable_flush_count=' ||
+	fail "status is missing SSTable batch-flush counters"
+printf '%s\n' "$status" | grep -q 'wal_group_commit_count=' ||
+	fail "status is missing WAL group-commit counters"
+printf '%s\n' "$status" | grep -q 'data_max_batch_blocks=' ||
+	fail "status is missing the dynamic DATA batch limit"
 sstable_count=$(printf '%s\n' "$status" | sed -n 's/.*persistent_sstables=\([0-9][0-9]*\).*/\1/p')
 [ -n "$sstable_count" ] || fail "status is missing persistent SSTable count"
 [ "$sstable_count" -lt 4 ] || fail "SSTable compaction did not reduce the table count: $sstable_count"
