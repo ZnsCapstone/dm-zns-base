@@ -3271,26 +3271,26 @@ static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag
 	}
 	if (!ret) {
 		c->gc_no_progress = 0;
-	} else if (ret == -ENOSPC &&
-		   (c->gc_active || c->gc_no_progress < 3)) {
+	} else if (ret == -ENOSPC && c->gc_no_progress < 3) {
 		/* zone_pool_alloc() 자체가 -ENOSPC를 반환하므로, GC가 아직
-		 * 공간을 만들고 있거나 무진전 판정이 확정되기 전에는 반드시
-		 * transient 상태로 바꿔야 한다. 이전 코드는 ret를 그대로 둬
-		 * gc_active=true인 동안에도 아래에서 영구 ENOSPC를 반환했다. */
+		 * 무진전 판정을 충분히 반복하기 전에는 transient 상태로 바꾼다.
+		 * gc_active만으로 EAGAIN을 강제하면 회수 불가능한 동일 상태에서
+		 * pending worker가 GC를 계속 재큐잉해 영구 D-state에 빠진다. 새
+		 * allocation이 성공하면 gc_no_progress가 0으로 초기화되므로, 3회
+		 * 연속 무진전 뒤에는 진행 중인 worker가 있더라도 ENOSPC가 맞다. */
 		ret = -EAGAIN;
 	}
-	/* 이전 무진전 횟수가 임계치를 넘었더라도 지금 GC가 victim을 이주
-	 * 중이면 결과가 날 때까지 requeue해야 한다. 여기서 ENOSPC를 내면
-	 * 느린 대형-zone GC가 잠시 뒤 성공해도 파일시스템은 먼저 I/O error를
-	 * 받아 손상된다. */
 	spin_unlock_irq(&c->lock);
 	if (borrowed_reserve)
 		DMINFO("foreground borrowed one GC reserve zone to seed invalidation (new_zone=%d, free_before=%u)",
 		       new_zone_out ? *new_zone_out : -1, free_count);
 
 	if (ret) {
-		if (ret == -ENOSPC)
+		if (ret == -ENOSPC) {
+			DMERR_LIMIT("foreground allocation exhausted after %u GC cycles without progress",
+				    READ_ONCE(c->gc_no_progress));
 			return ret;
+		}
 		queue_work(zns_gc_wq, &c->gc_work);
 		return -EAGAIN;
 	}
