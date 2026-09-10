@@ -14,7 +14,8 @@
 #              8  → test-wal-reclaim.sh (WAL zone 회수 + 회수 후 크래시 복구)
 #              9  → test-gc-crash.sh (GC 재배치의 크래시 안전성)
 #             10  → test-wal-retry.sh (WAL 공간 부족 재시도 + 데이터 무결성)
-#   (no argument) → runs 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 in order
+#             11  → test-discard.sh (discard tombstone + WAL replay)
+#   (no argument) → runs 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 in order
 #
 # Milestone 0(test-basic.sh)은 no-arg 실행에서 제외 — M1부터 target이 위로
 # conventional(non-zoned) 인터페이스를 내주기로 하면서 .report_zones/
@@ -35,8 +36,8 @@ UNDERLYING=${UNDERLYING:-/dev/nullb0}
 # ── argument check ────────────────────────────────────────────────────────────
 if [ $# -gt 1 ]; then
     echo "Usage: sudo bash scripts/test.sh [<milestone>]" >&2
-    echo "  milestone: 0 (M0), 1 (M1), 2 (M2), 3 (crash-recovery), 4 (checkpoint), 5 (sstable-read), 6 (compaction), 7 (gc), 8 (wal-reclaim), 9 (gc-crash), 10 (wal-retry)" >&2
-    echo "  omit milestone to run 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 in order" >&2
+    echo "  milestone: 0 (M0), 1 (M1), 2 (M2), 3 (crash-recovery), 4 (checkpoint), 5 (sstable-read), 6 (compaction), 7 (gc), 8 (wal-reclaim), 9 (gc-crash), 10 (wal-retry), 11 (discard)" >&2
+    echo "  omit milestone to run 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 in order" >&2
     exit 1
 fi
 
@@ -53,18 +54,19 @@ script_for() {
         8) echo "$SCRIPT_DIR/test-wal-reclaim.sh" ;;
         9) echo "$SCRIPT_DIR/test-gc-crash.sh" ;;
         10) echo "$SCRIPT_DIR/test-wal-retry.sh" ;;
+        11) echo "$SCRIPT_DIR/test-discard.sh" ;;
         *) return 1 ;;
     esac
 }
 
 if [ $# -eq 1 ]; then
     script_for "$1" >/dev/null || {
-        echo "[!] Unknown milestone '$1'. Supported: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10" >&2
+        echo "[!] Unknown milestone '$1'. Supported: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11" >&2
         exit 1
     }
     MILESTONES=("$1")
 else
-    MILESTONES=(1 2 3 4 5 6 7 8 9 10)
+    MILESTONES=(1 2 3 4 5 6 7 8 9 10 11)
 fi
 
 # ── ensure nullb0 is up ───────────────────────────────────────────────────────
