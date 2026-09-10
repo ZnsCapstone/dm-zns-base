@@ -269,6 +269,9 @@ struct sstable_info {
 #define WAL_REC_PUT        1
 #define WAL_REC_CHECKPOINT 2
 #define WAL_REC_GC_PUT     3
+#define WAL_REC_DELETE     4
+#define WAL_REC_DELETE_RANGE 5
+#define MAPPING_TOMBSTONE  U64_MAX
 #define WAL_PAGE_MAGIC     0x57414C50U /* "WALP" */
 #define WAL_PAGE_VERSION   1
 #define WAL_PAGE_SECTORS   (PAGE_SIZE / 512)
@@ -329,6 +332,8 @@ struct zns_io_ctx {
 	struct bio *orig_bio;
 	u64 lba;
 	sector_t phys;
+	bool is_discard;
+	u64 discard_blocks;
 	sector_t reserved_phys;      /* capacity 예약용; append 완료 전에는 실제 주소가 아님 */
 	sector_t reserved_nr;        /* append 예약 완료 시 dispatch_wp 회계 전진용 */
 	sector_t orig_sector;
@@ -778,7 +783,7 @@ static int mapping_put(struct zns_base_c *c, u64 lba, u64 phys)
 
 	if (ret < 0)
 		return ret;
-	if (ret == 1)
+	if (ret == 1 && old_phys != MAPPING_TOMBSTONE)
 		/* 옛 값이 SSTable에 있는(=upsert가 삽입인) 경우는 여기서 invalid_count를
        	 * 못 올린다(찾으려면 SSTable I/O 필요, atomic context라 불가). 그 stale
          * entry는 compaction이 세대 병합 시 반영한다. */
@@ -959,7 +964,29 @@ static void wal_replay_cb(void *fn_ctx, struct wal_record *rec, sector_t sector)
 
 		if (skiplist_upsert(c->memtable, le64_to_cpu(rec->put.lba),
 				    le64_to_cpu(rec->put.phys), &old_phys) == 1)
+			if (old_phys != MAPPING_TOMBSTONE)
+				c->zp->invalid_count[zone_of(c->zp, old_phys)]++;
+	} else if (le32_to_cpu(rec->type) == WAL_REC_DELETE) {
+		u64 old_phys;
+
+		if (skiplist_upsert(c->memtable, le64_to_cpu(rec->put.lba),
+				    MAPPING_TOMBSTONE, &old_phys) == 1 &&
+		    old_phys != MAPPING_TOMBSTONE)
 			c->zp->invalid_count[zone_of(c->zp, old_phys)]++;
+	} else if (le32_to_cpu(rec->type) == WAL_REC_DELETE_RANGE) {
+		u64 lba = le64_to_cpu(rec->put.lba);
+		u64 blocks = le64_to_cpu(rec->put.phys);
+		u64 i;
+
+		for (i = 0; i < blocks; i++) {
+			u64 old_phys;
+
+			if (skiplist_upsert(c->memtable,
+					    lba + i * BLOCK_SECTORS,
+					    MAPPING_TOMBSTONE, &old_phys) == 1 &&
+			    old_phys != MAPPING_TOMBSTONE)
+				c->zp->invalid_count[zone_of(c->zp, old_phys)]++;
+		}
 	} else if (le32_to_cpu(rec->type) == WAL_REC_GC_PUT) {
 		u64 lba = le64_to_cpu(rec->gc_put.lba);
 		u64 phys = le64_to_cpu(rec->gc_put.phys);
@@ -1374,10 +1401,14 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 	u64 flushed_seq = 0;
 	u64 flushed_split_gen = 0;
 	sector_t flushed_split_off = 0;
+	bool is_discard = ctx->is_discard;
+	u64 discard_blocks = ctx->discard_blocks;
+	u64 discard_i;
 	int ret;
 
 	if (wal_status) {
-		zone_dispatch_cancel(c, reserved_phys, reserved_nr);
+		if (reserved_nr)
+			zone_dispatch_cancel(c, reserved_phys, reserved_nr);
 		kfree(ctx);
 		orig->bi_status = wal_status;
 		foreground_write_done(c);
@@ -1386,7 +1417,17 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 	}
 
 	spin_lock_irq(&c->lock);
-	ret = mapping_put(c, lba, phys);
+	ret = 0;
+	if (is_discard) {
+		for (discard_i = 0; discard_i < discard_blocks; discard_i++) {
+			ret = mapping_put(c, lba + discard_i * BLOCK_SECTORS,
+					  MAPPING_TOMBSTONE);
+			if (ret)
+				break;
+		}
+	} else {
+		ret = mapping_put(c, lba, phys);
+	}
 	if (!ret && allow_flush && !c->gc_active &&
 	    c->memtable->count >= flush_threshold) {
 		/* memtable 교체는 이 락 안에서 — skiplist_init도 GFP_ATOMIC이라 atomic 컨텍스트에서 불러도 안전하다. */
@@ -1424,7 +1465,8 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 	/* Zone Append는 일반 dispatch gate를 통과하지 않으므로 완료 시점에
 	 * 예약 순서 회계를 직접 전진시킨다. data는 mapping_put 뒤에 완료
 	 * 처리해야 dispatch_wp==wp가 곧 "모든 매핑 공개 완료"를 뜻한다. */
-	zone_dispatch_cancel(c, reserved_phys, reserved_nr);
+	if (reserved_nr)
+		zone_dispatch_cancel(c, reserved_phys, reserved_nr);
 	kfree(ctx);
 
 	if (ret) {
@@ -1541,9 +1583,9 @@ static void wal_batch_work_fn(struct work_struct *work)
 		struct wal_record *rec = wal_sectors == 1 ?
 			(struct wal_record *)page : &page->records[count];
 
-		rec->type = cpu_to_le32(WAL_REC_PUT);
+		rec->type = cpu_to_le32(ctx->is_discard ? WAL_REC_DELETE_RANGE : WAL_REC_PUT);
 		rec->put.lba = cpu_to_le64(ctx->lba);
-		rec->put.phys = cpu_to_le64(ctx->phys);
+		rec->put.phys = cpu_to_le64(ctx->is_discard ? ctx->discard_blocks : ctx->phys);
 		count++;
 	}
 	if (wal_sectors > 1) {
@@ -2049,6 +2091,12 @@ static void sstable_read_finish(struct sstable_read_ctx *rctx)
 		spin_lock_irq(&c->lock);
 		if (mapping_get(c, rctx->lba, &cur))
 			best_phys = cur;
+		if (best_phys == MAPPING_TOMBSTONE) {
+			spin_unlock_irq(&c->lock);
+			zero_fill_bio(orig);
+			bio_endio(orig);
+			goto out_unpin;
+		}
 		pin->zone = zone_of(c->zp, best_phys);
 		zone_read_get(c->zp, pin->zone);
 		spin_unlock_irq(&c->lock);
@@ -2062,6 +2110,7 @@ static void sstable_read_finish(struct sstable_read_ctx *rctx)
 		zero_fill_bio(orig);
 		bio_endio(orig);
 	}
+out_unpin:
 	/* probe 동안 잡아둔 SSTable zone pin 전부 해제 */
 	for (i = 0; i < rctx->nr_candidates; i++)
 		zone_read_put(c->zp, zone_of(c->zp, rctx->candidates[i].phys));
@@ -2217,7 +2266,8 @@ static void apply_discarded_invalid_counts(struct zns_base_c *c, sector_t *disca
 		return;
 	spin_lock_irq(&c->lock);
 	for (i = 0; i < count; i++)
-		c->zp->invalid_count[zone_of(c->zp, discarded[i])]++;
+		if (discarded[i] != MAPPING_TOMBSTONE)
+			c->zp->invalid_count[zone_of(c->zp, discarded[i])]++;
 	spin_unlock_irq(&c->lock);
 }
 
@@ -3743,11 +3793,12 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	ti->private = c;
 	ti->num_flush_bios = 1;
-	ti->num_discard_bios = 0;
+	ti->num_discard_bios = 1;
+	ti->discards_supported = true;
 	/* 읽기 bio가 pin한 zone을 완료 시 unpin하려면 per-bio에 그 zone을 실어둔다(zns_read_pin). */
 	ti->per_io_data_size = sizeof(struct zns_read_pin);
-	/* 매핑 단위(4KB)보다 큰 bio는 DM core가 애초에 쪼개서 .map()에 보내게 함 */
-	ti->max_io_len = BLOCK_SECTORS;
+	/* 일반 I/O는 .map()에서 4KiB 경계로 분할하되 discard는 범위 bio로 받는다. */
+	ti->max_io_len = 0;
 
 	/* 복구로 durable 지점을 seed했으면(replay_wal_zones), 재부팅 전에 이미 온전히 flush됐던 옛 WAL zone들을 지금 한 번 회수해준다 —
 	 * 이후 쓰기가 없어도 새어나가지 않도록. */
@@ -3860,7 +3911,8 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 	offset_in_block = lba - block_lba;
 
 	/* 블록 경계를 넘으면 그 블록 끝까지만 처리, 나머지는 DM core가 재분배 */
-	if (nr > BLOCK_SECTORS - offset_in_block) {
+	if (bio_op(bio) != REQ_OP_DISCARD &&
+	    nr > BLOCK_SECTORS - offset_in_block) {
 		dm_accept_partial_bio(bio, BLOCK_SECTORS - offset_in_block);
 		nr = BLOCK_SECTORS - offset_in_block;
 	}
@@ -3907,6 +3959,32 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 				 msecs_to_jiffies(20));
 		return DM_MAPIO_SUBMITTED;
 	}
+	case REQ_OP_DISCARD: {
+		struct zns_io_ctx *ctx;
+
+		/* 정렬된 discard 범위 전체를 WAL 레코드 하나로 영속화한다. */
+		if (offset_in_block || nr % BLOCK_SECTORS) {
+			bio->bi_status = BLK_STS_NOTSUPP;
+			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
+		ctx = kzalloc(sizeof(*ctx), GFP_NOIO);
+		if (!ctx) {
+			bio->bi_status = BLK_STS_RESOURCE;
+			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
+		ctx->c = c;
+		ctx->orig_bio = bio;
+		ctx->lba = block_lba;
+		ctx->phys = MAPPING_TOMBSTONE;
+		ctx->is_discard = true;
+		ctx->discard_blocks = nr / BLOCK_SECTORS;
+		ctx->reserved_nr = 0;
+		atomic_inc(&c->foreground_writes);
+		submit_wal_async(ctx);
+		return DM_MAPIO_SUBMITTED;
+	}
 	case REQ_OP_READ: {
 		sector_t phys;
 		int found;
@@ -3916,7 +3994,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 
 		spin_lock_irq(&c->lock);
 		found = mapping_get(c, block_lba, &phys);
-		if (found) {
+		if (found && phys != MAPPING_TOMBSTONE) {
 			/* 이 데이터 zone을 pin — REMAPPED로 나간 읽기가 끝날 때까지(end_io)
 			 * GC가 이 zone을 reset하지 못하게. 반드시 조회와 같은 락 안에서 pin해야
 			 * GC의 "매핑 이동 → drain → reset" 순서와 어긋나지 않는다. */
@@ -3925,6 +4003,12 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		}
 		nr_sst = c->nr_sstables;
 		spin_unlock_irq(&c->lock);
+
+		if (found && phys == MAPPING_TOMBSTONE) {
+			zero_fill_bio(bio);
+			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
 
 		if (found) {
 			/* memtable에 있으면 8단계 전과 동일하게 즉시 처리.
@@ -4035,16 +4119,15 @@ static void zns_base_status(struct dm_target *ti, status_type_t type, unsigned i
 // 			       args->next_sector, args, nr_zones);
 // }
 
-/* DM_TARGET_ZONED_HM is just a capability flag. Without this callback the
- * underlying device's chunk_sectors and zoned attributes never propagate up
- * to the DM queue, and blkzone fails with "unable to determine zone size". */
-// static int zns_base_iterate_devices(struct dm_target *ti,
-// 				    iterate_devices_callout_fn fn, void *data)
-// {
-// 	struct zns_base_c *c = ti->private;
+/* DM core가 하위 장치의 기본 queue limit을 수집하게 한다. 상위에 노출할
+ * zoned/discard 속성은 이후 io_hints에서 이 변환 타깃에 맞게 덮어쓴다. */
+static int zns_base_iterate_devices(struct dm_target *ti,
+				    iterate_devices_callout_fn fn, void *data)
+{
+	struct zns_base_c *c = ti->private;
 
-// 	return fn(ti, c->dev, 0, ti->len, data);
-// }
+	return fn(ti, c->dev, 0, ti->len, data);
+}
 
 /* 읽기 bio 완료 훅 — .map()이 그 읽기가 걸친 zone을 pin(zone_read_get)했으면 여기서
  * put한다. 이 완료 추적 덕에 GC/compaction이 zone reset 전 진행 중인 읽기가 끝나길
@@ -4062,6 +4145,22 @@ static int zns_base_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *
 	return DM_ENDIO_DONE;
 }
 
+/* 이 타깃은 discard를 하위 ZNS 장치로 전달하지 않고 4KiB 논리 매핑의
+ * tombstone으로 직접 처리한다. 따라서 하위 장치의 discard capability와
+ * 무관하게 상위 queue에 타깃의 처리 단위와 한계를 명시해야 한다. */
+static void zns_base_io_hints(struct dm_target *ti, struct queue_limits *limits)
+{
+	(void)ti;
+	/* 하위 ZNS의 queue limit은 수집하되 상위 DM은 random-write 가능한
+	 * conventional 장치로 노출한다. */
+	limits->zoned = BLK_ZONED_NONE;
+	limits->chunk_sectors = 0;
+	limits->discard_granularity = BLOCK_SECTORS << SECTOR_SHIFT;
+	limits->discard_alignment = 0;
+	limits->max_hw_discard_sectors = UINT_MAX & ~(BLOCK_SECTORS - 1);
+	limits->max_discard_sectors = UINT_MAX & ~(BLOCK_SECTORS - 1);
+}
+
 static struct target_type zns_base_target = {
 	.name            = "zns-base",
 	.version         = {0, 1, 0},
@@ -4072,8 +4171,9 @@ static struct target_type zns_base_target = {
 	.map             = zns_base_map,
 	.status			 = zns_base_status,
 	.end_io          = zns_base_end_io,
+	.io_hints        = zns_base_io_hints,
 	// .report_zones    = zns_base_report_zones, //위쪽엔 zone이 없으므로
-	// .iterate_devices = zns_base_iterate_devices, // 위쪽으로 zone 속성 전파를 막음
+	.iterate_devices = zns_base_iterate_devices,
 };
 
 static int __init zns_base_init(void)
