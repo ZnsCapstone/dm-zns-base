@@ -1246,6 +1246,52 @@ static void flush_memtable_work_fn(struct work_struct *work)
 	kfree(fw);
 }
 
+/* c->lock을 잡은 상태에서 호출. GC가 flush 임계값 통과 순간을 가리고
+ * 있었더라도 GC 종료 경로가 같은 스왑을 재시도할 수 있게 한곳에 둔다. */
+static struct memtable_flush_work *
+schedule_memtable_flush_locked(struct zns_base_c *c)
+{
+	struct memtable_flush_work *flush_work;
+	struct skiplist *new_memtable;
+	struct skiplist *flushed_memtable;
+	unsigned int wal_zone;
+	u64 flushed_seq;
+	u64 flushed_split_gen;
+	sector_t flushed_split_off;
+
+	if (c->gc_active || c->memtable->count < flush_threshold)
+		return NULL;
+
+	wal_zone = c->zp->active_zone[ZONE_TAG_WAL];
+	if (wal_zone == ZONE_NONE)
+		return NULL;
+
+	/* WAL 완료 콜백도 이 경로를 사용하므로 sleep 가능한 할당은 금지한다. */
+	new_memtable = kzalloc(sizeof(*new_memtable), GFP_ATOMIC);
+	flush_work = kzalloc(sizeof(*flush_work), GFP_ATOMIC);
+	if (!new_memtable || !flush_work || skiplist_init(new_memtable)) {
+		kfree(flush_work);
+		kfree(new_memtable);
+		return NULL;
+	}
+
+	flushed_memtable = c->memtable;
+	flushed_seq = c->next_seq_no++;
+	flushed_split_gen = c->zp->wal_gen[wal_zone];
+	flushed_split_off = c->zp->wp[wal_zone];
+	c->memtable = new_memtable;
+	c->wal_ckpt_inflight++;
+	c->wal_highest_issued_split_gen = flushed_split_gen;
+	INIT_WORK(&flush_work->work, flush_memtable_work_fn);
+	flush_work->c = c;
+	flush_work->old_memtable = flushed_memtable;
+	flush_work->seq_no = flushed_seq;
+	flush_work->split_gen = flushed_split_gen;
+	flush_work->split_off = flushed_split_off;
+
+	return flush_work;
+}
+
 /* WAL PUT 레코드(512B, 앞 32B만 유효) 비동기 제출. process/atomic context
  * 양쪽에서 불리므로 GFP_ATOMIC 필수(GFP_NOIO도 sleep 가능해 안전하지 않음). */
 static void submit_wal_async(struct zns_io_ctx *ctx)
@@ -1396,11 +1442,7 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 	sector_t phys = ctx->phys;
 	sector_t reserved_phys = ctx->reserved_phys;
 	sector_t reserved_nr = ctx->reserved_nr;
-	struct skiplist *flushed_memtable = NULL;
 	struct memtable_flush_work *flush_work = NULL;
-	u64 flushed_seq = 0;
-	u64 flushed_split_gen = 0;
-	sector_t flushed_split_off = 0;
 	bool is_discard = ctx->is_discard;
 	u64 discard_blocks = ctx->discard_blocks;
 	u64 discard_i;
@@ -1428,39 +1470,8 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 	} else {
 		ret = mapping_put(c, lba, phys);
 	}
-	if (!ret && allow_flush && !c->gc_active &&
-	    c->memtable->count >= flush_threshold) {
-		/* memtable 교체는 이 락 안에서 — skiplist_init도 GFP_ATOMIC이라 atomic 컨텍스트에서 불러도 안전하다. */
-		struct skiplist *new_memtable = kzalloc(sizeof(*new_memtable), GFP_ATOMIC);
-
-		flush_work = kzalloc(sizeof(*flush_work), GFP_ATOMIC);
-		if (new_memtable && flush_work && skiplist_init(new_memtable) == 0) {
-			unsigned int wal_zone = c->zp->active_zone[ZONE_TAG_WAL];
-
-			flushed_memtable = c->memtable;
-			flushed_seq = c->next_seq_no++;
-			/* 이 순간 이후 WAL에 쌓이는 레코드는 새 memtable 몫
-			 * -> replay가 "스왑 시점 기준 이전/이후"로 정확히 나누도록 체크포인트에 이 위치를 (generation, 오프셋)로 실어둔다.
-			 * 절대 섹터가 아니라 논리 순번을 쓰는 이유는 WAL zone 회수 후 zone_id 순서 ≠ 기록 순서가 되기 때문. */
-			flushed_split_gen = c->zp->wal_gen[wal_zone];
-			flushed_split_off = c->zp->wp[wal_zone];
-			c->memtable = new_memtable;
-			/* 이 flush의 체크포인트가 곧 발행된다 — durable될 때까지 in-flight로 센다. split_gen은 스왑마다 단조 증가. */
-			c->wal_ckpt_inflight++;
-			c->wal_highest_issued_split_gen = flushed_split_gen;
-			INIT_WORK(&flush_work->work, flush_memtable_work_fn);
-			flush_work->c = c;
-			flush_work->old_memtable = flushed_memtable;
-			flush_work->seq_no = flushed_seq;
-			flush_work->split_gen = flushed_split_gen;
-			flush_work->split_off = flushed_split_off;
-		} else {
-			/* 못 만들면 이번 flush는 건너뛴다 — 다음 put에서 다시 시도됨 */
-			kfree(flush_work);
-			flush_work = NULL;
-			kfree(new_memtable);
-		}
-	}
+	if (!ret && allow_flush)
+		flush_work = schedule_memtable_flush_locked(c);
 	spin_unlock_irq(&c->lock);
 	/* Zone Append는 일반 dispatch gate를 통과하지 않으므로 완료 시점에
 	 * 예약 순서 회계를 직접 전진시킨다. data는 mapping_put 뒤에 완료
@@ -3447,6 +3458,7 @@ static void pending_write_work_fn(struct work_struct *work)
 static void gc_work_fn(struct work_struct *work)
 {
 	struct zns_base_c *c = container_of(work, struct zns_base_c, gc_work);
+	struct memtable_flush_work *flush_work = NULL;
 	bool still_low;
 	unsigned int attempts;
 	unsigned int reclaimed = 0;
@@ -3534,10 +3546,17 @@ out_finish:
 	else if (c->gc_no_progress < UINT_MAX)
 		c->gc_no_progress++;
 	c->gc_active = false;
+	/* GC 때문에 임계값 flush를 건너뛴 WAL callback이 있었으면 새 PUT을
+	 * 기다리지 않고 즉시 재시도한다. */
+	flush_work = schedule_memtable_flush_locked(c);
 	free_at_start = gc_count_free_zones(c->zp);
 	spin_unlock_irq(&c->lock);
 	DMINFO("gc: worker finished (reclaimed=%u, free_zones=%u, no_progress=%u)",
 	       reclaimed, free_at_start, READ_ONCE(c->gc_no_progress));
+	if (flush_work) {
+		DMINFO("gc: scheduled deferred memtable flush after worker completion");
+		queue_work(zns_flush_wq, &flush_work->work);
+	}
 	/* WAL 공간 부족으로 보류된 foreground bio가 있으면 100ms 타이머를
 	 * 기다리지 않고 방금 회수한 공간을 즉시 사용하게 한다. */
 	if (reclaimed && READ_ONCE(c->wal_pending_count))
