@@ -32,6 +32,7 @@
 #include <linux/seqlock.h>
 #include <linux/srcu.h>
 #include <linux/vmalloc.h>
+#include <linux/overflow.h>
 
 #define DM_MSG_PREFIX "zns-base"
 #define ZNS_BASE_BLOCK_SIZE 4096
@@ -56,6 +57,8 @@
 #define ZNS_BASE_WAL_RECORD_SIZE 32
 #define ZNS_BASE_SSTABLE_ENTRY_SIZE 24
 #define ZNS_BASE_WAL_OP_PUT 1
+#define ZNS_BASE_WAL_OP_DISCARD 2
+#define ZNS_BASE_DISCARDED_PBA ((sector_t)~0ULL)
 #define ZNS_BASE_WAL_PAGE_MAGIC 0x4750575aU /* ZWPG */
 #define ZNS_BASE_WAL_PAGE_HEADER_SIZE 64
 #define ZNS_BASE_WAL_RECORDS_PER_PAGE ((ZNS_BASE_BLOCK_SIZE - ZNS_BASE_WAL_PAGE_HEADER_SIZE) / ZNS_BASE_WAL_RECORD_SIZE)
@@ -364,6 +367,7 @@ struct zns_base_metadata_stream {
 enum zns_base_wal_commit_type {
   	ZNS_BASE_WAL_COMMIT_FOREGROUND,
   	ZNS_BASE_WAL_COMMIT_GC,
+	ZNS_BASE_WAL_COMMIT_DISCARD,
 };
 
 struct zns_base_wal_pending_commit {
@@ -478,6 +482,7 @@ struct zns_base_c {
 	u64 gc_runs;
 	u64 gc_reset_count;
 	u64 gc_moved_blocks;
+	u64 discarded_blocks;
 
 	mempool_t *io_pool;
 	/* quiescing rejects new upper bios while already-issued data completions
@@ -499,6 +504,8 @@ struct zns_base_c {
 
 static int mapping_update(struct zns_base_c *c, size_t logical_block, sector_t physical_sector, u64 seq);
 static int mapping_lookup(struct zns_base_c *c, size_t logical_block, struct mapping_entry *entry);
+static int mapping_lookup_latest(struct zns_base_c *c, size_t logical_block,
+				 struct mapping_entry *entry);
 static int mapping_lookup_visible(struct zns_base_c *c, size_t logical_block,
 				  struct mapping_entry *entry);
 static int mapping_reserve_write_slot(struct zns_base_c *c,
@@ -551,6 +558,8 @@ static int zns_base_sstable_invalidate_obsolete_locked(struct zns_base_c *c,
 	const struct mapping_entry *latest);
 static int zns_base_replay_wal_put(struct zns_base_c *c,
 				   size_t logical_block, sector_t physical_sector, u64 seq);
+static int zns_base_replay_wal_discard(struct zns_base_c *c,
+				       size_t logical_block, u64 seq);
 static void zns_base_wal_flush_work(struct work_struct *work);
 static void zns_base_wal_abort_pending(struct zns_base_c *c, int error);
 static int zns_base_wal_flush_sync(struct zns_base_c *c);
@@ -564,7 +573,11 @@ static int zns_base_wal_stage_gc(struct zns_base_c *c,
 		struct zns_base_zone *new_zone, unsigned int new_slot,
 		struct zns_base_zone *old_zone, unsigned int old_slot,
 		const struct mapping_entry *expected_entry, bool *group_full);
+static int zns_base_wal_stage_discard(struct zns_base_c *c,
+		size_t logical_block, bool *group_full);
 static int zns_base_wal_publish_gc_locked(struct zns_base_c *c,
+		struct zns_base_wal_pending_commit *commit);
+static int zns_base_wal_publish_discard_locked(struct zns_base_c *c,
 		struct zns_base_wal_pending_commit *commit);
 static int zns_base_reserve_pending_slot_locked(struct zns_base_zone *zone,
 		unsigned int slot, size_t logical_block);
@@ -1703,6 +1716,54 @@ static void mapping_release_write_slot(struct zns_base_c *c)
 	wake_up_all(&c->spare_waitq);
 }
 
+static int zns_base_process_discard_bio(struct zns_base_c *c,
+					 struct bio *bio)
+{
+	sector_t sector = bio->bi_iter.bi_sector;
+	sector_t sectors = bio_sectors(bio);
+	sector_t end;
+	int ret;
+
+	if (sector % SECTORS_PER_BLOCK || sectors % SECTORS_PER_BLOCK)
+		return -EINVAL;
+	if (check_add_overflow(sector, sectors, &end) ||
+	    end > (sector_t)c->nr_logical_blocks * SECTORS_PER_BLOCK)
+		return -EINVAL;
+
+	/* DISCARD is an ordering boundary in io_work.  Publish all preceding PUTs
+	 * before resolving and invalidating their newest physical locations. */
+	ret = zns_base_wal_flush_sync(c);
+	if (ret)
+		return ret;
+
+	while (sector < end) {
+		struct mapping_entry entry;
+		bool group_full = false;
+		size_t logical_block = sector / SECTORS_PER_BLOCK;
+
+		ret = mapping_lookup(c, logical_block, &entry);
+		if (ret == -ENOENT) {
+			sector += SECTORS_PER_BLOCK;
+			continue;
+		}
+		if (ret)
+			return ret;
+
+		ret = zns_base_wal_stage_discard(c, logical_block,
+						 &group_full);
+		if (ret)
+			return ret;
+		if (group_full) {
+			ret = zns_base_wal_flush_sync(c);
+			if (ret)
+				return ret;
+		}
+		sector += SECTORS_PER_BLOCK;
+	}
+
+	return zns_base_wal_flush_sync(c);
+}
+
 static bool zns_base_process_bio(struct zns_base_c *c, struct zns_base_io *io){
 	struct bio *bio = io->bio;
 	int ret;
@@ -1727,6 +1788,14 @@ static bool zns_base_process_bio(struct zns_base_c *c, struct zns_base_io *io){
 	// read bio 처리
 	else if(bio_op(bio) == REQ_OP_READ){
 		zns_base_process_read_bio(c, bio);
+		return false;
+	}
+	else if (bio_op(bio) == REQ_OP_DISCARD) {
+		ret = zns_base_process_discard_bio(c, bio);
+		if (ret)
+			bio_io_error(bio);
+		else
+			bio_endio(bio);
 		return false;
 	}
 	bio->bi_status = BLK_STS_NOTSUPP;
@@ -2208,8 +2277,12 @@ static int mapping_lookup_ram_locked(struct zns_base_c *c,
 }
 
 /* May sleep while binary-searching immutable on-media SSTables. */
-static int mapping_lookup(struct zns_base_c *c, size_t logical_block,
-			  struct mapping_entry *entry)
+/* Return the newest record even when it is a discard tombstone.  Recovery
+ * needs the tombstone sequence to prevent an older PUT from becoming visible
+ * again.  Normal callers use mapping_lookup(), which exposes a tombstone as
+ * an unmapped block. */
+static int mapping_lookup_latest(struct zns_base_c *c, size_t logical_block,
+				 struct mapping_entry *entry)
 {
 	int ret;
 
@@ -2220,6 +2293,16 @@ static int mapping_lookup(struct zns_base_c *c, size_t logical_block,
 		return ret;
 
 	ret = zns_base_sstable_lookup(c, logical_block, entry);
+	return ret;
+}
+
+static int mapping_lookup(struct zns_base_c *c, size_t logical_block,
+			  struct mapping_entry *entry)
+{
+	int ret = mapping_lookup_latest(c, logical_block, entry);
+
+	if (!ret && entry->physical_sector == ZNS_BASE_DISCARDED_PBA)
+		return -ENOENT;
 	return ret;
 }
 
@@ -2234,6 +2317,10 @@ static int mapping_lookup_visible(struct zns_base_c *c, size_t logical_block,
 				    node) {
 		if (commit->logical_block != logical_block)
 			continue;
+		if (commit->type == ZNS_BASE_WAL_COMMIT_DISCARD) {
+			mutex_unlock(&c->metadata.wal.lock);
+			return -ENOENT;
+		}
 
 		entry->logical_block = logical_block;
 		entry->physical_sector = commit->new_physical_sector;
@@ -3523,6 +3610,59 @@ static int zns_base_wal_stage_gc(
 	return 0;
 }
 
+/* Persist a logical deallocation without consuming a DATA-zone block.  The
+ * tombstone participates in the same sequence/WAL/SSTable ordering as PUT,
+ * so an older mapping cannot reappear after a checkpoint or target reload. */
+static int zns_base_wal_stage_discard(struct zns_base_c *c,
+				      size_t logical_block, bool *group_full)
+{
+	struct zns_base_wal_pending_commit *commit;
+	bool full = false;
+	int ret;
+
+	if (group_full)
+		*group_full = false;
+
+	ret = mapping_reserve_write_slot(c, logical_block);
+	if (ret)
+		return ret;
+
+	commit = kzalloc(sizeof(*commit), GFP_KERNEL);
+	if (!commit) {
+		mapping_release_write_slot(c);
+		return -ENOMEM;
+	}
+
+	INIT_LIST_HEAD(&commit->node);
+	commit->type = ZNS_BASE_WAL_COMMIT_DISCARD;
+	commit->logical_block = logical_block;
+	commit->new_physical_sector = ZNS_BASE_DISCARDED_PBA;
+	commit->mapping_slot_reserved = true;
+
+	for (;;) {
+		mutex_lock(&c->metadata.wal.lock);
+		ret = zns_base_wal_stage_commit_locked(c, commit, &full);
+		mutex_unlock(&c->metadata.wal.lock);
+
+		if (ret != -EAGAIN)
+			break;
+		ret = zns_base_wal_flush_sync(c);
+		if (ret)
+			break;
+	}
+
+	if (ret) {
+		mapping_release_write_slot(c);
+		commit->mapping_slot_reserved = false;
+		kfree(commit);
+		return ret;
+	}
+
+	if (group_full)
+		*group_full = full;
+	return 0;
+}
+
 static int zns_base_reserve_pending_slot_locked(
 	struct zns_base_zone *zone,
 	unsigned int slot,
@@ -3583,7 +3723,8 @@ static int zns_base_wal_publish_foreground_locked(
 	} else if (ret) {
 		goto out_unlock;
 	} else {
-		had_old_mapping = true;
+		had_old_mapping =
+			old_entry.physical_sector != ZNS_BASE_DISCARDED_PBA;
 	}
 
 	if (had_old_mapping) {
@@ -3630,6 +3771,36 @@ static int zns_base_wal_publish_foreground_locked(
 		commit->mapping_slot_reserved = false;
 	}
   	return ret;
+}
+
+static int zns_base_wal_publish_discard_locked(
+	struct zns_base_c *c, struct zns_base_wal_pending_commit *commit)
+{
+	struct mapping_entry old_entry;
+	int ret;
+
+	ret = mapping_lookup_latest(c, commit->logical_block, &old_entry);
+
+	spin_lock(&c->lock);
+	if (!ret && old_entry.seq >= commit->seq)
+		goto out_unlock;
+	if (ret != 0 && ret != -ENOENT)
+		goto out_unlock;
+
+	if (!ret && old_entry.physical_sector != ZNS_BASE_DISCARDED_PBA)
+		if (zns_base_invalidate_entry_slot_locked(c, &old_entry))
+			c->discarded_blocks++;
+
+	ret = mapping_update(c, commit->logical_block,
+			     ZNS_BASE_DISCARDED_PBA, commit->seq);
+
+out_unlock:
+	spin_unlock(&c->lock);
+	if (commit->mapping_slot_reserved) {
+		mapping_release_write_slot(c);
+		commit->mapping_slot_reserved = false;
+	}
+	return ret;
 }
 
 static int zns_base_metadata_allocate_block(
@@ -4239,9 +4410,10 @@ static int zns_base_sstable_invalidate_obsolete_locked(
 				goto out;
 			}
 
-			if (latest[candidate.logical_block].seq != candidate.seq ||
+			if (candidate.physical_sector != ZNS_BASE_DISCARDED_PBA &&
+			    (latest[candidate.logical_block].seq != candidate.seq ||
 			    latest[candidate.logical_block].physical_sector !=
-				candidate.physical_sector) {
+				candidate.physical_sector)) {
 				spin_lock(&c->lock);
 				zns_base_invalidate_entry_slot_locked(c, &candidate);
 				spin_unlock(&c->lock);
@@ -4908,6 +5080,9 @@ static int zns_base_manifest_recover(struct zns_base_c *c)
 
 		if (!snapshot[i].seq)
 			continue;
+		max_seq = max(max_seq, snapshot[i].seq);
+		if (snapshot[i].physical_sector == ZNS_BASE_DISCARDED_PBA)
+			continue;
 		ret = zns_base_get_zone_slot(c, snapshot[i].physical_sector,
 					     &zone, &slot);
 		if (ret)
@@ -4916,7 +5091,6 @@ static int zns_base_manifest_recover(struct zns_base_c *c)
 		zone->slots[slot].seq = snapshot[i].seq;
 		zone->slots[slot].valid = true;
 		zone->valid_blocks++;
-		max_seq = max(max_seq, snapshot[i].seq);
 	}
 	kvfree(snapshot);
 
@@ -4981,7 +5155,7 @@ static int zns_base_replay_wal_put(struct zns_base_c *c,
 	ret = mapping_reserve_write_slot(c, logical_block);
 	if (ret)
 		return ret;
-	ret = mapping_lookup(c, logical_block, &old_entry);
+	ret = mapping_lookup_latest(c, logical_block, &old_entry);
 	if (!ret && old_entry.seq >= seq) {
 		mapping_release_write_slot(c);
 		return 0;
@@ -4992,7 +5166,7 @@ static int zns_base_replay_wal_put(struct zns_base_c *c,
 	}
 
 	spin_lock(&c->lock);
-	if (ret == 0) {
+	if (ret == 0 && old_entry.physical_sector != ZNS_BASE_DISCARDED_PBA) {
 		ret = zns_base_get_zone_slot(c, old_entry.physical_sector,
 						     &zone, &slot);
 		if (!ret && zone->slots[slot].valid &&
@@ -5017,6 +5191,37 @@ static int zns_base_replay_wal_put(struct zns_base_c *c,
 	spin_unlock(&c->lock);
 	mapping_release_write_slot(c);
 
+	return ret;
+}
+
+static int zns_base_replay_wal_discard(struct zns_base_c *c,
+				       size_t logical_block, u64 seq)
+{
+	struct mapping_entry old_entry;
+	int ret;
+
+	if (logical_block >= c->nr_logical_blocks)
+		return -EINVAL;
+
+	ret = mapping_reserve_write_slot(c, logical_block);
+	if (ret)
+		return ret;
+	ret = mapping_lookup_latest(c, logical_block, &old_entry);
+	if (!ret && old_entry.seq >= seq) {
+		mapping_release_write_slot(c);
+		return 0;
+	}
+	if (ret != 0 && ret != -ENOENT) {
+		mapping_release_write_slot(c);
+		return ret;
+	}
+
+	spin_lock(&c->lock);
+	if (!ret && old_entry.physical_sector != ZNS_BASE_DISCARDED_PBA)
+		zns_base_invalidate_entry_slot_locked(c, &old_entry);
+	ret = mapping_update(c, logical_block, ZNS_BASE_DISCARDED_PBA, seq);
+	spin_unlock(&c->lock);
+	mapping_release_write_slot(c);
 	return ret;
 }
 
@@ -5100,10 +5305,19 @@ static int zns_base_wal_recover(struct zns_base_c *c)
 				if (actual_crc != stored_crc)
 					goto next_zone;
 
-				ret = zns_base_replay_wal_put(c,
-					le64_to_cpu(record->logical_block),
-					le64_to_cpu(record->physical_sector),
-					le64_to_cpu(record->seq));
+				if (le32_to_cpu(record->op_flags) ==
+				    ZNS_BASE_WAL_OP_PUT)
+					ret = zns_base_replay_wal_put(c,
+						le64_to_cpu(record->logical_block),
+						le64_to_cpu(record->physical_sector),
+						le64_to_cpu(record->seq));
+				else if (le32_to_cpu(record->op_flags) ==
+					 ZNS_BASE_WAL_OP_DISCARD)
+					ret = zns_base_replay_wal_discard(c,
+						le64_to_cpu(record->logical_block),
+						le64_to_cpu(record->seq));
+				else
+					ret = -EIO;
 				if (ret)
 					goto out;
 				max_seq = max(max_seq, le64_to_cpu(record->seq));
@@ -5325,7 +5539,9 @@ static int zns_base_wal_prepare_group_locked(struct zns_base_c *c)
   		record->physical_sector =
   			cpu_to_le64(commit->new_physical_sector);
   		record->seq = cpu_to_le64(commit->seq);
-  		record->op_flags = cpu_to_le32(ZNS_BASE_WAL_OP_PUT);
+		record->op_flags = cpu_to_le32(
+			commit->type == ZNS_BASE_WAL_COMMIT_DISCARD ?
+			ZNS_BASE_WAL_OP_DISCARD : ZNS_BASE_WAL_OP_PUT);
 
   		record->crc32c = 0;
 		record->crc32c = cpu_to_le32(
@@ -5483,9 +5699,10 @@ static void zns_base_wal_abort_pending(
 	list_for_each_entry_safe(commit, next,
 				 &wal->pending_commits, node) {
 		commit->result = error;
-		zns_base_release_pending_slot(c, commit->new_zone,
-					      commit->new_slot,
-					      commit->logical_block);
+		if (commit->type != ZNS_BASE_WAL_COMMIT_DISCARD)
+			zns_base_release_pending_slot(c, commit->new_zone,
+						      commit->new_slot,
+						      commit->logical_block);
 		if (commit->mapping_slot_reserved) {
 			mapping_release_write_slot(c);
 			commit->mapping_slot_reserved = false;
@@ -5533,9 +5750,10 @@ static void zns_base_wal_flush_work(struct work_struct *work)
 	list_for_each_entry_safe(commit, next,
 				 &wal->pending_commits, node) {
 		commit->result = ret;
-		zns_base_release_pending_slot(c, commit->new_zone,
-					      commit->new_slot,
-					      commit->logical_block);
+		if (commit->type != ZNS_BASE_WAL_COMMIT_DISCARD)
+			zns_base_release_pending_slot(c, commit->new_zone,
+						      commit->new_slot,
+						      commit->logical_block);
 		if (commit->mapping_slot_reserved) {
 			mapping_release_write_slot(c);
 			commit->mapping_slot_reserved = false;
@@ -5560,6 +5778,9 @@ static void zns_base_wal_flush_work(struct work_struct *work)
 		else if (commit->type == ZNS_BASE_WAL_COMMIT_GC)
 			commit->result =
 				zns_base_wal_publish_gc_locked(c, commit);
+		else if (commit->type == ZNS_BASE_WAL_COMMIT_DISCARD)
+			commit->result =
+				zns_base_wal_publish_discard_locked(c, commit);
 		else
 			commit->result = -EIO;
 
@@ -5568,12 +5789,14 @@ static void zns_base_wal_flush_work(struct work_struct *work)
 			wal->flush_error = commit->result;
 		}
 
-		if (commit->result)
-			zns_base_release_pending_slot(c, commit->new_zone,
-						      commit->new_slot,
-						      commit->logical_block);
-		else
+		if (commit->result) {
+			if (commit->type != ZNS_BASE_WAL_COMMIT_DISCARD)
+				zns_base_release_pending_slot(c, commit->new_zone,
+							      commit->new_slot,
+							      commit->logical_block);
+		} else {
 			published = true;
+		}
 
   		list_move_tail(&commit->node, &done_commits);
   	}
@@ -5942,7 +6165,10 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	ti->private = c;
 	ti->num_flush_bios = 1;
-	// ti->num_discard_bios = 1;
+	ti->num_discard_bios = 1;
+	/* DISCARD is consumed by this target as mapping tombstones; it is not
+	 * forwarded to the host-managed lower device. */
+	ti->discards_supported = true;
 
 	DMINFO("ctr: target attached on top of '%s'", argv[0]);
 	return 0;
@@ -6046,7 +6272,8 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 	struct zns_base_c *c = ti -> private;
 	int ret;
 
-	if(bio_op(bio) != REQ_OP_READ && bio_op(bio) != REQ_OP_WRITE && bio_op(bio) != REQ_OP_FLUSH){
+	if (bio_op(bio) != REQ_OP_READ && bio_op(bio) != REQ_OP_WRITE &&
+	    bio_op(bio) != REQ_OP_FLUSH && bio_op(bio) != REQ_OP_DISCARD) {
 		bio -> bi_status = BLK_STS_NOTSUPP;
 		bio_endio(bio);
 		return DM_MAPIO_SUBMITTED;
@@ -6057,6 +6284,17 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		bio_io_error(bio);
 
 	return DM_MAPIO_SUBMITTED;
+}
+
+static void zns_base_io_hints(struct dm_target *ti,
+			      struct queue_limits *limits)
+{
+	(void)ti;
+	/* The mapping table has 4 KiB granularity and can split an arbitrarily
+	 * large filesystem discard into WAL-backed tombstones. */
+	limits->max_hw_discard_sectors = UINT_MAX;
+	limits->discard_granularity = ZNS_BASE_BLOCK_SIZE;
+	limits->discard_alignment = 0;
 }
 
 static void zns_base_status(struct dm_target *ti, status_type_t type,
@@ -6083,6 +6321,7 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	u64 gc_runs;
 	u64 gc_reset_count;
 	u64 gc_moved_blocks;
+	u64 discarded_blocks;
 	u64 compaction_count;
 	u64 compaction_last_ns;
 	u64 compaction_max_ns;
@@ -6185,6 +6424,7 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	gc_runs = c->gc_runs;
 	gc_reset_count = c->gc_reset_count;
 	gc_moved_blocks = c->gc_moved_blocks;
+	discarded_blocks = c->discarded_blocks;
 	gc_error = c->gc_error;
 	gc_last_error = c->gc_last_error;
 	data_write_error = c->data_write_error;
@@ -6200,10 +6440,12 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 
 	DMEMIT("data_active=%u data_free=%u data_full=%u gc_dest=%u gc_victim=%u ",
 		data_active, data_free, data_full, data_gc_dest, data_gc_victim);
-	DMEMIT("gc_runs=%llu gc_resets=%llu gc_moved_blocks=%llu gc_error=%d gc_last_error=%d ",
+	DMEMIT("gc_runs=%llu gc_resets=%llu gc_moved_blocks=%llu discarded_blocks=%llu gc_error=%d gc_last_error=%d ",
 		(unsigned long long)gc_runs,
 		(unsigned long long)gc_reset_count,
-		(unsigned long long)gc_moved_blocks, gc_error, gc_last_error);
+		(unsigned long long)gc_moved_blocks,
+		(unsigned long long)discarded_blocks,
+		gc_error, gc_last_error);
 	DMEMIT("data_write_inflight=%u data_write_queued=%u data_write_queued_blocks=%u data_write_error=%d mapping_reserved_slots=%zu active_data_zone=%u active_data_wp=%llu ",
 		data_write_inflight, data_write_queued, data_write_queued_blocks,
 		data_write_error, mapping_reserved_slots,
@@ -6247,6 +6489,7 @@ static struct target_type zns_base_target = {
 	.dtr             = zns_base_dtr,
 	.map             = zns_base_map,
 	.status          = zns_base_status,
+	.io_hints        = zns_base_io_hints,
 };
 
 static int __init zns_base_init(void)

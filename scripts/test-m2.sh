@@ -100,7 +100,7 @@ echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" ||
 mkdir -p "$MOUNT_DIR"
 
 echo
-echo "=== [1/7] mapped 1024B read ==="
+echo "=== [1/8] mapped 1024B read ==="
 make_filled_file "$TMP_DIR/partial-read-base.bin" "$BLOCK_SIZE" A
 dd if="$TMP_DIR/partial-read-base.bin" of="$DM_DEV" bs="$BLOCK_SIZE" count=1 \
 	seek="$PARTIAL_READ_LBLOCK" oflag=direct conv=notrunc status=none ||
@@ -115,7 +115,7 @@ cmp "$TMP_DIR/partial-read.expected" "$TMP_DIR/partial-read.actual" ||
 echo "[OK]"
 
 echo
-echo "=== [2/7] 512B overwrite preserves the rest of a 4 KiB block ==="
+echo "=== [2/8] 512B overwrite preserves the rest of a 4 KiB block ==="
 make_filled_file "$TMP_DIR/overwrite-base.bin" "$BLOCK_SIZE" B
 make_filled_file "$TMP_DIR/overwrite-patch.bin" "$SECTOR_SIZE" Z
 cp "$TMP_DIR/overwrite-base.bin" "$TMP_DIR/overwrite.expected"
@@ -135,7 +135,7 @@ cmp "$TMP_DIR/overwrite.expected" "$TMP_DIR/overwrite.actual" ||
 echo "[OK]"
 
 echo
-echo "=== [3/7] 7 KiB write/read across a 4 KiB boundary ==="
+echo "=== [3/8] 7 KiB write/read across a 4 KiB boundary ==="
 dd if=/dev/urandom of="$TMP_DIR/cross-block.bin" bs=1024 count=7 status=none
 dd if="$TMP_DIR/cross-block.bin" of="$DM_DEV" bs=1024 count=7 \
 	seek=$((CROSS_BLOCK_LBLOCK * 4)) oflag=direct conv=notrunc status=none ||
@@ -148,13 +148,13 @@ cmp "$TMP_DIR/cross-block.bin" "$TMP_DIR/cross-block.actual" ||
 echo "[OK]"
 
 echo
-echo "=== [4/7] mkfs.ext4 without discard ==="
+echo "=== [4/8] mkfs.ext4 without format-time discard ==="
 mkfs.ext4 -F -E nodiscard "$DM_DEV" >/dev/null || fail "mkfs.ext4 failed"
 echo "[OK]"
 
 echo
-echo "=== [5/7] mount and write random data ==="
-mount "$DM_DEV" "$MOUNT_DIR" || fail "mount failed"
+echo "=== [5/8] mount with runtime discard and write random data ==="
+mount -o discard "$DM_DEV" "$MOUNT_DIR" || fail "mount failed"
 dd if=/dev/urandom of="$MOUNT_DIR/data" bs=1M count="$DATA_SIZE_MB" status=none ||
 	fail "file write failed"
 hash_a=$(md5sum "$MOUNT_DIR/data" | awk '{print $1}') || fail "first md5sum failed"
@@ -162,17 +162,29 @@ echo "hash A: $hash_a"
 echo "[OK]"
 
 echo
-echo "=== [6/7] sync and unmount ==="
+echo "=== [6/8] sync and unmount ==="
 sync
 umount "$MOUNT_DIR" || fail "umount failed"
 echo "[OK]"
 
 echo
-echo "=== [7/7] remount and verify data ==="
-mount "$DM_DEV" "$MOUNT_DIR" || fail "remount failed"
+echo "=== [7/8] remount and verify data ==="
+mount -o discard "$DM_DEV" "$MOUNT_DIR" || fail "remount failed"
 hash_b=$(md5sum "$MOUNT_DIR/data" | awk '{print $1}') || fail "second md5sum failed"
 echo "hash B: $hash_b"
 [ "$hash_a" = "$hash_b" ] || fail "hash mismatch after remount"
+
+echo
+echo "=== [8/8] unlink reaches the mapper as DISCARD ==="
+discarded_before=$(dmsetup status "$DM_NAME" | sed -n 's/.*discarded_blocks=\([0-9][0-9]*\).*/\1/p')
+[ -n "$discarded_before" ] || fail "discarded_blocks is missing from dmsetup status"
+rm "$MOUNT_DIR/data" || fail "file removal failed"
+sync
+discarded_after=$(dmsetup status "$DM_NAME" | sed -n 's/.*discarded_blocks=\([0-9][0-9]*\).*/\1/p')
+[ -n "$discarded_after" ] || fail "could not read discarded_blocks after unlink"
+[ "$discarded_after" -gt "$discarded_before" ] ||
+	fail "unlink emitted no discard ($discarded_before -> $discarded_after)"
+echo "discarded blocks: $discarded_before -> $discarded_after"
 umount "$MOUNT_DIR" || fail "final umount failed"
 echo "[OK]"
 

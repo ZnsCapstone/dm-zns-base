@@ -56,6 +56,13 @@ dd if=/dev/urandom of="$TMP_DIR/payload" bs=1M count=4 status=none
 dd if="$TMP_DIR/payload" of="$DM_DEV" bs=1M conv=fsync oflag=direct status=none ||
 	fail "initial write failed"
 
+# A discard must survive WAL replay as a tombstone; otherwise an older PUT
+# becomes visible again after the target is recreated.
+cp "$TMP_DIR/payload" "$TMP_DIR/expected"
+dd if=/dev/zero of="$TMP_DIR/expected" bs=1M count=1 conv=notrunc status=none
+blkdiscard -o 0 -l $((1024 * 1024)) "$DM_DEV" || fail "discard failed"
+blockdev --flushbufs "$DM_DEV" || fail "flush after discard failed"
+
 remove_target || fail "first dmsetup remove failed"
 rmmod "$MOD_NAME" || fail "first rmmod failed"
 
@@ -66,6 +73,7 @@ echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" ||
 
 dd if="$DM_DEV" of="$TMP_DIR/recovered" bs=1M count=4 iflag=direct status=none ||
 	fail "recovery read failed"
-cmp "$TMP_DIR/payload" "$TMP_DIR/recovered" || fail "WAL replay readback mismatch"
+cmp "$TMP_DIR/expected" "$TMP_DIR/recovered" ||
+	fail "WAL replay did not preserve discard tombstone"
 
-echo "[OK] WAL replay recovered 4 MiB after module reload"
+echo "[OK] WAL replay recovered PUT data and a 1 MiB discard tombstone"

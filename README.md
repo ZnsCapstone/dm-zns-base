@@ -293,7 +293,7 @@ worker가 한 번에 하나의 extent만 완료 순서대로 제출합니다. �
 `.status` callback으로 다음 상태를 `dmsetup status <target>`에서 확인할 수 있습니다.
 
 - DATA zone별 `ACTIVE/FREE/FULL/GC_DEST/GC_VICTIM` 개수
-- GC 실행/zone reset/moved block 수와 최근 오류
+- GC 실행/zone reset/moved block 수, discard로 무효화된 block 수와 최근 오류
 - 현재 WAL zone, generation, 사용 block, staged record, WAL 오류와 group commit 시간
 - persistent SSTable 수, checkpoint sequence/generation, Manifest/SSTable active zone
 - DATA inflight/queue block 수와 동적 최대 batch block 수
@@ -317,7 +317,7 @@ sudo bash scripts/test-failure-injection.sh
 | 스크립트 | 검증 내용 |
 |---|---|
 | `test-m1.sh` | 기본 random write/read, overwrite, persistent MemTable flush, flush bio |
-| `test-m2.sh` | 1024 B read, partial overwrite/RMW, ext4 round-trip |
+| `test-m2.sh` | 1024 B read, partial overwrite/RMW, ext4 round-trip, unlink discard 전달 |
 | `test-m3.sh` | zone rollover, metadata 격리, 실제 GC reset/reuse, live-block migration |
 | `test-wal-recovery.sh` | module reload 뒤 WAL replay readback |
 | `test-wal-recovery-ext4.sh` | ext4 sync/unmount/reload/remount hash 검증 |
