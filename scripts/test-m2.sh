@@ -53,6 +53,11 @@ fail() {
 	exit 1
 }
 
+discarded_blocks() {
+	dmsetup status "$DM_NAME" |
+		sed -n 's/.*discarded_blocks=\([0-9][0-9]*\).*/\1/p'
+}
+
 make_filled_file() {
 	local output=$1
 	local bytes=$2
@@ -96,6 +101,13 @@ insmod "$KO_PATH" || fail "insmod failed"
 echo "[*] dmsetup create $DM_NAME"
 echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" ||
 	fail "dmsetup create failed"
+
+dm_block=$(basename "$(readlink -f "$DM_DEV")")
+discard_max_bytes=$(cat "/sys/class/block/$dm_block/queue/discard_max_bytes" 2>/dev/null) ||
+	fail "could not read the mapper discard capability"
+[ "$discard_max_bytes" -gt 0 ] ||
+	fail "$DM_DEV does not advertise discard support (discard_max_bytes=0)"
+echo "[*] $DM_DEV discard_max_bytes=$discard_max_bytes"
 
 mkdir -p "$MOUNT_DIR"
 
@@ -176,14 +188,22 @@ echo "hash B: $hash_b"
 
 echo
 echo "=== [8/8] unlink reaches the mapper as DISCARD ==="
-discarded_before=$(dmsetup status "$DM_NAME" | sed -n 's/.*discarded_blocks=\([0-9][0-9]*\).*/\1/p')
+discarded_before=$(discarded_blocks)
 [ -n "$discarded_before" ] || fail "discarded_blocks is missing from dmsetup status"
 rm "$MOUNT_DIR/data" || fail "file removal failed"
 sync
-discarded_after=$(dmsetup status "$DM_NAME" | sed -n 's/.*discarded_blocks=\([0-9][0-9]*\).*/\1/p')
-[ -n "$discarded_after" ] || fail "could not read discarded_blocks after unlink"
-[ "$discarded_after" -gt "$discarded_before" ] ||
-	fail "unlink emitted no discard ($discarded_before -> $discarded_after)"
+
+# ext4 can finish the journal transaction before the associated discard has
+# completed.  Give the asynchronous completion path a bounded grace period.
+discarded_after=$discarded_before
+for _ in $(seq 1 20); do
+	discarded_after=$(discarded_blocks)
+	[ -n "$discarded_after" ] || fail "could not read discarded_blocks after unlink"
+	[ "$discarded_after" -gt "$discarded_before" ] && break
+	sleep 0.5
+done
+[ "$discarded_after" -gt "$discarded_before" ] || fail \
+	"unlink emitted no discard within 10 seconds ($discarded_before -> $discarded_after); run scripts/test-wal-recovery.sh to test direct DISCARD"
 echo "discarded blocks: $discarded_before -> $discarded_after"
 umount "$MOUNT_DIR" || fail "final umount failed"
 echo "[OK]"
