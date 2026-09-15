@@ -6286,15 +6286,37 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 	return DM_MAPIO_SUBMITTED;
 }
 
+static int zns_base_iterate_devices(struct dm_target *ti,
+				    iterate_devices_callout_fn fn,
+				    void *data)
+{
+	struct zns_base_c *c = ti->private;
+
+	/*
+	 * Linux 5.15 only applies a target's io_hints after it has iterated
+	 * the target's lower devices.  Exposing the backing device here is
+	 * therefore required even though upper DISCARD bios are consumed as
+	 * mapping tombstones rather than forwarded to that device.
+	 */
+	return fn(ti, c->dev, 0, ti->len, data);
+}
+
 static void zns_base_io_hints(struct dm_target *ti,
 			      struct queue_limits *limits)
 {
 	(void)ti;
 	/* The mapping table has 4 KiB granularity and can split an arbitrarily
 	 * large filesystem discard into WAL-backed tombstones. */
-	limits->max_hw_discard_sectors = UINT_MAX;
+	limits->max_discard_sectors = UINT_MAX >> SECTOR_SHIFT;
+	limits->max_hw_discard_sectors = UINT_MAX >> SECTOR_SHIFT;
 	limits->discard_granularity = ZNS_BASE_BLOCK_SIZE;
 	limits->discard_alignment = 0;
+
+	/* zns-base translates random logical I/O itself, so its upper device is
+	 * conventional even though the iterated backing device is host-managed. */
+	limits->zoned = BLK_ZONED_NONE;
+	limits->chunk_sectors = 0;
+	limits->zone_write_granularity = 0;
 }
 
 static void zns_base_status(struct dm_target *ti, status_type_t type,
@@ -6484,11 +6506,13 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 static struct target_type zns_base_target = {
 	.name            = "zns-base",
 	.version         = {0, 1, 0},
+	.features        = DM_TARGET_ZONED_HM,
 	.module          = THIS_MODULE,
 	.ctr             = zns_base_ctr,
 	.dtr             = zns_base_dtr,
 	.map             = zns_base_map,
 	.status          = zns_base_status,
+	.iterate_devices = zns_base_iterate_devices,
 	.io_hints        = zns_base_io_hints,
 };
 
