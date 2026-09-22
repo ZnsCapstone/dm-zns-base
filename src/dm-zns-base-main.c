@@ -24,6 +24,12 @@
 
 #define DM_MSG_PREFIX "zns-base"
 
+/* Opt-in, bounded diagnostics. No allocation or mapping policy changes. */
+static unsigned int gc_diag_budget;
+module_param(gc_diag_budget, uint, 0444);
+MODULE_PARM_DESC(gc_diag_budget, "maximum live>used mapping audits per module load (0 disables)");
+static atomic_t gc_diag_events = ATOMIC_INIT(0);
+
 /* bio 완료 콜백에서 다음 bio를 이어붙일 땐 반드시 이 워크큐로 미뤄 process
  * context에서 제출한다 — submit_bio()는 논블로킹이 아니라 atomic context에서
  * 부르면 죽을 수 있음(admission control이 내부에서 schedule()을 부를 수 있음). */
@@ -2616,6 +2622,63 @@ struct gc_cycle {
 	bool *excluded;
 };
 
+static int gc_diag_phys_cmp(const void *a, const void *b)
+{
+	const struct gc_live_entry *x = a, *y = b;
+
+	if (x->phys != y->phys)
+		return x->phys < y->phys ? -1 : 1;
+	return x->lba < y->lba ? -1 : x->lba != y->lba;
+}
+
+/* Audit the exact GC view, not a fresh lookup. A cached view can be stale;
+ * aliases here are evidence to investigate, not proof of on-disk corruption.
+ * Run only on overflow, outside c->lock, with bounded output/allocation. */
+static void gc_diag_audit(struct zns_base_c *c, struct gc_live_map *map,
+			 unsigned int victim, u64 used, u64 live, bool cached)
+{
+	struct gc_live_entry *rows;
+	sector_t start = (sector_t)victim * c->zp->zone_sectors;
+	sector_t end = start + c->zp->zone_sectors;
+	unsigned int i, n = 0, aliases = 0, beyond = 0, shown = 0;
+	unsigned int event;
+
+	if (!gc_diag_budget || live <= used ||
+	    atomic_read(&gc_diag_events) >= gc_diag_budget)
+		return;
+	event = atomic_inc_return(&gc_diag_events);
+	if (event > gc_diag_budget)
+		return;
+	rows = kvmalloc_array(live / BLOCK_SECTORS, sizeof(*rows), GFP_KERNEL);
+	if (!rows) {
+		DMINFO("gc audit: event=%u allocation failed", event);
+		return;
+	}
+	for (i = 0; i < map->capacity; i++) {
+		struct gc_live_entry *e = &map->entries[i];
+
+		if (e->used && e->phys >= start && e->phys < end)
+			rows[n++] = *e;
+	}
+	sort(rows, n, sizeof(*rows), gc_diag_phys_cmp, NULL);
+	for (i = 0; i < n; i++) {
+		bool alias = i && rows[i].phys < rows[i - 1].phys + BLOCK_SECTORS;
+		bool outside = rows[i].phys < start + 1 ||
+			rows[i].phys + BLOCK_SECTORS > start + used + 1;
+
+		aliases += alias;
+		beyond += outside;
+		if ((alias || outside) && shown++ < 16)
+			DMINFO("gc audit: event=%u zone=%u lba=%llu phys=%llu prev_lba=%llu prev_phys=%llu overlap=%u outside_wp=%u",
+			       event, victim, rows[i].lba, (u64)rows[i].phys,
+			       i ? rows[i - 1].lba : 0,
+			       i ? (u64)rows[i - 1].phys : 0, alias, outside);
+	}
+	DMINFO("gc audit: event=%u zone=%u cached=%u used=%llu live=%llu entries=%u overlaps=%u outside_wp=%u",
+	       event, victim, cached, used, live, n, aliases, beyond);
+	kvfree(rows);
+}
+
 static unsigned int gc_live_hash(u64 lba, unsigned int capacity)
 {
 	/* Fibonacci hashing. LBA가 4KB 정렬이어도 하위 비트가 고르게 섞인다. */
@@ -3027,6 +3090,7 @@ static enum gc_reclaim_result gc_reclaim_one_victim(struct zns_base_c *c,
 	unsigned int reloc_count = 0;
 	u64 live_sectors = 0;
 	u64 used_sectors;
+	bool cached_at_entry = cycle->built;
 	bool ok = true;
 	bool reclaimed = false;
 	unsigned long victim_started = jiffies;
@@ -3188,6 +3252,8 @@ refresh_current:
 	}
 	used_sectors = READ_ONCE(c->zp->wp[victim]);
 	used_sectors = used_sectors > 0 ? used_sectors - 1 : 0;
+	gc_diag_audit(c, &live_map, victim, used_sectors, live_sectors,
+		      cached_at_entry);
 	/* 여유 zone이 reserve보다 남아 있는 동안에는 아주 작은 순이익을
 	 * 위해 거의 전체 zone을 복사하지 않는다. FEMU의 2GiB zone에서는
 	 * invalid 1% 미만 victim 하나가 foreground를 60초 이상 막을 수 있다.
