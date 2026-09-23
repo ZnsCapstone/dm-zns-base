@@ -833,6 +833,9 @@ static void release_frozen_memtable(struct zns_base_c *c,
 		c->metadata_failed = true;
 	}
 	spin_unlock_irq(&c->lock);
+	if (!durable)
+		DMERR("flush chain failed: WAL reclamation frontier frozen until reload (published=%u)",
+		      release ? 1 : 0);
 	if (release) {
 		skiplist_destroy(old);
 		kfree(old);
@@ -1811,7 +1814,7 @@ static void sstable_flush_complete(struct zns_io_ctx *ctx, blk_status_t status)
 		should_compact = !rret && c->nr_sstables >= compaction_k;
 		spin_unlock_irq(&c->lock);
 		if (rret)
-			DMERR("SSTable flush: failed to register in-memory index (seq=%llu) — unreadable until next restart's recovery scan",
+			DMERR("SSTable flush: failed to register index (seq=%llu); retaining frozen map and failing I/O closed",
 			      (unsigned long long)ctx->checkpoint_seq);
 
 		/* atomic context라 queue_work만(비블로킹) — 실제 병합은
@@ -1952,7 +1955,7 @@ static void submit_sstable_write_async(struct zns_io_ctx *ctx)
 	 * 청크 단위로 쪼개 gate를 거쳐 순차 제출하고 각 청크 완료(sstable_write_chunk_done)에서 다음 청크를 이어간다. */
 	bio = bio_alloc(GFP_ATOMIC, nr_pages);
 	if (!bio) {
-		DMERR("SSTable flush: bio_alloc failed, dropping this generation (data remains in WAL)");
+		DMERR("SSTable flush: bio_alloc failed; retaining frozen map and failing I/O closed");
 		/* 이미 배정된 SSTable phys 중 아직 안 나간 부분은 취소해 dispatch 정지를 막는다. */
 		if (remaining_sectors > 0)
 			zone_dispatch_cancel(c, chunk_phys, remaining_sectors);
@@ -2043,7 +2046,7 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 	 * 아래 비동기 SSTable writer는 buf_page()로 두 종류 버퍼를 모두 지원한다. */
 	buf = kvzalloc(alloc_bytes, GFP_KERNEL);
 	if (!buf) {
-		DMERR("SSTable flush: out of memory (seq=%llu), dropping this generation (data remains in WAL)",
+		DMERR("SSTable flush: out of memory (seq=%llu); retaining frozen map and failing I/O closed",
 		      (unsigned long long)seq_no);
 		release_frozen_memtable(c, old_memtable, false);
 		flush_chain_end(c);
@@ -2071,7 +2074,7 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 	ret = zone_pool_alloc(c->zp, ZONE_TAG_SSTABLE, nr_sectors, &phys, &new_sstable_zone, false);
 	spin_unlock_irq(&c->lock);
 	if (ret) {
-		DMERR("SSTable flush: zone_pool_alloc failed (%d, seq=%llu), dropping this generation (data remains in WAL)",
+		DMERR("SSTable flush: zone_pool_alloc failed (%d, seq=%llu); retaining frozen map and failing I/O closed",
 		      ret, (unsigned long long)seq_no);
 		kvfree(buf);
 		release_frozen_memtable(c, old_memtable, false);
@@ -2081,7 +2084,7 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx) {
-		DMERR("SSTable flush: out of memory building ctx (seq=%llu), dropping this generation (data remains in WAL)",
+		DMERR("SSTable flush: out of memory building ctx (seq=%llu); retaining frozen map and failing I/O closed",
 		      (unsigned long long)seq_no);
 		kvfree(buf);
 		release_frozen_memtable(c, old_memtable, false);
@@ -2896,6 +2899,18 @@ static unsigned int gc_workspace_required(struct zns_base_c *c, u64 live_sectors
 	return (live_sectors > tail ? 1 : 0) + 1;
 }
 
+/* c->lock held; GC excludes frozen memtables for the entire cycle. */
+static bool gc_memtable_references_zone(struct zns_base_c *c,
+				       sector_t start, sector_t end)
+{
+	struct skiplist_node *node;
+
+	for (node = c->memtable->head->forward[0]; node; node = node->forward[0])
+		if (node->phys >= start && node->phys < end)
+			return true;
+	return false;
+}
+
 /* free zone이 gc_low_watermark 이하로 떨어지면 GC를 큐잉
  * zone_pool_alloc으로 free zone을 소비할 수 있는 지점(.map()의 WRITE 분기)에서 호출. */
 static void maybe_trigger_gc(struct zns_base_c *c)
@@ -3509,12 +3524,7 @@ refresh_current:
 	/* Every relocated LBA is now in memtable. Also catches new keys omitted
 	 * by any future snapshot bug. Never reset a zone still referenced there. */
 	spin_lock_irq(&c->lock);
-	for (node = c->memtable->head->forward[0]; node; node = node->forward[0]) {
-		if (node->phys >= vstart && node->phys < vend) {
-			ok = false;
-			break;
-		}
-	}
+	ok = !gc_memtable_references_zone(c, vstart, vend);
 	spin_unlock_irq(&c->lock);
 	if (!ok) {
 		DMERR("gc: reset blocked by live memtable reference to zone %u", victim);
@@ -3609,7 +3619,7 @@ static int start_foreground_write(struct zns_base_c *c, struct bio *bio,
 	if (ret == -EAGAIN)
 		return ret;
 	if (ret) {
-		bio->bi_status = BLK_STS_NOSPC;
+		bio->bi_status = errno_to_blk_status(ret);
 		bio_endio(bio);
 		return 0;
 	}
