@@ -33,7 +33,8 @@ class SafetyTests(unittest.TestCase):
                  "gc_live_map_find", "gc_live_map_resize", "gc_live_map_update",
                  "gc_refresh_live_map", "gc_workspace_required",
                  "zone_pool_acquire_free", "zone_pool_alloc", "gc_commit_relocation",
-                 "gc_count_free_zones", "foreground_wal_allowed", "sstable_read_finish"]
+                 "gc_count_free_zones", "foreground_wal_allowed", "sstable_read_finish",
+                 "gc_memtable_references_zone"]
         prelude = (ROOT / "scripts/safety-unit-stubs.h").read_text()
         cases = (ROOT / "scripts/safety-unit-cases.c").read_text()
         with tempfile.TemporaryDirectory(prefix="zns-safety-unit-") as folder:
@@ -48,6 +49,7 @@ class SafetyTests(unittest.TestCase):
         reclaim = function("gc_reclaim_one_victim")
         self.assertIn("gc_refresh_live_map(c, &live_map)", reclaim)
         self.assertIn("cycle->latest = live_map", reclaim)
+        self.assertIn("!gc_memtable_references_zone(c, vstart, vend)", reclaim)
         self.assertLess(reclaim.index("reset blocked by live memtable"),
                         reclaim.index("if (zone_reset_hw"))
         self.assertIn("gc_workspace_required(c, live_sectors)", reclaim)

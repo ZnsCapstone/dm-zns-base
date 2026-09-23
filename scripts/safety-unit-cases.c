@@ -11,6 +11,11 @@ int main(void) {
     a.phys = UINT64_MAX;
     assert(mapping_get(&c, 8, &phys) && phys == UINT64_MAX); /* tombstone wins */
     a.phys = 101;
+    assert(gc_memtable_references_zone(&c, 100, 200));
+    assert(!gc_memtable_references_zone(&c, 0, 101)); /* end is exclusive */
+    a.phys = MAPPING_TOMBSTONE;
+    assert(!gc_memtable_references_zone(&c, 100, 200));
+    a.phys = 101;
     release_frozen_memtable(&c, &frozen, false);
     assert(c.frozen_memtable == &frozen && c.metadata_failed && c.checkpoint_failed);
     assert(destroy_count == 0); /* failed flush never frees unpublished data */
