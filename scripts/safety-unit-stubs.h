@@ -14,6 +14,7 @@ typedef uint64_t sector_t;
 #define MAPPING_TOMBSTONE UINT64_MAX
 #define BLK_STS_IOERR 1
 #define BLK_STS_RESOURCE 2
+#define DMERR(...) ((void)0)
 #define BLOCK_SECTORS 8
 #define ZONE_NONE UINT32_MAX
 enum zone_tag { ZONE_TAG_FREE, ZONE_TAG_USER_DATA, ZONE_TAG_GC_DATA, ZONE_TAG_WAL };
