@@ -184,6 +184,12 @@ struct zns_base_c {
 	sector_t 		nr_sectors;
 	struct zone_pool *zp;
 	struct skiplist *memtable;  	// LBA -> phys 매핑 (M1의 map[] flat array를 대체)
+	/* One flush at a time; reads must see this until its SSTable is published. */
+	struct skiplist *frozen_memtable;
+	bool frozen_published;
+	bool checkpoint_failed;
+	bool metadata_failed;
+	u64 read_view_epoch;
 	u64              next_seq_no;   // 다음 flush에 붙일 SSTable 세대 번호
 
 	struct sstable_info *sstables;  // 살아있는 SSTable 색인 (append-only, krealloc으로 증가)
@@ -213,6 +219,7 @@ struct zns_base_c {
 	u64 wal_durable_split_gen;          // 이 값보다 작은 gen의 WAL zone은 회수 가능
 	wait_queue_head_t flush_waitq;      // dtr에서 비동기 flush chain drain 대기
 	bool gc_active;                     // GC latest-map 구축/이주 중 memtable swap 금지
+	sector_t gc_wal_budget;             /* remaining WAL sectors for current victim */
 	unsigned int gc_no_progress;        // 연속으로 공간을 못 만든 GC cycle 수
 
 	spinlock_t 		lock;
@@ -797,11 +804,39 @@ static int mapping_put(struct zns_base_c *c, u64 lba, u64 phys)
 	return 0;
 }
 
-/* memtable에서만 조회. .map()의 READ 분기가 이게 miss일 때만 SSTable도 훑는다(아래 sstable_read_* 체인) - 여긴 순수 memtable 조회 그대로 둔다.
+/* Active then frozen memtable; only a miss falls back to SSTables.
  * 호출자가 c->lock을 쥐고 있다고 가정. */
 static int mapping_get(struct zns_base_c *c, u64 lba, u64 *phys_out)
 {
-	return skiplist_lookup(c->memtable, lba, phys_out);
+	if (skiplist_lookup(c->memtable, lba, phys_out))
+		return 1;
+	return c->frozen_memtable &&
+		skiplist_lookup(c->frozen_memtable, lba, phys_out);
+}
+
+/* Called once by every flush termination path, before flush_chain_end().
+ * Never drop an unpublished mapping or advance WAL reclamation after failure. */
+static void release_frozen_memtable(struct zns_base_c *c,
+				    struct skiplist *old, bool durable)
+{
+	bool release;
+
+	spin_lock_irq(&c->lock);
+	if (!durable)
+		c->checkpoint_failed = true;
+	release = c->frozen_published;
+	if (release) {
+		c->frozen_memtable = NULL;
+		c->frozen_published = false;
+	} else {
+		/* Retain ownership until detach; fail I/O/GC closed until recovery. */
+		c->metadata_failed = true;
+	}
+	spin_unlock_irq(&c->lock);
+	if (release) {
+		skiplist_destroy(old);
+		kfree(old);
+	}
 }
 
 /* GC 이주 전용 조건부 매핑 갱신 — 이주 사이 사용자가 같은 lba를 덮어써 memtable이
@@ -848,6 +883,7 @@ static int sstable_register(struct zns_base_c *c, sector_t phys, u64 seq_no,
 	si->min_lba = min_lba;
 	si->max_lba = max_lba;
 	c->zp->sstable_live_count[zone_of(c->zp, phys)]++;
+	c->read_view_epoch++;
 	return 0;
 }
 
@@ -1233,8 +1269,7 @@ static void abort_after_header_failure(struct zns_io_ctx *ctx,
 		sstable_flush_complete(ctx, status);
 	} else if (ctx->on_headers_done == submit_checkpoint_async) {
 		zone_dispatch_cancel(c, ctx->wal_phys, 1);
-		skiplist_destroy(ctx->old_memtable);
-		kfree(ctx->old_memtable);
+		release_frozen_memtable(c, ctx->old_memtable, false);
 		kfree(ctx);
 		flush_chain_end(c);
 	} else {
@@ -1265,7 +1300,8 @@ schedule_memtable_flush_locked(struct zns_base_c *c)
 	u64 flushed_split_gen;
 	sector_t flushed_split_off;
 
-	if (c->gc_active || c->memtable->count < flush_threshold)
+	if (c->gc_active || c->wal_ckpt_inflight || c->metadata_failed ||
+	    c->stopping || c->memtable->count < flush_threshold)
 		return NULL;
 
 	wal_zone = c->zp->active_zone[ZONE_TAG_WAL];
@@ -1286,6 +1322,8 @@ schedule_memtable_flush_locked(struct zns_base_c *c)
 	flushed_split_gen = c->zp->wal_gen[wal_zone];
 	flushed_split_off = c->zp->wp[wal_zone];
 	c->memtable = new_memtable;
+	c->frozen_memtable = flushed_memtable;
+	c->frozen_published = false;
 	c->wal_ckpt_inflight++;
 	c->wal_highest_issued_split_gen = flushed_split_gen;
 	INIT_WORK(&flush_work->work, flush_memtable_work_fn);
@@ -1525,6 +1563,17 @@ static int wal_page_append_sync(struct zns_base_c *c, sector_t reserved_phys,
 	return ret;
 }
 
+/* c->lock held. Do not let foreground steal the WAL tail promised to GC. */
+static bool foreground_wal_allowed(struct zns_base_c *c, sector_t nr)
+{
+	unsigned int z = c->zp->active_zone[ZONE_TAG_WAL];
+	sector_t tail = z == ZONE_NONE ? 0 : c->zp->zone_sectors - c->zp->wp[z];
+
+	return !c->gc_wal_budget ||
+		gc_count_free_zones(c->zp) > gc_reserved_zones ||
+		tail >= c->gc_wal_budget + nr;
+}
+
 static void wal_batch_work_fn(struct work_struct *work)
 {
 	struct zns_base_c *c = container_of(to_delayed_work(work),
@@ -1556,7 +1605,9 @@ static void wal_batch_work_fn(struct work_struct *work)
 	more = !list_empty(&c->wal_pending);
 	wal_sectors = count == 1 ? 1 : WAL_PAGE_SECTORS;
 	if (!ret && count) {
-		if (unlikely(wal_batch_alloc_failures)) {
+		if (!foreground_wal_allowed(c, wal_sectors)) {
+			ret = -ENOSPC;
+		} else if (unlikely(wal_batch_alloc_failures)) {
 			wal_batch_alloc_failures--;
 			ret = -ENOSPC;
 		} else {
@@ -1710,7 +1761,7 @@ static void flush_chain_end(struct zns_base_c *c)
 	bool need_gc;
 
 	spin_lock_irq(&c->lock);
-	if (--c->wal_ckpt_inflight == 0 &&
+	if (--c->wal_ckpt_inflight == 0 && !c->checkpoint_failed &&
 	    c->wal_highest_issued_split_gen > c->wal_durable_split_gen) {
 		c->wal_durable_split_gen = c->wal_highest_issued_split_gen;
 		advanced = true;
@@ -1752,6 +1803,11 @@ static void sstable_flush_complete(struct zns_io_ctx *ctx, blk_status_t status)
 		rret = sstable_register(c, ctx->sstable_phys, le64_to_cpu(hdr->seq_no),
 					  le64_to_cpu(hdr->record_count),
 					  le64_to_cpu(hdr->min_lba), le64_to_cpu(hdr->max_lba), GFP_ATOMIC);
+		if (!rret) {
+			c->frozen_published = true;
+		} else {
+			status = BLK_STS_RESOURCE;
+		}
 		should_compact = !rret && c->nr_sstables >= compaction_k;
 		spin_unlock_irq(&c->lock);
 		if (rret)
@@ -1767,8 +1823,7 @@ static void sstable_flush_complete(struct zns_io_ctx *ctx, blk_status_t status)
 	kvfree(ctx->sstable_buf);
 
 	if (status) {
-		skiplist_destroy(ctx->old_memtable);
-		kfree(ctx->old_memtable);
+		release_frozen_memtable(c, ctx->old_memtable, false);
 		kfree(ctx);
 		flush_chain_end(c);
 		return;
@@ -1780,8 +1835,7 @@ static void sstable_flush_complete(struct zns_io_ctx *ctx, blk_status_t status)
 	if (ret) {
 		DMERR("checkpoint alloc failed (%d, seq=%llu): replay will just do extra work next time, no data lost",
 		      ret, (unsigned long long)ctx->checkpoint_seq);
-		skiplist_destroy(ctx->old_memtable);
-		kfree(ctx->old_memtable);
+		release_frozen_memtable(c, ctx->old_memtable, false);
 		kfree(ctx);
 		flush_chain_end(c);
 		return;
@@ -1818,8 +1872,7 @@ static void submit_checkpoint_async(struct zns_io_ctx *ctx)
 		DMERR("checkpoint write: out of memory (seq=%llu), skipping — replay will just do extra work next time",
 		      (unsigned long long)ctx->checkpoint_seq);
 		zone_dispatch_cancel(c, ctx->wal_phys, 1);
-		skiplist_destroy(ctx->old_memtable);
-		kfree(ctx->old_memtable);
+		release_frozen_memtable(c, ctx->old_memtable, false);
 		kfree(ctx);
 		flush_chain_end(c);
 		return;
@@ -1835,8 +1888,7 @@ static void submit_checkpoint_async(struct zns_io_ctx *ctx)
 		kfree(rec);
 		ctx->wal_buf = NULL;
 		zone_dispatch_cancel(c, ctx->wal_phys, 1);
-		skiplist_destroy(ctx->old_memtable);
-		kfree(ctx->old_memtable);
+		release_frozen_memtable(c, ctx->old_memtable, false);
 		kfree(ctx);
 		flush_chain_end(c);
 		return;
@@ -1876,8 +1928,7 @@ static void checkpoint_write_done(struct bio *bio)
 		       (unsigned long long)ctx->checkpoint_split_gen,
 		       (unsigned long long)ctx->checkpoint_split_off);
 
-	skiplist_destroy(ctx->old_memtable);
-	kfree(ctx->old_memtable);
+	release_frozen_memtable(c, ctx->old_memtable, !status);
 	kfree(ctx);
 	flush_chain_end(c);
 }
@@ -1906,8 +1957,7 @@ static void submit_sstable_write_async(struct zns_io_ctx *ctx)
 		if (remaining_sectors > 0)
 			zone_dispatch_cancel(c, chunk_phys, remaining_sectors);
 		kvfree(ctx->sstable_buf);
-		skiplist_destroy(ctx->old_memtable);
-		kfree(ctx->old_memtable);
+		release_frozen_memtable(c, ctx->old_memtable, false);
 		kfree(ctx);
 		flush_chain_end(c);
 		return;
@@ -1979,8 +2029,7 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 	int ret;
 
 	if (old_memtable->count == 0) {
-		skiplist_destroy(old_memtable);
-		kfree(old_memtable);
+		release_frozen_memtable(c, old_memtable, false);
 		flush_chain_end(c);
 		return;
 	}
@@ -1996,8 +2045,7 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 	if (!buf) {
 		DMERR("SSTable flush: out of memory (seq=%llu), dropping this generation (data remains in WAL)",
 		      (unsigned long long)seq_no);
-		skiplist_destroy(old_memtable);
-		kfree(old_memtable);
+		release_frozen_memtable(c, old_memtable, false);
 		flush_chain_end(c);
 		return;
 	}
@@ -2026,8 +2074,7 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 		DMERR("SSTable flush: zone_pool_alloc failed (%d, seq=%llu), dropping this generation (data remains in WAL)",
 		      ret, (unsigned long long)seq_no);
 		kvfree(buf);
-		skiplist_destroy(old_memtable);
-		kfree(old_memtable);
+		release_frozen_memtable(c, old_memtable, false);
 		flush_chain_end(c);
 		return;
 	}
@@ -2037,8 +2084,7 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 		DMERR("SSTable flush: out of memory building ctx (seq=%llu), dropping this generation (data remains in WAL)",
 		      (unsigned long long)seq_no);
 		kvfree(buf);
-		skiplist_destroy(old_memtable);
-		kfree(old_memtable);
+		release_frozen_memtable(c, old_memtable, false);
 		flush_chain_end(c);
 		return;
 	}
@@ -2085,10 +2131,12 @@ struct sstable_read_ctx {
 	int best_found;
 	u64 best_seq;
 	sector_t best_phys;
+	u64 view_epoch;
 };
 
 static void sstable_read_probe(struct sstable_read_ctx *rctx);
 static void sstable_probe_done(struct bio *bio);
+static void sstable_read_next_candidate(struct sstable_read_ctx *rctx);
 
 /* 후보를 다 훑었으면 결과를 원본 bio에 반영하고 체인을 끝낸다 */
 static void sstable_read_finish(struct sstable_read_ctx *rctx)
@@ -2096,29 +2144,58 @@ static void sstable_read_finish(struct sstable_read_ctx *rctx)
 	struct bio *orig = rctx->orig_bio;
 	struct zns_base_c *c = rctx->c;
 	unsigned int i;
+	struct zns_read_pin *pin = dm_per_bio_data(orig, sizeof(*pin));
+	u64 cur;
+	bool found;
 
-	if (rctx->best_found) {
-		struct zns_read_pin *pin = dm_per_bio_data(orig, sizeof(*pin));
-		sector_t best_phys = rctx->best_phys;
-		u64 cur;
+	spin_lock_irq(&c->lock);
+	if (c->metadata_failed) {
+		spin_unlock_irq(&c->lock);
+		orig->bi_status = BLK_STS_IOERR;
+		bio_endio(orig);
+		goto out_unpin;
+	}
+	found = mapping_get(c, rctx->lba, &cur);
+	if (!found && rctx->view_epoch != c->read_view_epoch) {
+		struct sstable_info *fresh;
+		unsigned int count = c->nr_sstables;
 
-		/* best_phys(SSTable가 준 위치)를 읽기 직전, 그 사이 GC가 이 lba를 옮겼는지
-		 * 락 안에서 재확인 — 옮겼으면 memtable의 새 위치를 쓴다(TOCTOU). 그리고 실제
-		 * 읽을 데이터 zone을 pin(end_io가 unpin)해 GC가 그 사이 reset 못하게 한다. */
-		spin_lock_irq(&c->lock);
-		if (mapping_get(c, rctx->lba, &cur))
-			best_phys = cur;
-		if (best_phys == MAPPING_TOMBSTONE) {
+		/* A flush published and released its frozen map while this probe
+		 * was in flight. Its original SSTable snapshot is no longer latest. */
+		fresh = kmalloc_array(count ? count : 1, sizeof(*fresh), GFP_ATOMIC);
+		if (!fresh) {
 			spin_unlock_irq(&c->lock);
-			zero_fill_bio(orig);
+			orig->bi_status = BLK_STS_RESOURCE;
 			bio_endio(orig);
 			goto out_unpin;
 		}
-		pin->zone = zone_of(c->zp, best_phys);
-		zone_read_get(c->zp, pin->zone);
+		memcpy(fresh, c->sstables, count * sizeof(*fresh));
+		for (i = 0; i < count; i++)
+			zone_read_get(c->zp, zone_of(c->zp, fresh[i].phys));
+		rctx->view_epoch = c->read_view_epoch;
 		spin_unlock_irq(&c->lock);
-
-		orig->bi_iter.bi_sector = best_phys + rctx->offset_in_block;
+		for (i = 0; i < rctx->nr_candidates; i++)
+			zone_read_put(c->zp, zone_of(c->zp, rctx->candidates[i].phys));
+		kfree(rctx->candidates);
+		rctx->candidates = fresh;
+		rctx->nr_candidates = count;
+		rctx->idx = 0;
+		rctx->best_found = 0;
+		rctx->best_seq = 0;
+		sstable_read_next_candidate(rctx);
+		return;
+	}
+	if (!found) {
+		found = rctx->best_found;
+		cur = rctx->best_phys;
+	}
+	if (found && cur != MAPPING_TOMBSTONE) {
+		pin->zone = zone_of(c->zp, cur);
+		zone_read_get(c->zp, pin->zone);
+	}
+	spin_unlock_irq(&c->lock);
+	if (found && cur != MAPPING_TOMBSTONE) {
+		orig->bi_iter.bi_sector = cur + rctx->offset_in_block;
 		bio_set_dev(orig, c->dev->bdev);
 		submit_bio_deferred(orig);
 	} else {
@@ -2763,6 +2840,41 @@ static int gc_live_map_update(struct gc_live_map *map, u64 lba,
 	return 0;
 }
 
+/* Copy outside-I/O state under the lock, grow the hash only in process context.
+ * A closed, drained victim cannot gain mappings after selection. If the
+ * memtable grows past our allocation, abort safely rather than truncate it. */
+static int gc_refresh_live_map(struct zns_base_c *c, struct gc_live_map *map)
+{
+	struct gc_candidate *rows;
+	struct skiplist_node *node;
+	unsigned int cap, n = 0, i;
+	int ret = 0;
+
+	spin_lock_irq(&c->lock);
+	cap = c->memtable->count;
+	spin_unlock_irq(&c->lock);
+	/* Allow foreground growth during the sleeping allocation. Still detect
+	 * overflow below, rather than silently taking a truncated snapshot. */
+	if (cap < UINT_MAX - 65536)
+		cap += 65536;
+	rows = kvmalloc_array(cap ? cap : 1, sizeof(*rows), GFP_KERNEL);
+	if (!rows)
+		return -ENOMEM;
+	spin_lock_irq(&c->lock);
+	for (node = c->memtable->head->forward[0]; node && n < cap;
+	     node = node->forward[0]) {
+		rows[n].lba = node->lba;
+		rows[n++].phys = node->phys;
+	}
+	if (node)
+		ret = -EAGAIN;
+	spin_unlock_irq(&c->lock);
+	for (i = 0; !ret && i < n; i++)
+		ret = gc_live_map_update(map, rows[i].lba, rows[i].phys, true);
+	kvfree(rows);
+	return ret;
+}
+
 /* [락] 호출자가 c->lock을 쥐고 있어야 한다. */
 static unsigned int gc_count_free_zones(struct zone_pool *zp)
 {
@@ -2772,6 +2884,16 @@ static unsigned int gc_count_free_zones(struct zone_pool *zp)
 		if (zp->zone_tag[z] == ZONE_TAG_FREE)
 			count++;
 	return count;
+}
+
+/* Called with c->lock. Foreground cannot consume GC_DATA tails. Always allow
+ * a full extra WAL zone: foreground may consume its current tail concurrently. */
+static unsigned int gc_workspace_required(struct zns_base_c *c, u64 live_sectors)
+{
+	unsigned int z = c->zp->active_zone[ZONE_TAG_GC_DATA];
+	u64 tail = z == ZONE_NONE ? 0 : c->zp->zone_sectors - c->zp->wp[z];
+
+	return (live_sectors > tail ? 1 : 0) + 1;
 }
 
 /* free zone이 gc_low_watermark 이하로 떨어지면 GC를 큐잉
@@ -2894,6 +3016,28 @@ static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512,
 	return w.status ? -EIO : 0;
 }
 
+/* c->lock held. A failed insertion must prevent the caller from resetting
+ * the source zone, even though the copy and its WAL record are durable. */
+static int gc_commit_relocation(struct zns_base_c *c,
+		struct gc_live_entry **entries, unsigned int count, sector_t data_phys)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		sector_t new_phys = data_phys + (sector_t)i * BLOCK_SECTORS;
+		int put = mapping_put_if_match(c, entries[i]->lba,
+					       entries[i]->phys, new_phys);
+
+		if (put < 0)
+			return put;
+		if (put == 0)
+			entries[i]->phys = new_phys;
+		else if (!mapping_get(c, entries[i]->lba, &entries[i]->phys))
+			return -EAGAIN;
+	}
+	return 0;
+}
+
 /* 최대 한 WAL page에 들어가는 live block을 연속 GC_DATA 공간에 기록하고,
  * 같은 묶음의 조건부 mapping 갱신을 WAL page 하나로 durable하게 만든다. */
 static int gc_relocate_batch(struct zns_base_c *c,
@@ -2938,8 +3082,11 @@ static int gc_relocate_batch(struct zns_base_c *c,
 	ret = zone_pool_alloc(c->zp, ZONE_TAG_GC_DATA, data_sectors,
 			      &data_phys, &new_data_zone, true);
 	spin_unlock_irq(&c->lock);
-	if (ret)
+	if (ret) {
+		DMERR("gc: data allocation failed (sectors=%llu err=%d)",
+		      (unsigned long long)data_sectors, ret);
 		goto out;
+	}
 	if (new_data_zone >= 0) {
 		struct zone_header *hdr = kzalloc(512, GFP_KERNEL);
 		sector_t hdr_phys = (sector_t)new_data_zone * c->zp->zone_sectors;
@@ -2976,9 +3123,13 @@ static int gc_relocate_batch(struct zns_base_c *c,
 	spin_lock_irq(&c->lock);
 	ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, WAL_PAGE_SECTORS,
 			      &wal_phys, &new_wal_zone, true);
+	if (!ret && c->gc_wal_budget >= WAL_PAGE_SECTORS)
+		c->gc_wal_budget -= WAL_PAGE_SECTORS;
 	spin_unlock_irq(&c->lock);
-	if (ret)
+	if (ret) {
+		DMERR("gc: WAL allocation failed (err=%d)", ret);
 		goto out;
+	}
 	if (new_wal_zone >= 0) {
 		struct zone_header *hdr = kzalloc(512, GFP_KERNEL);
 		sector_t hdr_phys = (sector_t)new_wal_zone * c->zp->zone_sectors;
@@ -3025,18 +3176,7 @@ static int gc_relocate_batch(struct zns_base_c *c,
 	}
 
 	spin_lock_irq(&c->lock);
-	for (i = 0; i < count; i++) {
-		sector_t old_phys = entries[i]->phys;
-		sector_t new_phys = data_phys + (sector_t)i * BLOCK_SECTORS;
-		int put = mapping_put_if_match(c, entries[i]->lba, old_phys, new_phys);
-
-		if (put == 0)
-			entries[i]->phys = new_phys;
-		else if (put == 1 && !mapping_get(c, entries[i]->lba, &entries[i]->phys))
-			ret = -EAGAIN;
-		if (ret)
-			break;
-	}
+	ret = gc_commit_relocation(c, entries, count, data_phys);
 	spin_unlock_irq(&c->lock);
 out:
 	if (wal)
@@ -3232,9 +3372,19 @@ static enum gc_reclaim_result gc_reclaim_one_victim(struct zns_base_c *c,
 	       jiffies_to_msecs(jiffies - victim_started));
 
 refresh_current:
-	/* snapshot 후 도착한 foreground overwrite를 반영. gc_active 덕분에
-	 * 이 순회 중 memtable이 frozen 상태로 숨지 않는다. 새 엔트리
-	 * 삽입은 필요 없고, 이미 victim 후보인 LBA의 최신 phys만 갱신. */
+	/* New LBAs must be inserted as well, including those written into a zone
+	 * that became closed during this GC cycle. */
+	{
+		int refresh_ret = gc_refresh_live_map(c, &live_map);
+
+		cycle->latest = live_map; /* resize may have replaced its allocation */
+		if (refresh_ret) {
+			DMERR("gc: live-map refresh failed (err=%d), no reset", refresh_ret);
+			goto out_free_snapshot;
+		}
+	}
+	/* Refresh overwrites that raced the snapshot merge. New keys were added
+	 * above; a closed/drained victim cannot receive further foreground writes. */
 	spin_lock_irq(&c->lock);
 	for (node = c->memtable->head->forward[0]; node; node = node->forward[0]) {
 		struct gc_live_entry *entry = gc_live_map_find(&live_map, node->lba);
@@ -3288,6 +3438,23 @@ refresh_current:
 	       (unsigned long long)(live_sectors / BLOCK_SECTORS),
 	       free_at_start);
 	relocation_started = jiffies;
+	/* Refuse partial evacuation without data + worst-case WAL workspace. */
+	{
+		unsigned int need, available;
+
+		spin_lock_irq(&c->lock);
+		need = gc_workspace_required(c, live_sectors);
+		available = gc_count_free_zones(c->zp);
+		if (available >= need)
+			c->gc_wal_budget = DIV_ROUND_UP_ULL(live_sectors / BLOCK_SECTORS,
+				WAL_PAGE_MAX_RECORDS) * WAL_PAGE_SECTORS;
+		spin_unlock_irq(&c->lock);
+		if (available < need) {
+			DMERR("gc: insufficient relocation workspace (free=%u need=%u), no reset",
+			      available, need);
+			goto out_free_snapshot;
+		}
+	}
 	reloc_batch = kvmalloc_array(live_sectors / BLOCK_SECTORS,
 				     sizeof(*reloc_batch), GFP_KERNEL);
 	if (!reloc_batch) {
@@ -3313,8 +3480,11 @@ refresh_current:
 		unsigned int batch_count = min_t(unsigned int,
 			WAL_PAGE_MAX_RECORDS, reloc_count - i);
 
-		if (gc_relocate_batch(c, &reloc_batch[i], batch_count)) {
-			DMERR("gc: relocation failed, aborting this round without resetting victim zone %u", victim);
+		int reloc_ret = gc_relocate_batch(c, &reloc_batch[i], batch_count);
+
+		if (reloc_ret) {
+			DMERR("gc: relocation failed (err=%d batch=%u), aborting this round without resetting victim zone %u",
+			      reloc_ret, i, victim);
 			ok = false;
 			break;
 		}
@@ -3336,6 +3506,21 @@ refresh_current:
 	if (!ok)
 		goto out_free_snapshot;
 
+	/* Every relocated LBA is now in memtable. Also catches new keys omitted
+	 * by any future snapshot bug. Never reset a zone still referenced there. */
+	spin_lock_irq(&c->lock);
+	for (node = c->memtable->head->forward[0]; node; node = node->forward[0]) {
+		if (node->phys >= vstart && node->phys < vend) {
+			ok = false;
+			break;
+		}
+	}
+	spin_unlock_irq(&c->lock);
+	if (!ok) {
+		DMERR("gc: reset blocked by live memtable reference to zone %u", victim);
+		goto out_free_snapshot;
+	}
+
 	/* 전부 성공 — victim zone에 더 이상 살아있는 데이터가 없다고 확신할 수 있으므로 실제로 회수.
 	 * reset 직전 진행 중인 읽기(read pin)가 전부 끝나길 기다린다(회수 안전). */
 	zone_wait_reads_drained(c->zp, victim);
@@ -3353,6 +3538,9 @@ refresh_current:
 	}
 
 out_free_snapshot:
+	spin_lock_irq(&c->lock);
+	c->gc_wal_budget = 0;
+	spin_unlock_irq(&c->lock);
 	kvfree(reloc_batch);
 	if (!cycle->built)
 		kvfree(live_map.entries);
@@ -3374,28 +3562,13 @@ static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag
 					   sector_t *phys_out, int *new_zone_out)
 {
 	int ret;
-	bool borrowed_reserve = false;
-	unsigned int free_count = 0;
-	unsigned int z;
 
 	spin_lock_irq(&c->lock);
-	ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out, false);
-	/* 모든 논리 LBA가 한 번씩 기록된 직후에는 기존 data zone이 전부
-	 * live라 GC victim이 없다. 이때 reserve 전체를 foreground에서 막으면
-	 * overwrite가 invalid block을 만들 수도 없어 영구 교착한다. GC가 한
-	 * cycle 무진전을 확인한 뒤 USER_DATA에 reserve 하나만 seed로 빌려주고,
-	 * 마지막 한 zone은 GC relocation용으로 반드시 남긴다. */
-	if (ret == -ENOSPC && tag == ZONE_TAG_USER_DATA &&
-	    c->gc_no_progress > 0) {
-		for (z = 0; z < c->zp->nr_zones; z++)
-			if (c->zp->zone_tag[z] == ZONE_TAG_FREE)
-				free_count++;
-		if (free_count > 1) {
-			ret = zone_pool_alloc(c->zp, tag, nr, phys_out,
-					      new_zone_out, true);
-			borrowed_reserve = !ret;
-		}
+	if (c->metadata_failed) {
+		spin_unlock_irq(&c->lock);
+		return -EIO;
 	}
+	ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out, false);
 	if (!ret) {
 		c->gc_no_progress = 0;
 	} else if (ret == -ENOSPC && c->gc_no_progress < 3) {
@@ -3408,9 +3581,6 @@ static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag
 		ret = -EAGAIN;
 	}
 	spin_unlock_irq(&c->lock);
-	if (borrowed_reserve)
-		DMINFO("foreground borrowed one GC reserve zone to seed invalidation (new_zone=%d, free_before=%u)",
-		       new_zone_out ? *new_zone_out : -1, free_count);
 
 	if (ret) {
 		if (ret == -ENOSPC) {
@@ -3535,11 +3705,18 @@ static void gc_work_fn(struct work_struct *work)
 	unsigned int ckpt_inflight;
 	unsigned int sealed_zone = ZONE_NONE;
 
+	if (READ_ONCE(c->metadata_failed) || READ_ONCE(c->stopping))
+		return;
+
 	/* frozen memtable은 active memtable에서는 빠졌지만 SSTable 색인에
 	 * 아직 등록되지 않은 순간이 있다. 그 때 latest-map을 만들면
 	 * 최신 overwrite를 놓칠 수 있으므로 진행 중 flush가 있으면 미루고,
 	 * GC가 끝날 때까지 새 memtable swap을 막는다. */
 	spin_lock_irq(&c->lock);
+	if (c->metadata_failed || c->stopping) {
+		spin_unlock_irq(&c->lock);
+		return;
+	}
 	free_at_start = gc_count_free_zones(c->zp);
 	ckpt_inflight = c->wal_ckpt_inflight;
 	if (c->wal_ckpt_inflight > 0) {
@@ -3687,6 +3864,10 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	if (argc != 1) {
 		ti->error = "expected one argument: underlying device";
+		return -EINVAL;
+	}
+	if (gc_reserved_zones < 2) {
+		ti->error = "GC requires at least two reserve zones (data and WAL)";
 		return -EINVAL;
 	}
 
@@ -3917,6 +4098,10 @@ static void zns_base_dtr(struct dm_target *ti)
 	cancel_work_sync(&c->wal_reclaim_work);
 
 	dm_put_device(ti, c->dev);
+	if (c->frozen_memtable) {
+		skiplist_destroy(c->frozen_memtable);
+		kfree(c->frozen_memtable);
+	}
 	skiplist_destroy(c->memtable);
 	kfree(c->memtable);
 	kfree(c->sstables);
@@ -3958,6 +4143,11 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 	sector_t offset_in_block;
 
 	pin->zone = -1;  /* 읽기 pin 없음이 기본 — READ 경로에서 필요 시에만 설정 */
+	if (READ_ONCE(c->metadata_failed)) {
+		bio->bi_status = BLK_STS_IOERR;
+		bio_endio(bio);
+		return DM_MAPIO_SUBMITTED;
+	}
 
 	/* 순수 flush 요청(nr=0)은 특정 LBA와 무관하므로 매핑 로직을 타면 안 됨.
 	 * bi_sector에 남은 임의값을 lba로 오인해 엉뚱한 매핑을 덮어쓰게 된다. */
@@ -4072,6 +4262,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 	}
 	case REQ_OP_READ: {
 		sector_t phys;
+		u64 view_epoch;
 		int found;
 		unsigned int nr_sst, actual_nr, nmatch, i;
 		struct sstable_info *candidates;
@@ -4087,6 +4278,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 			zone_read_get(c->zp, pin->zone);
 		}
 		nr_sst = c->nr_sstables;
+		view_epoch = c->read_view_epoch;
 		spin_unlock_irq(&c->lock);
 
 		if (found && phys == MAPPING_TOMBSTONE) {
@@ -4118,6 +4310,9 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		}
 		spin_lock_irq(&c->lock);
 		actual_nr = min(nr_sst, c->nr_sstables);
+		/* Keep the earlier epoch if the allocated snapshot was truncated. */
+		if (actual_nr == c->nr_sstables)
+			view_epoch = c->read_view_epoch;
 		memcpy(candidates, c->sstables, actual_nr * sizeof(*candidates));
 		/* in-range 후보만 남기고, 각 후보의 SSTable zone을 pin — probe가 그 zone을
 		 * 읽는 동안 compaction이 reset하지 못하게. pin은 반드시 스냅샷과 같은 락
@@ -4131,13 +4326,6 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 			}
 		}
 		spin_unlock_irq(&c->lock);
-
-		if (nmatch == 0) {
-			kfree(candidates);
-			zero_fill_bio(bio);
-			bio_endio(bio);
-			return DM_MAPIO_SUBMITTED;
-		}
 
 		rctx = kzalloc(sizeof(*rctx), GFP_NOIO);
 		if (!rctx) {
@@ -4163,6 +4351,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		rctx->offset_in_block = offset_in_block;
 		rctx->candidates = candidates;
 		rctx->nr_candidates = nmatch;
+		rctx->view_epoch = view_epoch;
 		rctx->idx = 0;
 		sstable_read_next_candidate(rctx);
 
