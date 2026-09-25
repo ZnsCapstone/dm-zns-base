@@ -28,6 +28,11 @@ def function(name):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_gc_preserves_foreground_active_tail(self):
+        worker = function("gc_work_fn")
+        self.assertNotRegex(worker,
+                            r"active_zone\[ZONE_TAG_USER_DATA\]\s*=\s*ZONE_NONE")
+
     def test_actual_c_helpers(self):
         names = ["mapping_get", "release_frozen_memtable", "gc_live_hash",
                  "gc_live_map_find", "gc_live_map_resize", "gc_live_map_update",
