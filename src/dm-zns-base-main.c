@@ -3713,7 +3713,6 @@ static void gc_work_fn(struct work_struct *work)
 	enum gc_reclaim_result result;
 	unsigned int free_at_start;
 	unsigned int ckpt_inflight;
-	unsigned int sealed_zone = ZONE_NONE;
 
 	if (READ_ONCE(c->metadata_failed) || READ_ONCE(c->stopping))
 		return;
@@ -3732,18 +3731,11 @@ static void gc_work_fn(struct work_struct *work)
 	if (c->wal_ckpt_inflight > 0) {
 		deferred = true;
 	} else {
-		unsigned int active = c->zp->active_zone[ZONE_TAG_USER_DATA];
-
-		/* 압박을 만든 overwrite는 대개 현재 USER_DATA zone에 몰려 있다.
-		 * active zone은 victim 후보에서 제외되므로, 이를 그대로 두면 GC가
-		 * 오래된 거의-live zone부터 복사한다. 새 foreground zone과 GC 이주
-		 * 공간이 모두 남아 있을 때 dirty active zone을 조기 seal한다. */
-		if (active != ZONE_NONE &&
-		    c->zp->invalid_count[active] > 0 &&
-		    free_at_start > gc_reserved_zones + 1) {
-			c->zp->active_zone[ZONE_TAG_USER_DATA] = ZONE_NONE;
-			sealed_zone = active;
-		}
+		/* Keep the foreground tail writable until normal allocator rollover.
+		 * A positive invalid hint does not imply positive relocation gain:
+		 * early sealing can strand most of a zone that GC then refuses to
+		 * reclaim. At the reserve boundary that tail cannot be replaced.
+		 * Active zones remain excluded by gc_select_victim(). */
 		c->gc_active = true;
 	}
 	spin_unlock_irq(&c->lock);
@@ -3752,10 +3744,6 @@ static void gc_work_fn(struct work_struct *work)
 		       ckpt_inflight, free_at_start);
 		return;
 	}
-	if (sealed_zone != ZONE_NONE)
-		DMINFO("gc: sealed active USER_DATA zone %u early (invalid_hint=%u, free_zones=%u)",
-		       sealed_zone, READ_ONCE(c->zp->invalid_count[sealed_zone]),
-		       free_at_start);
 	DMINFO("gc: worker started (free_zones=%u, start=%u, stop=%u, reserve=%u)",
 	       free_at_start, gc_low_watermark, gc_stop_watermark(),
 	       gc_reserved_zones);

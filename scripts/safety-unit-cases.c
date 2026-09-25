@@ -72,6 +72,16 @@ int main(void) {
     zp.zone_tag[1] = ZONE_TAG_USER_DATA;
     zp.active_zone[ZONE_TAG_USER_DATA] = ZONE_NONE;
     int new_zone;
+    /* Same reserve boundary, with a still-active partial USER_DATA zone:
+     * existing tail is usable without consuming either reserved zone.
+     * Clearing active (the former early-seal action) makes the same request
+     * fail despite the unchanged physical tail. */
+    zp.wp[1] = 307;
+    zp.active_zone[ZONE_TAG_USER_DATA] = 1;
+    assert(zone_pool_alloc(&zp, ZONE_TAG_USER_DATA, 8, &phys, &new_zone, false) == 0);
+    assert(phys == 1024 + 307 && new_zone == -1 && zp.wp[1] == 315);
+    assert(gc_count_free_zones(&zp) == 2);
+    zp.active_zone[ZONE_TAG_USER_DATA] = ZONE_NONE;
     assert(zone_pool_alloc(&zp, ZONE_TAG_USER_DATA, 8, &phys, &new_zone, false) == -ENOSPC);
     assert(zp.zone_tag[2] == ZONE_TAG_FREE && zp.zone_tag[3] == ZONE_TAG_FREE);
     zp.active_zone[ZONE_TAG_WAL] = ZONE_NONE;
