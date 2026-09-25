@@ -1,5 +1,20 @@
 # WIP: 공간 고갈 원인 검증 및 benchmark 4 통과 계획
 
+## 2026-09-25: H1 최소 수정
+
+게스트 kf5OWpjg에서 02:28:44 zone 11 early seal (invalid_hint=1,
+free=4), 이후 used=628576/live=628272인 동일 zone의 회수 거절과 free=2
+할당 실패가 관측됐다. GC worker의 조기 seal을 제거했다. 정상 allocator
+rollover, active victim 제외, reserve, 매핑/reset 안전장치는 변경하지 않았다.
+
+검증: production allocator 추출 C 테스트에서 reserve=2인 동일 상태를 두고
+active tail 사용 성공과 active 제거 후 ENOSPC를 비교했다. worker가 active를
+제거하지 않는 source guard는 수정 전 실패하고 수정 후 통과했다. 이는 전체
+worker/concurrency/FEMU 재현이 아니다. 기존 포함 5개 단위 테스트 통과.
+게스트 186 빌드와 EXT4/F2FS 짧은/1시간 검증은 아직 미완료다.
+이 수정으로 실패가 지연될 뿐인지 정상 순환이 회복되는지는 게스트에서 판정한다.
+아래의 추가 계측 및 H2/H3 검증 계획은 계속 필요하다.
+
 2026-09-24. 기준 코드: `00d0b54`.
 
 이 문서는 **검증 설계**다. 아래 추가 계측과 재현 테스트는 아직 구현하지
