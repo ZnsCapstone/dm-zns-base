@@ -6165,6 +6165,7 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	ti->private = c;
 	ti->num_flush_bios = 1;
+	ti->flush_supported = true;
 	ti->num_discard_bios = 1;
 	/* DISCARD is consumed by this target as mapping tombstones; it is not
 	 * forwarded to the host-managed lower device. */
