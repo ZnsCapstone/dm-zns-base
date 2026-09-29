@@ -33,6 +33,7 @@
 #include <linux/srcu.h>
 #include <linux/vmalloc.h>
 #include <linux/overflow.h>
+#include <linux/jiffies.h>
 
 #define DM_MSG_PREFIX "zns-base"
 #define ZNS_BASE_BLOCK_SIZE 4096
@@ -43,6 +44,10 @@
 #define IO_POOL_SIZE 128
 #define ZNS_BASE_MAX_WAL_GROUP_PAGES 64
 #define GC_RESERVE_ZONES 2
+/* Diagnostic only: no allocation, mapping or reset policy changes. */
+static bool gc_diagnostics = true;
+module_param(gc_diagnostics, bool, 0444);
+MODULE_PARM_DESC(gc_diagnostics, "log GC phases and progress (default enabled)");
 #define GC_DEFAULT_LOW_WATERMARK 3
 #define GC_DEFAULT_TARGET_FREE_ZONES 4
 #define ZNS_BASE_NO_ZONE ((unsigned int)-1)
@@ -1849,6 +1854,7 @@ static void zns_base_gc_work(struct work_struct *work)
 	struct zns_base_zone *victim;
   	unsigned int slot;
 	unsigned int reclaimable_blocks;
+	unsigned long phase_started, next_report;
   	int ret;
 
   	c = container_of(work, struct zns_base_c, gc_work);
@@ -1904,7 +1910,20 @@ static void zns_base_gc_work(struct work_struct *work)
 			continue;
 		}
 
+		phase_started = jiffies;
+		next_report = phase_started + 5 * HZ;
+		if (gc_diagnostics)
+			DMINFO("gc-diag: phase=move begin victim=%u slots=%u reclaimable=%u",
+			       (unsigned int)(victim - c->zone_state.zones),
+			       victim->nr_blocks, reclaimable_blocks);
 		for (slot = 0; slot < victim->nr_blocks; slot++) {
+			if (gc_diagnostics && time_after_eq(jiffies, next_report)) {
+				DMINFO("gc-diag: phase=move victim=%u scanned=%u/%u elapsed_ms=%u",
+				       (unsigned int)(victim - c->zone_state.zones),
+				       slot, victim->nr_blocks,
+				       jiffies_to_msecs(jiffies - phase_started));
+				next_report = jiffies + 5 * HZ;
+			}
   			ret = zns_base_gc_move_block(c, victim, slot);
   			if (ret)
   				break;
@@ -1916,6 +1935,10 @@ static void zns_base_gc_work(struct work_struct *work)
 		}
 
 		/* Publish every staged GC move before the victim can be reset. */
+		if (gc_diagnostics)
+			DMINFO("gc-diag: phase=wal-flush begin victim=%u move_elapsed_ms=%u",
+			       (unsigned int)(victim - c->zone_state.zones),
+			       jiffies_to_msecs(jiffies - phase_started));
 		ret = zns_base_wal_flush_sync(c);
 		if (ret) {
 			zns_base_release_victim(c, victim);
@@ -1924,13 +1947,22 @@ static void zns_base_gc_work(struct work_struct *work)
 
 		/* Selection statistics are only a heuristic.  Audit the exact,
 		 * versioned reverse map immediately before the destructive zone reset. */
+		if (gc_diagnostics)
+			DMINFO("gc-diag: phase=reset-guard begin victim=%u",
+			       (unsigned int)(victim - c->zone_state.zones));
 		ret = zns_base_gc_verify_reset_safe(c, victim);
 		if (ret) {
 			zns_base_release_victim(c, victim);
 			break;
 		}
 
+		if (gc_diagnostics)
+			DMINFO("gc-diag: phase=reset begin victim=%u",
+			       (unsigned int)(victim - c->zone_state.zones));
 		ret = zns_base_reset_victim(c, victim);
+		if (gc_diagnostics)
+			DMINFO("gc-diag: phase=reset end victim=%u ret=%d",
+			       (unsigned int)(victim - c->zone_state.zones), ret);
   		if (ret) {
   			zns_base_release_victim(c, victim);
   			break;
@@ -2562,6 +2594,8 @@ static bool zns_base_gc_space_ready(struct zns_base_c *c)
 static int zns_base_wait_for_gc_space(struct zns_base_c *c)
 {
 	bool attempted_gc = false;
+	unsigned long started = jiffies;
+	unsigned int free_zones, reserve;
 
 	for (;;) {
   		spin_lock(&c->lock);
@@ -2595,6 +2629,14 @@ static int zns_base_wait_for_gc_space(struct zns_base_c *c)
 
   		spin_unlock(&c->lock);
 
+		if (gc_diagnostics && !attempted_gc) {
+			spin_lock(&c->lock);
+			free_zones = zns_base_count_free_zones(c);
+			reserve = zns_base_foreground_reserve_locked(c);
+			spin_unlock(&c->lock);
+			DMINFO("gc-diag: phase=foreground-space-wait begin free=%u reserve=%u",
+			       free_zones, reserve);
+		}
 		/* lock 밖에서 GC를 예약해야 한다. */
 		zns_base_schedule_gc(c);
 		attempted_gc = true;
@@ -2604,6 +2646,9 @@ static int zns_base_wait_for_gc_space(struct zns_base_c *c)
   		 * 깨어나서 위 조건을 다시 검사한다.
   		 */
   		wait_event(c->gc_waitq, zns_base_gc_space_ready(c));
+		if (gc_diagnostics)
+			DMINFO("gc-diag: phase=foreground-space-wait wake elapsed_ms=%u",
+			       jiffies_to_msecs(jiffies - started));
   	}
 }
 
@@ -2700,12 +2745,25 @@ static int zns_base_gc_validate_victim(struct zns_base_c *c,
 	struct mapping_entry current_entry;
 	sector_t physical_sector;
 	unsigned int slot_idx;
+	unsigned int lookups = 0;
+	unsigned long started = jiffies;
+	unsigned long next_report = started + 5 * HZ;
 	int ret;
 
+	if (gc_diagnostics)
+		DMINFO("gc-diag: phase=validate begin victim=%u slots=%u",
+		       (unsigned int)(victim - c->zone_state.zones), victim->nr_blocks);
 	for (slot_idx = 0; slot_idx < victim->nr_blocks; slot_idx++) {
 		size_t logical_block;
 		u64 seq;
 
+		if (gc_diagnostics && time_after_eq(jiffies, next_report)) {
+			DMINFO("gc-diag: phase=validate victim=%u scanned=%u/%u lookups=%u elapsed_ms=%u",
+			       (unsigned int)(victim - c->zone_state.zones),
+			       slot_idx, victim->nr_blocks, lookups,
+			       jiffies_to_msecs(jiffies - started));
+			next_report = jiffies + 5 * HZ;
+		}
 		spin_lock(&c->lock);
 		if (victim->state != ZNS_BASE_ZONE_GC_VICTIM) {
 			spin_unlock(&c->lock);
@@ -2722,6 +2780,7 @@ static int zns_base_gc_validate_victim(struct zns_base_c *c,
 			((sector_t)slot_idx * SECTORS_PER_BLOCK);
 		spin_unlock(&c->lock);
 
+		lookups++;
 		ret = mapping_lookup(c, logical_block, &current_entry);
 		if (ret && ret != -ENOENT)
 			return ret;
@@ -2750,6 +2809,10 @@ static int zns_base_gc_validate_victim(struct zns_base_c *c,
 	}
 	*reclaimable_blocks = victim->nr_blocks - victim->valid_blocks;
 	spin_unlock(&c->lock);
+	if (gc_diagnostics)
+		DMINFO("gc-diag: phase=validate end victim=%u scanned=%u lookups=%u reclaimable=%u elapsed_ms=%u",
+		       (unsigned int)(victim - c->zone_state.zones), slot_idx,
+		       lookups, *reclaimable_blocks, jiffies_to_msecs(jiffies - started));
 	return 0;
 }
 
