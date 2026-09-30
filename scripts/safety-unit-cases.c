@@ -63,12 +63,163 @@ int main(void) {
     assert(gc_commit_relocation(&c, entries, 1, 501) == 0 && e.phys == 501);
 
     zp.active_zone[ZONE_TAG_GC_DATA] = ZONE_NONE;
+    zp.active_zone[ZONE_TAG_WAL] = ZONE_NONE;
     assert(gc_workspace_required(&c, 800) == 2);
     zp.active_zone[ZONE_TAG_GC_DATA] = 0;
     zp.wp[0] = 100;
+    zp.active_zone[ZONE_TAG_WAL] = 1;
+    zp.wp[1] = 1000; /* 24-sector WAL tail covers one 8-sector GC page. */
+    assert(gc_workspace_required(&c, 800) == 0);
+    assert(gc_workspace_required(&c, 1000) == 1);
+    zp.wp[1] = 1020;
     assert(gc_workspace_required(&c, 800) == 1);
     assert(gc_workspace_required(&c, 1000) == 2);
+    zp.wp[1] = 900; /* 124-sector tail: current 8 fits, next-victim floor does not. */
+    c.gc_wal_reserve = 120;
+    assert(gc_wal_tail_needs_roll(&c, 8));
+    assert(gc_workspace_required(&c, 800) == 1);
+    zp.wp[1] = 880; /* 144-sector tail covers current 8 + floor 120. */
+    assert(!gc_wal_tail_needs_roll(&c, 8));
+    assert(gc_workspace_required(&c, 800) == 0);
+    c.gc_wal_reserve = 0;
+    /* Normal GC requires data+WAL net gain. At reserve, a real data tail can
+     * bootstrap foreground progress, but a fully-live victim never can. */
+    assert(!gc_reclaim_gain_allowed(1000, 993, 3));
+    assert(gc_reclaim_gain_allowed(1000, 993, 2));
+    assert(!gc_reclaim_gain_allowed(1000, 1000, 2));
+    assert(gc_reclaim_gain_allowed(1000, 900, 3));
     zp.zone_tag[0] = ZONE_TAG_GC_DATA;
+    zp.zone_tag[1] = ZONE_TAG_WAL;
+    zp.zone_tag[2] = ZONE_TAG_FREE;
+    zp.zone_tag[3] = ZONE_TAG_FREE;
+    zp.wp[1] = 800; /* Seed worst-case 128 + full-victim GC WAL 8. */
+    assert(gc_seed_borrow_allowed(&c));
+    zp.zone_tag[3] = ZONE_TAG_USER_DATA;
+    assert(!gc_seed_borrow_allowed(&c)); /* never borrow the final free zone */
+    zp.zone_tag[3] = ZONE_TAG_FREE;
+    zp.wp[1] = 889; /* only 135 WAL sectors remain; 136 are required */
+    assert(!gc_seed_borrow_allowed(&c));
+    zp.wp[1] = 800;
+
+    /* At free=reserve or free=1, rotate only when the WAL cannot cover one
+     * full victim plus the following victim floor and the forced mapping
+     * snapshot fits in the existing SSTable tail. */
+    zp.zone_tag[0] = ZONE_TAG_SSTABLE;
+    zp.zone_tag[1] = ZONE_TAG_WAL;
+    zp.zone_tag[2] = ZONE_TAG_FREE;
+    zp.zone_tag[3] = ZONE_TAG_FREE;
+    zp.active_zone[ZONE_TAG_SSTABLE] = 0;
+    zp.active_zone[ZONE_TAG_WAL] = 1;
+    zp.wp[0] = 100;
+    zp.wp[1] = 900;
+    c.gc_wal_reserve = 120;
+    c.wal_rotation_pending = false;
+    c.wal_rotation_credit = false;
+    assert(gc_wal_rotation_needed(&c));
+    /* 100 sectors covers two 16-sector GC floors, but not the exact
+     * 16-sector full-victim GC WAL plus 128-sector foreground seed WAL. */
+    c.gc_wal_reserve = 16;
+    zp.wp[1] = 924;
+    assert(gc_wal_rotation_needed(&c));
+    c.gc_wal_reserve = 120;
+    zp.wp[1] = 760;
+    assert(!gc_wal_rotation_needed(&c)); /* ample old tail: no churn */
+    zp.wp[1] = 900;
+    zp.zone_tag[3] = ZONE_TAG_USER_DATA;
+    assert(gc_wal_rotation_needed(&c)); /* final free zone can rotate WAL */
+    zp.zone_tag[2] = ZONE_TAG_USER_DATA;
+    assert(!gc_wal_rotation_needed(&c)); /* no free zone to create WAL */
+    zp.zone_tag[2] = ZONE_TAG_FREE;
+    c.wal_rotation_credit = true;
+    assert(!gc_wal_rotation_needed(&c));
+    c.wal_rotation_credit = false;
+    c.wal_rotation_pending = true;
+    assert(!gc_wal_rotation_needed(&c));
+    c.wal_rotation_pending = false;
+    zp.zone_tag[3] = ZONE_TAG_FREE;
+
+    /* A compaction may borrow a reserve zone only when it covers every live
+     * table in the drained old active SSTable zone. */
+    struct sstable_info compact_victims[4] = {
+        { .phys = 10 }, { .phys = 20 }, { .phys = 30 }, { .phys = 40 }
+    };
+    zp.active_zone[ZONE_TAG_SSTABLE] = 0;
+    zp.zone_tag[0] = ZONE_TAG_SSTABLE;
+    zp.zone_tag[1] = ZONE_TAG_WAL;
+    zp.zone_tag[2] = ZONE_TAG_FREE;
+    zp.zone_tag[3] = ZONE_TAG_USER_DATA;
+    zp.wp[0] = 500;
+    zp.dispatch_wp[0] = 500;
+    zp.sstable_live_count[0] = 4;
+    c.wal_ckpt_inflight = 0;
+    c.gc_active = false;
+    assert(sstable_compaction_can_borrow_reserve(&c, compact_victims, 4, 0));
+    zp.sstable_live_count[0] = 5;
+    assert(!sstable_compaction_can_borrow_reserve(&c, compact_victims, 4, 0));
+    zp.sstable_live_count[0] = 4;
+    zp.dispatch_wp[0] = 499;
+    assert(!sstable_compaction_can_borrow_reserve(&c, compact_victims, 4, 0));
+    zp.dispatch_wp[0] = 500;
+    c.wal_ckpt_inflight = 1;
+    assert(!sstable_compaction_can_borrow_reserve(&c, compact_victims, 4, 0));
+    c.wal_ckpt_inflight = 0;
+    c.gc_active = true;
+    assert(!sstable_compaction_can_borrow_reserve(&c, compact_victims, 4, 0));
+    assert(sstable_compaction_reserve_reclaimable(&c, compact_victims, 4, 0));
+    c.gc_active = false;
+    sector_t fresh_phys = 0;
+    int fresh_zone = -1;
+    assert(zone_pool_alloc_fresh(&zp, ZONE_TAG_SSTABLE, 100,
+                                 &fresh_phys, &fresh_zone, true) == 0);
+    assert(fresh_zone == 2 && fresh_phys == 2 * 1024 + 1);
+    assert(zp.active_zone[ZONE_TAG_SSTABLE] == 2 && zp.wp[2] == 101);
+    assert(zp.wp[0] == 500); /* old active tail was deliberately untouched */
+    zp.zone_tag[2] = ZONE_TAG_FREE;
+    zp.wp[2] = 0;
+    zp.active_zone[ZONE_TAG_SSTABLE] = 0;
+    struct sstable_info flush_inputs[3] = {
+        { .phys = 10, .record_count = 1000 },
+        { .phys = 20, .record_count = 1000 },
+        { .phys = 30, .record_count = 1000 }
+    };
+    c.sstables = flush_inputs;
+    c.nr_sstables = 3;
+    c.wal_ckpt_inflight = 1;
+    zp.sstable_live_count[0] = 3;
+    assert(sstable_flush_can_borrow_reserve(&c, 1000, 33, 0));
+    c.nr_sstables = 2;
+    assert(!sstable_flush_can_borrow_reserve(&c, 1000, 33, 0));
+    c.nr_sstables = 3;
+    flush_inputs[2].phys = 1024 + 30;
+    assert(!sstable_flush_can_borrow_reserve(&c, 1000, 33, 0));
+    flush_inputs[2].phys = 30;
+    c.wal_ckpt_inflight = 2;
+    assert(!sstable_flush_can_borrow_reserve(&c, 1000, 33, 0));
+    c.wal_ckpt_inflight = 1;
+    assert(!sstable_flush_can_borrow_reserve(&c, 40000, 800, 0));
+    c.sstables = NULL;
+    c.nr_sstables = 0;
+    c.wal_ckpt_inflight = 0;
+    zp.zone_tag[2] = ZONE_TAG_USER_DATA;
+    assert(!sstable_compaction_can_borrow_reserve(&c, compact_victims, 4, 0));
+    zp.zone_tag[2] = ZONE_TAG_FREE;
+    zp.zone_tag[3] = ZONE_TAG_FREE;
+
+    zp.zone_tag[0] = ZONE_TAG_GC_DATA;
+    zp.active_zone[ZONE_TAG_USER_DATA] = ZONE_NONE;
+    sector_t shared_phys;
+    unsigned int shared_zone;
+    zp.active_zone[ZONE_TAG_GC_DATA] = 0;
+    zp.wp[0] = 900;
+    assert(zone_pool_handoff_gc_tail(&zp, 8, &shared_phys, &shared_zone) == 0);
+    assert(shared_zone == 0 && shared_phys == 900 && zp.wp[0] == 908);
+    assert(zp.active_zone[ZONE_TAG_GC_DATA] == ZONE_NONE);
+    assert(zp.active_zone[ZONE_TAG_USER_DATA] == 0);
+    assert(zone_pool_zone_is_active(&zp, 0));
+    zp.active_zone[ZONE_TAG_GC_DATA] = 0;
+    zp.active_zone[ZONE_TAG_USER_DATA] = ZONE_NONE;
+    zp.wp[0] = 1020;
+    assert(zone_pool_handoff_gc_tail(&zp, 8, &shared_phys, NULL) == -ENOSPC);
     zp.zone_tag[1] = ZONE_TAG_USER_DATA;
     zp.active_zone[ZONE_TAG_USER_DATA] = ZONE_NONE;
     int new_zone;
@@ -81,6 +232,7 @@ int main(void) {
     assert(zone_pool_alloc(&zp, ZONE_TAG_USER_DATA, 8, &phys, &new_zone, false) == 0);
     assert(phys == 1024 + 307 && new_zone == -1 && zp.wp[1] == 315);
     assert(gc_count_free_zones(&zp) == 2);
+
     zp.active_zone[ZONE_TAG_USER_DATA] = ZONE_NONE;
     assert(zone_pool_alloc(&zp, ZONE_TAG_USER_DATA, 8, &phys, &new_zone, false) == -ENOSPC);
     assert(zp.zone_tag[2] == ZONE_TAG_FREE && zp.zone_tag[3] == ZONE_TAG_FREE);
@@ -92,6 +244,10 @@ int main(void) {
     assert(foreground_wal_allowed(&c, 8));
     c.gc_wal_budget = 0;
     assert(foreground_wal_allowed(&c, 8));
+    c.gc_wal_reserve = 1000;
+    assert(!foreground_wal_allowed(&c, 25));
+    assert(foreground_wal_allowed(&c, 15));
+    c.gc_wal_reserve = 0;
     /* An old SSTable hit must lose to a frozen map even if active misses. */
     struct fake_device dev = {0};
     struct bio bio = {0};
