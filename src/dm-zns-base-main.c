@@ -199,6 +199,7 @@ struct zns_base_c {
 	struct work_struct compaction_work;  // compaction_wq에 큐잉되는 백그라운드 작업
 	struct work_struct gc_work;          // gc_wq에 큐잉되는 백그라운드 작업
 	struct work_struct wal_reclaim_work; // wal_reclaim_wq에 큐잉되는 백그라운드 작업
+	struct delayed_work wal_rotate_work;  // reserve 경계의 WAL 세대 선회/checkpoint
 	struct delayed_work wal_batch_work;
 	struct list_head wal_pending;
 	unsigned int wal_pending_count;
@@ -219,7 +220,14 @@ struct zns_base_c {
 	u64 wal_durable_split_gen;          // 이 값보다 작은 gen의 WAL zone은 회수 가능
 	wait_queue_head_t flush_waitq;      // dtr에서 비동기 flush chain drain 대기
 	bool gc_active;                     // GC latest-map 구축/이주 중 memtable swap 금지
+	bool gc_foreground_pause;           /* approved victim relocation drains new foreground */
+	bool sstable_rotation_pending;      /* compaction owns reserve-boundary metadata rotation */
 	sector_t gc_wal_budget;             /* remaining WAL sectors for current victim */
+	sector_t gc_wal_reserve;            /* WAL floor while foreground owns one reserve zone */
+	bool wal_rotation_pending;          /* stop new mappings while old WAL generation drains */
+	bool wal_rotation_credit;           /* one reserve seed may use the freshly rotated WAL */
+	unsigned int wal_rotation_old_zone; /* old WAL zone reclaimed before foreground resumes */
+	unsigned int foreground_handoff_gc_zone; /* last GC tail handed to foreground */
 	unsigned int gc_no_progress;        // 연속으로 공간을 못 만든 GC cycle 수
 
 	spinlock_t 		lock;
@@ -306,6 +314,7 @@ struct wal_record {
 };
 
 #define WAL_PAGE_MAX_RECORDS ((PAGE_SIZE - 16) / sizeof(struct wal_record))
+#define GC_RELOC_WAL_PAGES 16
 struct wal_page {
 	__le32 magic;
 	__le16 version;
@@ -445,6 +454,64 @@ static int zone_pool_alloc(struct zone_pool *zp, enum zone_tag tag, sector_t nr,
 	*phys_out = z * zp->zone_sectors + zp->wp[z];
 	zp->wp[z] += nr;
 	return 0;
+}
+
+/* Deliberately rotate away from a still-writable active tail.  This is not a
+ * general allocator policy: reserve-boundary SSTable compaction uses it only
+ * after proving that its commit removes every live reference from the old
+ * active zone, so the borrowed FREE zone is repaid by that same operation. */
+static int zone_pool_alloc_fresh(struct zone_pool *zp, enum zone_tag tag,
+				  sector_t nr, sector_t *phys_out,
+				  int *new_zone_out, bool gc_ctx)
+{
+	unsigned int z;
+
+	if (new_zone_out)
+		*new_zone_out = -1;
+	if (nr > zp->zone_sectors - 1)
+		return -ENOSPC;
+	z = zone_pool_acquire_free(zp, tag, gc_ctx);
+	if (z == ZONE_NONE)
+		return -ENOSPC;
+	zp->active_zone[tag] = z;
+	if (tag == ZONE_TAG_WAL)
+		zp->wal_gen[z] = zp->wal_next_gen++;
+	if (new_zone_out)
+		*new_zone_out = z;
+	*phys_out = (sector_t)z * zp->zone_sectors + zp->wp[z];
+	zp->wp[z] += nr;
+	return 0;
+}
+
+/* c->lock held by caller and no GC worker active. USER_DATA and GC_DATA have
+ * the same on-disk block format, so transfer sole ownership of a partially
+ * filled GC tail to foreground. This must never run concurrently with GC:
+ * foreground uses Zone Append while GC uses positional writes. */
+static int zone_pool_handoff_gc_tail(struct zone_pool *zp, sector_t nr,
+				      sector_t *phys_out, unsigned int *zone_out)
+{
+	unsigned int z = zp->active_zone[ZONE_TAG_GC_DATA];
+
+	if (z == ZONE_NONE || zp->wp[z] + nr > zp->zone_sectors)
+		return -ENOSPC;
+	zp->active_zone[ZONE_TAG_GC_DATA] = ZONE_NONE;
+	zp->active_zone[ZONE_TAG_USER_DATA] = z;
+	*phys_out = (sector_t)z * zp->zone_sectors + zp->wp[z];
+	zp->wp[z] += nr;
+	if (zone_out)
+		*zone_out = z;
+	return 0;
+}
+
+/* A shared data zone stays active until every allocator rolls away. */
+static bool zone_pool_zone_is_active(struct zone_pool *zp, unsigned int zone)
+{
+	unsigned int tag;
+
+	for (tag = 0; tag < ZONE_TAG_COUNT; tag++)
+		if (zp->active_zone[tag] == zone)
+			return true;
+	return false;
 }
 
 /* 실제 ZNS zone reset 명령을 하드웨어에 동기적으로 보낸다 — process
@@ -1232,8 +1299,10 @@ static void pending_write_work_fn(struct work_struct *work);
 
 static void foreground_write_done(struct zns_base_c *c)
 {
-	if (atomic_dec_and_test(&c->foreground_writes))
+	if (atomic_dec_and_test(&c->foreground_writes)) {
+		wake_up_all(&c->flush_waitq);
 		mod_delayed_work(zns_wq, &c->pending_flush_work, 0);
+	}
 }
 
 /* 새 zone의 헤더가 없으면 그 뒤의 데이터는 재시작 후 식별할 수 없다.
@@ -1293,7 +1362,7 @@ static void flush_memtable_work_fn(struct work_struct *work)
 /* c->lock을 잡은 상태에서 호출. GC가 flush 임계값 통과 순간을 가리고
  * 있었더라도 GC 종료 경로가 같은 스왑을 재시도할 수 있게 한곳에 둔다. */
 static struct memtable_flush_work *
-schedule_memtable_flush_locked(struct zns_base_c *c)
+schedule_memtable_flush_locked(struct zns_base_c *c, bool force)
 {
 	struct memtable_flush_work *flush_work;
 	struct skiplist *new_memtable;
@@ -1303,8 +1372,11 @@ schedule_memtable_flush_locked(struct zns_base_c *c)
 	u64 flushed_split_gen;
 	sector_t flushed_split_off;
 
-	if (c->gc_active || c->wal_ckpt_inflight || c->metadata_failed ||
-	    c->stopping || c->memtable->count < flush_threshold)
+	if (c->gc_active || c->sstable_rotation_pending ||
+	    c->wal_ckpt_inflight || c->metadata_failed ||
+	    (!force && c->wal_rotation_pending) ||
+	    c->stopping || (!force && c->memtable->count < flush_threshold) ||
+	    (force && !c->memtable->count))
 		return NULL;
 
 	wal_zone = c->zp->active_zone[ZONE_TAG_WAL];
@@ -1518,7 +1590,7 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 		ret = mapping_put(c, lba, phys);
 	}
 	if (!ret && allow_flush)
-		flush_work = schedule_memtable_flush_locked(c);
+		flush_work = schedule_memtable_flush_locked(c, false);
 	spin_unlock_irq(&c->lock);
 	/* Zone Append는 일반 dispatch gate를 통과하지 않으므로 완료 시점에
 	 * 예약 순서 회계를 직접 전진시킨다. data는 mapping_put 뒤에 완료
@@ -1543,7 +1615,7 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 }
 
 static int wal_page_append_sync(struct zns_base_c *c, sector_t reserved_phys,
-				void *buf, sector_t nr_sectors)
+				void *buf, sector_t nr_sectors, bool fua)
 {
 	struct bio *bio = bio_alloc(GFP_KERNEL, 1);
 	int ret;
@@ -1553,7 +1625,7 @@ static int wal_page_append_sync(struct zns_base_c *c, sector_t reserved_phys,
 	bio_set_dev(bio, c->dev->bdev);
 	bio->bi_iter.bi_sector = (sector_t)zone_of(c->zp, reserved_phys) *
 				 c->zp->zone_sectors;
-	bio->bi_opf = REQ_OP_ZONE_APPEND | REQ_SYNC | REQ_FUA;
+	bio->bi_opf = REQ_OP_ZONE_APPEND | REQ_SYNC | (fua ? REQ_FUA : 0);
 	if (bio_add_page(bio, virt_to_page(buf), nr_sectors * 512, 0) !=
 	    nr_sectors * 512) {
 		bio_put(bio);
@@ -1571,10 +1643,18 @@ static bool foreground_wal_allowed(struct zns_base_c *c, sector_t nr)
 {
 	unsigned int z = c->zp->active_zone[ZONE_TAG_WAL];
 	sector_t tail = z == ZONE_NONE ? 0 : c->zp->zone_sectors - c->zp->wp[z];
+	sector_t protected = max(c->gc_wal_budget, c->gc_wal_reserve);
 
-	return !c->gc_wal_budget ||
+	/* Rotation first drains data appends which were already admitted. No new
+	 * foreground data allocation is allowed meanwhile, so this is a finite
+	 * set. Let those WAL records consume the protected tail; otherwise the
+	 * rotation worker would wait forever for foreground_writes to reach zero. */
+	if (c->wal_rotation_pending)
+		return tail >= nr;
+
+	return !protected ||
 		gc_count_free_zones(c->zp) > gc_reserved_zones ||
-		tail >= c->gc_wal_budget + nr;
+		tail >= protected + nr;
 }
 
 static void wal_batch_work_fn(struct work_struct *work)
@@ -1690,7 +1770,7 @@ static void wal_batch_work_fn(struct work_struct *work)
 			zone_append_header_done(c, new_zone, 0);
 	}
 	if (!ret) {
-		ret = wal_page_append_sync(c, wal_phys, page, wal_sectors);
+		ret = wal_page_append_sync(c, wal_phys, page, wal_sectors, true);
 		if (ret)
 			DMERR("foreground WAL append failed: err=%d zone=%u reserved=%llu+%llu records=%u new_zone=%d",
 			      ret, zone_of(c->zp, wal_phys),
@@ -2011,6 +2091,46 @@ static void sstable_write_chunk_done(struct bio *bio)
 	sstable_flush_complete(ctx, 0);  /* 전 청크 durable */
 }
 
+/* c->lock held, and the caller has drained zns_compaction_wq.  A normal
+ * memtable flush may be the operation that first outgrows the active SSTable
+ * tail, before compaction gets an allocation attempt of its own.  Borrow one
+ * reserve zone only for the steady-state k-1 -> k transition where every
+ * existing live table is in the old active zone.  Publishing this flush then
+ * necessarily queues a k-way compaction containing all old-zone references.
+ * Reserve enough of the fresh zone for both this flush and the worst-case
+ * (no duplicate discarded) merged output, so that compaction can commit and
+ * reset old_zone without asking for another free zone. */
+static bool sstable_flush_can_borrow_reserve(struct zns_base_c *c,
+					     u64 flush_records,
+					     sector_t flush_sectors,
+					     unsigned int old_zone)
+{
+	u64 merged_records = flush_records;
+	sector_t merged_sectors;
+	unsigned int free_zones = gc_count_free_zones(c->zp);
+	unsigned int i;
+
+	if (old_zone == ZONE_NONE || compaction_k < 2 ||
+	    c->nr_sstables != compaction_k - 1 ||
+	    c->zp->sstable_live_count[old_zone] != c->nr_sstables ||
+	    !free_zones || free_zones > gc_reserved_zones ||
+	    c->gc_active || c->wal_rotation_pending ||
+	    c->wal_ckpt_inflight != 1 ||
+	    c->zp->dispatch_wp[old_zone] !=
+		(sector_t)old_zone * c->zp->zone_sectors + c->zp->wp[old_zone])
+		return false;
+
+	for (i = 0; i < c->nr_sstables; i++) {
+		if (zone_of(c->zp, c->sstables[i].phys) != old_zone)
+			return false;
+		merged_records += c->sstables[i].record_count;
+	}
+
+	merged_sectors = (512 + round_up(merged_records *
+					     sizeof(struct sstable_record), 512)) / 512;
+	return 1 + flush_sectors + merged_sectors <= c->zp->zone_sectors;
+}
+
 /* memtable 하나를 SSTable 한 세대로 직렬화해서 zone에 기록. 전용 flush worker의
  * process context에서 호출되므로 큰 버퍼는 kvzalloc(GFP_KERNEL)로 잡을 수 있다.
  * old_memtable은 이미 c->memtable에서 떼어져 나온 상태라 락 없이 순회해도 안전.
@@ -2027,6 +2147,8 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 	sector_t nr_sectors;
 	sector_t phys;
 	int new_sstable_zone;
+	unsigned int old_sstable_zone = ZONE_NONE;
+	bool borrowed_reserve = false;
 	struct zns_io_ctx *ctx;
 	u64 i = 0;
 	int ret;
@@ -2071,8 +2193,30 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 	}
 
 	spin_lock_irq(&c->lock);
-	ret = zone_pool_alloc(c->zp, ZONE_TAG_SSTABLE, nr_sectors, &phys, &new_sstable_zone, false);
+	ret = zone_pool_alloc(c->zp, ZONE_TAG_SSTABLE, nr_sectors,
+			      &phys, &new_sstable_zone, false);
 	spin_unlock_irq(&c->lock);
+	if (ret == -ENOSPC) {
+		/* A previously queued compaction may free tail/zone space.  Drain it
+		 * before deciding whether this flush is the safe k-th table that may
+		 * rotate the full active SSTable zone. */
+		flush_workqueue(zns_compaction_wq);
+		spin_lock_irq(&c->lock);
+		ret = zone_pool_alloc(c->zp, ZONE_TAG_SSTABLE, nr_sectors,
+				      &phys, &new_sstable_zone, false);
+		if (ret == -ENOSPC) {
+			old_sstable_zone = c->zp->active_zone[ZONE_TAG_SSTABLE];
+			if (sstable_flush_can_borrow_reserve(c, old_memtable->count,
+							 nr_sectors,
+							 old_sstable_zone)) {
+				ret = zone_pool_alloc(c->zp, ZONE_TAG_SSTABLE,
+						      nr_sectors, &phys,
+						      &new_sstable_zone, true);
+				borrowed_reserve = !ret;
+			}
+		}
+		spin_unlock_irq(&c->lock);
+	}
 	if (ret) {
 		DMERR("SSTable flush: zone_pool_alloc failed (%d, seq=%llu); retaining frozen map and failing I/O closed",
 		      ret, (unsigned long long)seq_no);
@@ -2081,6 +2225,9 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 		flush_chain_end(c);
 		return;
 	}
+	if (borrowed_reserve)
+		DMINFO("SSTable flush: borrowed reserve zone %d to rotate full SSTable zone %u",
+		       new_sstable_zone, old_sstable_zone);
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx) {
@@ -2426,6 +2573,54 @@ static u64 merge_sstable_sources(struct compaction_source *srcs, unsigned int nr
 	return out_count;
 }
 
+/* c->lock held.  Compaction normally obeys the foreground reserve, but once
+ * the active SSTable zone cannot hold the merged output that rule can leave
+ * the metadata lifecycle permanently stuck: the old active zone cannot be
+ * reset until the output is written somewhere else.  Borrow one reserve zone
+ * only when this very compaction contains every live table in the old active
+ * zone.  No flush may still have an unregistered reservation there.  After
+ * the new table is durable, the normal commit path removes all old references
+ * and necessarily resets old_zone, so the borrow is space-neutral.
+ *
+ * A concurrent future flush is safe after the allocation: zone_pool_alloc()
+ * switches active_zone[SSTABLE] to the new zone under the same lock. */
+static bool sstable_compaction_reserve_reclaimable(struct zns_base_c *c,
+						    struct sstable_info *victims,
+						    unsigned int nr_victims,
+						    unsigned int old_zone)
+{
+	unsigned int free_zones = gc_count_free_zones(c->zp);
+	unsigned int victim_refs = 0;
+	unsigned int i;
+
+	if (old_zone == ZONE_NONE || !free_zones ||
+	    free_zones > gc_reserved_zones ||
+	    c->zp->dispatch_wp[old_zone] !=
+		(sector_t)old_zone * c->zp->zone_sectors + c->zp->wp[old_zone])
+		return false;
+
+	for (i = 0; i < nr_victims; i++)
+		if (zone_of(c->zp, victims[i].phys) == old_zone)
+			victim_refs++;
+
+	return victim_refs &&
+		victim_refs == c->zp->sstable_live_count[old_zone];
+}
+
+/* c->lock held.  Separate the durable reclaim guarantee above from transient
+ * owners.  A compaction that is structurally able to return old_zone may ask
+ * an already-running GC cycle to yield, then re-check this ready predicate. */
+static bool sstable_compaction_can_borrow_reserve(struct zns_base_c *c,
+						  struct sstable_info *victims,
+						  unsigned int nr_victims,
+						  unsigned int old_zone)
+{
+	return !c->gc_active && !c->wal_rotation_pending &&
+		!c->wal_ckpt_inflight &&
+		sstable_compaction_reserve_reclaimable(c, victims, nr_victims,
+						       old_zone);
+}
+
 /* compaction_wq 워커(process context, submit_bio_wait/GFP_KERNEL 사용 가능).
  * 가장 오래된 compaction_k개를 읽어 k-way merge한 뒤 새 SSTable로 동기 기록하고,
  * 그게 durable해진 다음에야 옛 색인 제거 + 하드웨어 reset — 이 순서 덕분에 어느 지점에서 크래시가 나도 안전. */
@@ -2451,6 +2646,12 @@ static void compaction_work_fn(struct work_struct *work)
 	sector_t nr_sectors = 0;
 	sector_t new_phys = 0;
 	int new_zone = -1;
+	unsigned int old_sstable_zone = ZONE_NONE;
+	bool borrowed_reserve = false;
+	bool proactive_rotation = false;
+	bool rotation_pending_owned = false;
+	struct memtable_flush_work *deferred_flush = NULL;
+	bool retry_gc = false;
 	u64 out_seq_no = 0;
 	u64 merged_min_lba = 0, merged_max_lba = 0;
 
@@ -2545,12 +2746,70 @@ static void compaction_work_fn(struct work_struct *work)
 	memcpy(out_rec, merged, merged_count * sizeof(struct sstable_record));
 
 	spin_lock_irq(&c->lock);
-	ret = zone_pool_alloc(c->zp, ZONE_TAG_SSTABLE, nr_sectors, &new_phys, &new_zone, false);
+	old_sstable_zone = c->zp->active_zone[ZONE_TAG_SSTABLE];
+	/* At the reserve boundary, do not keep appending compacted outputs to a
+	 * still-writable metadata tail.  That eventually strands the next normal
+	 * flush before it reaches the exact k-1 -> k emergency guard.  If this
+	 * compaction owns every live reference in old_sstable_zone, rotate now:
+	 * its durable commit necessarily resets old_sstable_zone, so borrowing the
+	 * fresh zone is space-neutral and the next compaction cycle starts empty. */
+	if (sstable_compaction_can_borrow_reserve(c, snapshot, k,
+						 old_sstable_zone)) {
+		ret = zone_pool_alloc_fresh(c->zp, ZONE_TAG_SSTABLE, nr_sectors,
+					    &new_phys, &new_zone, true);
+		borrowed_reserve = !ret;
+		proactive_rotation = !ret;
+	} else if (c->gc_active && !c->wal_rotation_pending &&
+		   !c->wal_ckpt_inflight && !c->sstable_rotation_pending &&
+		   sstable_compaction_reserve_reclaimable(c, snapshot, k,
+							 old_sstable_zone)) {
+		/* GC and compaction use different workers.  Stop new memtable swaps,
+		 * ask GC to yield at its next victim boundary, and retain the already
+		 * built merge buffers while waiting for the proactive rotation. */
+		c->sstable_rotation_pending = true;
+		rotation_pending_owned = true;
+		ret = -EAGAIN;
+	} else {
+		ret = zone_pool_alloc(c->zp, ZONE_TAG_SSTABLE, nr_sectors,
+				      &new_phys, &new_zone, false);
+		if (ret == -ENOSPC &&
+		    sstable_compaction_can_borrow_reserve(c, snapshot, k,
+							 old_sstable_zone)) {
+			ret = zone_pool_alloc(c->zp, ZONE_TAG_SSTABLE, nr_sectors,
+					      &new_phys, &new_zone, true);
+			borrowed_reserve = !ret;
+		}
+	}
 	spin_unlock_irq(&c->lock);
+
+	if (rotation_pending_owned) {
+		DMINFO("compaction: waiting for active GC to yield before reserve-boundary SSTable rotation");
+		wait_event(c->flush_waitq,
+			   !READ_ONCE(c->gc_active) || READ_ONCE(c->stopping) ||
+			   READ_ONCE(c->metadata_failed));
+		spin_lock_irq(&c->lock);
+		if (c->stopping || c->metadata_failed) {
+			ret = -EIO;
+		} else if (sstable_compaction_can_borrow_reserve(c, snapshot, k,
+							 old_sstable_zone)) {
+			ret = zone_pool_alloc_fresh(c->zp, ZONE_TAG_SSTABLE,
+						    nr_sectors, &new_phys,
+						    &new_zone, true);
+			borrowed_reserve = !ret;
+			proactive_rotation = !ret;
+		} else {
+			ret = zone_pool_alloc(c->zp, ZONE_TAG_SSTABLE, nr_sectors,
+					      &new_phys, &new_zone, false);
+		}
+		spin_unlock_irq(&c->lock);
+	}
 	if (ret) {
 		DMERR("compaction: zone_pool_alloc failed (%d), aborting this run — old SSTables remain valid", ret);
 		goto out_free_out_buf;
 	}
+	if (borrowed_reserve)
+		DMINFO("compaction: borrowed reserve zone %d to rotate full SSTable zone %u (proactive=%u)",
+		       new_zone, old_sstable_zone, proactive_rotation ? 1 : 0);
 
 	if (new_zone >= 0) {
 		struct zone_header *zhdr = kzalloc(512, GFP_KERNEL);
@@ -2666,6 +2925,19 @@ out_free_sources:
 	kvfree(discarded);
 out_free_snapshot:
 	kvfree(snapshot);
+	if (rotation_pending_owned) {
+		spin_lock_irq(&c->lock);
+		c->sstable_rotation_pending = false;
+		deferred_flush = schedule_memtable_flush_locked(c, false);
+		retry_gc = !c->stopping && !c->metadata_failed &&
+			gc_count_free_zones(c->zp) <= gc_low_watermark;
+		spin_unlock_irq(&c->lock);
+		wake_up_all(&c->flush_waitq);
+		if (deferred_flush)
+			queue_work(zns_flush_wq, &deferred_flush->work);
+		if (retry_gc)
+			queue_work(zns_gc_wq, &c->gc_work);
+	}
 }
 
 /* ============================================================================
@@ -2889,14 +3161,210 @@ static unsigned int gc_count_free_zones(struct zone_pool *zp)
 	return count;
 }
 
-/* Called with c->lock. Foreground cannot consume GC_DATA tails. Always allow
- * a full extra WAL zone: foreground may consume its current tail concurrently. */
+struct gc_space_state_row {
+	enum zone_tag tag;
+	sector_t wp;
+	sector_t dispatch_wp;
+	unsigned int invalid_count;
+};
+
+/* Capture the reserve-boundary state once per no-progress episode.  Keep
+ * printk out of c->lock: on the FEMU target one snapshot is only 16 rows, but
+ * console I/O while holding the allocator lock can still stall foreground I/O.
+ */
+static void gc_log_no_progress_state(struct zns_base_c *c,
+				      unsigned int no_progress)
+{
+	struct gc_space_state_row *rows;
+	unsigned int active[ZONE_TAG_COUNT];
+	sector_t active_tail[ZONE_TAG_COUNT] = { 0 };
+	unsigned int free_zones;
+	unsigned int nr_zones = c->zp->nr_zones;
+	unsigned int tag, z;
+
+	rows = kvmalloc_array(nr_zones, sizeof(*rows), GFP_KERNEL);
+	if (!rows) {
+		DMERR("gc: no-progress state snapshot allocation failed (zones=%u)",
+		      nr_zones);
+		return;
+	}
+
+	spin_lock_irq(&c->lock);
+	free_zones = gc_count_free_zones(c->zp);
+	for (tag = 0; tag < ZONE_TAG_COUNT; tag++)
+		active[tag] = c->zp->active_zone[tag];
+	for (z = 0; z < nr_zones; z++) {
+		rows[z].tag = c->zp->zone_tag[z];
+		rows[z].wp = c->zp->wp[z];
+		rows[z].dispatch_wp = c->zp->dispatch_wp[z];
+		rows[z].invalid_count = c->zp->invalid_count[z];
+	}
+	for (tag = 0; tag < ZONE_TAG_COUNT; tag++) {
+		z = active[tag];
+		if (z < nr_zones && rows[z].wp <= c->zp->zone_sectors)
+			active_tail[tag] = c->zp->zone_sectors - rows[z].wp;
+	}
+	spin_unlock_irq(&c->lock);
+
+	DMERR("gc: no-progress state (count=%u free=%u reserve=%u zones=%u zone_sectors=%llu)",
+	      no_progress, free_zones, gc_reserved_zones, nr_zones,
+	      (unsigned long long)c->zp->zone_sectors);
+	for (tag = 0; tag < ZONE_TAG_COUNT; tag++)
+		DMERR("gc: no-progress active tag=%u zone=%u tail=%llu",
+		      tag, active[tag], (unsigned long long)active_tail[tag]);
+	for (z = 0; z < nr_zones; z++) {
+		bool is_active = false;
+
+		for (tag = 0; tag < ZONE_TAG_COUNT; tag++)
+			if (active[tag] == z) {
+				is_active = true;
+				break;
+			}
+		DMERR("gc: no-progress zone=%u tag=%u active=%u wp=%llu dispatch_wp=%llu invalid_hint=%u",
+		      z, rows[z].tag, is_active ? 1 : 0,
+		      (unsigned long long)rows[z].wp,
+		      (unsigned long long)rows[z].dispatch_wp,
+		      rows[z].invalid_count);
+	}
+	kvfree(rows);
+}
+
+static u64 gc_wal_sectors_for_data(u64 data_sectors)
+{
+	return DIV_ROUND_UP_ULL(data_sectors / BLOCK_SECTORS,
+				WAL_PAGE_MAX_RECORDS) * WAL_PAGE_SECTORS;
+}
+
+/* c->lock held.  gc_wal_reserve is for the victim after the current one.
+ * Foreground already respects it, but GC must not consume that floor either.
+ * Roll to a fresh WAL zone before relocation when the current WAL plus the
+ * persistent floor no longer fit in the active tail. */
+static bool gc_wal_tail_needs_roll(struct zns_base_c *c, u64 wal_sectors)
+{
+	unsigned int z = c->zp->active_zone[ZONE_TAG_WAL];
+	u64 tail;
+
+	if (!c->gc_wal_reserve || z == ZONE_NONE)
+		return false;
+	tail = c->zp->zone_sectors - c->zp->wp[z];
+	return tail < wal_sectors + c->gc_wal_reserve;
+}
+
+/* Called with c->lock. Foreground cannot consume GC_DATA tails.  A WAL tail
+ * counted here is protected immediately by gc_wal_budget under the same lock,
+ * so foreground_wal_allowed() cannot consume it during relocation. */
 static unsigned int gc_workspace_required(struct zns_base_c *c, u64 live_sectors)
 {
-	unsigned int z = c->zp->active_zone[ZONE_TAG_GC_DATA];
-	u64 tail = z == ZONE_NONE ? 0 : c->zp->zone_sectors - c->zp->wp[z];
+	unsigned int data_z = c->zp->active_zone[ZONE_TAG_GC_DATA];
+	unsigned int wal_z = c->zp->active_zone[ZONE_TAG_WAL];
+	u64 data_tail = data_z == ZONE_NONE ? 0 :
+		c->zp->zone_sectors - c->zp->wp[data_z];
+	u64 wal_tail = wal_z == ZONE_NONE ? 0 :
+		c->zp->zone_sectors - c->zp->wp[wal_z];
+	u64 wal_sectors = gc_wal_sectors_for_data(live_sectors);
+	u64 wal_required = wal_sectors + c->gc_wal_reserve;
 
-	return (live_sectors > tail ? 1 : 0) + 1;
+	return (live_sectors > data_tail ? 1 : 0) +
+		(wal_required > wal_tail ? 1 : 0);
+}
+
+/* Normally a victim must repay both relocated data and its WAL immediately.
+ * At the reserve boundary that rule can deadlock a nodiscard log-structured
+ * workload: a small amount of invalid data exists, but its WAL makes the
+ * immediate physical gain negative, so foreground never receives the tail
+ * that would create the next invalidations.  Permit one such bootstrap only
+ * when the data copy itself leaves a non-empty tail.  The caller still checks
+ * full data+WAL workspace before issuing I/O, and gc_work_fn yields after the
+ * reclaim when foreground is waiting.  A 100%-live victim remains forbidden. */
+static bool gc_reclaim_gain_allowed(u64 used_sectors, u64 live_sectors,
+				    unsigned int free_zones)
+{
+	u64 wal_sectors;
+
+	if (live_sectors >= used_sectors)
+		return false;
+	wal_sectors = gc_wal_sectors_for_data(live_sectors);
+	return live_sectors + wal_sectors < used_sectors ||
+		free_zones <= gc_reserved_zones;
+}
+
+/* c->lock held. At the reserve boundary, one USER_DATA seed zone is safe only
+ * when the other free zone can cover a full victim's relocation data and the
+ * existing WAL tail covers both that victim and every overwrite in the seed.
+ * Once borrowed, free<reserve prevents a second borrow. */
+static u64 gc_seed_wal_required(struct zns_base_c *c)
+{
+	u64 max_data = c->zp->zone_sectors - 1;
+	u64 full_gc_wal = gc_wal_sectors_for_data(max_data);
+	u64 gc_wal = c->gc_wal_budget > full_gc_wal ?
+		c->gc_wal_budget : full_gc_wal;
+	/* Foreground batching is an optimization, not a safety guarantee: in the
+	 * worst case every 4KB seed write consumes one legacy-size WAL sector.
+	 * Keep one more sector for a checkpoint record. */
+	u64 seed_wal = max_data / BLOCK_SECTORS + 1;
+
+	return gc_wal + seed_wal;
+}
+
+static bool gc_seed_borrow_allowed(struct zns_base_c *c)
+{
+	unsigned int wal_z = c->zp->active_zone[ZONE_TAG_WAL];
+	u64 wal_tail;
+
+	if (gc_count_free_zones(c->zp) != gc_reserved_zones ||
+	    gc_reserved_zones < 2 || wal_z == ZONE_NONE)
+		return false;
+	wal_tail = c->zp->zone_sectors - c->zp->wp[wal_z];
+	return wal_tail >= gc_seed_wal_required(c);
+}
+
+/* c->lock held. Before another reserve seed or sole-owner GC tail is handed
+ * to foreground, rotate a WAL that can no longer cover one full victim plus
+ * the following victim's floor.  F2FS normally stays at free=1 after the
+ * first borrow and advances by handing partial GC_DATA tails to foreground,
+ * so requiring free==reserve here misses the only useful admission point.
+ * One free zone is sufficient: the new generation consumes it temporarily,
+ * then its durable checkpoint makes the old WAL zone reclaimable before
+ * foreground resumes.  A completed rotation grants exactly one handoff/seed
+ * attempt, avoiding an immediate repeat on the checkpoint-only generation.
+ * The forced flush must fit in the active SSTable tail; consuming another
+ * free zone would recreate the same data+WAL workspace deadlock. */
+static bool gc_wal_rotation_needed(struct zns_base_c *c)
+{
+	unsigned int wal_z = c->zp->active_zone[ZONE_TAG_WAL];
+	unsigned int sst_z = c->zp->active_zone[ZONE_TAG_SSTABLE];
+	unsigned int free_zones = gc_count_free_zones(c->zp);
+	u64 wal_tail;
+	bool wal_short;
+	u64 sstable_sectors;
+	u64 sstable_tail;
+
+	if (c->wal_rotation_pending || c->wal_ckpt_inflight ||
+	    c->wal_rotation_credit ||
+	    !free_zones || free_zones > gc_reserved_zones ||
+	    gc_reserved_zones < 2 || wal_z == ZONE_NONE ||
+	    sst_z == ZONE_NONE || !c->memtable->count)
+		return false;
+
+	wal_tail = c->zp->zone_sectors - c->zp->wp[wal_z];
+	if (free_zones == gc_reserved_zones) {
+		/* A reserve seed is the only way to turn a fully-live logical
+		 * device over. Match gc_seed_borrow_allowed() exactly: checking
+		 * only the GC floor can leave too little WAL for the seed itself,
+		 * so neither borrowing nor rotation can start. */
+		wal_short = wal_tail < gc_seed_wal_required(c);
+	} else {
+		if (!c->gc_wal_reserve)
+			return false;
+		wal_short = gc_wal_tail_needs_roll(c, c->gc_wal_reserve);
+	}
+	if (!wal_short)
+		return false;
+
+	sstable_sectors = (512 + round_up(c->memtable->count *
+					 sizeof(struct sstable_record), 512)) / 512;
+	sstable_tail = c->zp->zone_sectors - c->zp->wp[sst_z];
+	return sstable_sectors <= sstable_tail;
 }
 
 /* c->lock held; GC excludes frozen memtables for the entire cycle. */
@@ -2944,7 +3412,7 @@ static unsigned int gc_select_victim(struct zns_base_c *c, const bool *excluded)
 			continue;
 		/* 아직 쓰는 중인 활성 zone은 대상 아님. "닫힘"을 wp==zone_sectors로
 		 * 판정하면 안 됨 — rollover가 항상 몇 섹터 남기고 넘어가 절대 안 참. */
-		if (z == c->zp->active_zone[tag])
+		if (zone_pool_zone_is_active(c->zp, z))
 			continue;
 		/* 아직 발행 안 된 배정분이 남은 zone은 건드리면 안 됨 — .map()은 phys를 배정만 하고,
 		 * 매핑은 wal_put_done에서야 등록되므로 아래 스캔이 진행 중인 쓰기를 못 본다.
@@ -3031,6 +3499,106 @@ static int gc_sync_gate_write(struct zns_base_c *c, sector_t phys, void *buf512,
 	return w.status ? -EIO : 0;
 }
 
+/* Reserve-boundary WAL generation rotation. New data/discard mappings are
+ * held while already admitted appends drain. We then create and durably tag
+ * a fresh WAL zone, force the current mapping memtable to SSTable, and write
+ * its checkpoint into the new generation. wal_reclaim_work_fn releases the
+ * old zone and only then reopens foreground allocation. */
+static void wal_rotate_work_fn(struct work_struct *work)
+{
+	struct zns_base_c *c = container_of(to_delayed_work(work),
+					     struct zns_base_c, wal_rotate_work);
+	struct memtable_flush_work *flush_work;
+	struct zone_header *hdr;
+	unsigned int old_zone, new_zone;
+	sector_t hdr_phys;
+	bool drained;
+	int ret;
+
+	spin_lock_irq(&c->lock);
+	if (!c->wal_rotation_pending || c->metadata_failed || c->stopping) {
+		spin_unlock_irq(&c->lock);
+		return;
+	}
+	drained = !c->gc_active && !c->wal_ckpt_inflight &&
+		!c->wal_batch_busy && list_empty(&c->wal_pending) &&
+		atomic_read(&c->foreground_writes) == 0;
+	if (!drained) {
+		spin_unlock_irq(&c->lock);
+		mod_delayed_work(zns_gc_wq, &c->wal_rotate_work,
+				 msecs_to_jiffies(20));
+		return;
+	}
+	if (c->wal_rotation_old_zone != ZONE_NONE) {
+		old_zone = c->wal_rotation_old_zone;
+		new_zone = c->zp->active_zone[ZONE_TAG_WAL];
+		spin_unlock_irq(&c->lock);
+		goto schedule_flush;
+	}
+	old_zone = c->zp->active_zone[ZONE_TAG_WAL];
+	if (old_zone == ZONE_NONE || !gc_count_free_zones(c->zp) ||
+	    gc_count_free_zones(c->zp) > gc_reserved_zones) {
+		c->wal_rotation_pending = false;
+		spin_unlock_irq(&c->lock);
+		mod_delayed_work(zns_wq, &c->pending_write_work, 0);
+		return;
+	}
+	new_zone = zone_pool_acquire_free(c->zp, ZONE_TAG_WAL, true);
+	if (new_zone == ZONE_NONE) {
+		spin_unlock_irq(&c->lock);
+		mod_delayed_work(zns_gc_wq, &c->wal_rotate_work,
+				 msecs_to_jiffies(20));
+		return;
+	}
+	c->zp->active_zone[ZONE_TAG_WAL] = new_zone;
+	c->zp->wal_gen[new_zone] = c->zp->wal_next_gen++;
+	c->wal_rotation_old_zone = old_zone;
+	hdr_phys = (sector_t)new_zone * c->zp->zone_sectors;
+	spin_unlock_irq(&c->lock);
+
+	hdr = kzalloc(512, GFP_KERNEL);
+	if (!hdr) {
+		zone_dispatch_cancel(c, hdr_phys, 1);
+		ret = -ENOMEM;
+	} else {
+		hdr->magic = cpu_to_le32(ZONE_HEADER_MAGIC);
+		hdr->tag = cpu_to_le32(ZONE_TAG_WAL);
+		hdr->gen = cpu_to_le64(c->zp->wal_gen[new_zone]);
+		ret = gc_sync_gate_write(c, hdr_phys, hdr, false);
+		kfree(hdr);
+	}
+	if (ret) {
+		zone_quarantine(c, new_zone, ZONE_TAG_WAL, BLK_STS_IOERR);
+		spin_lock_irq(&c->lock);
+		if (c->zp->active_zone[ZONE_TAG_WAL] == ZONE_NONE)
+			c->zp->active_zone[ZONE_TAG_WAL] = old_zone;
+		c->wal_rotation_pending = false;
+		c->wal_rotation_old_zone = ZONE_NONE;
+		spin_unlock_irq(&c->lock);
+		DMERR("WAL rotation: new zone %u header failed (%d); restored old zone %u",
+		      new_zone, ret, old_zone);
+		mod_delayed_work(zns_wq, &c->pending_write_work, 0);
+		return;
+	}
+	zone_append_header_done(c, new_zone, 0);
+
+schedule_flush:
+	spin_lock_irq(&c->lock);
+	flush_work = schedule_memtable_flush_locked(c, true);
+	spin_unlock_irq(&c->lock);
+	if (!flush_work) {
+		/* Allocation can fail transiently in atomic context. Keep foreground
+		 * closed and retry; the fresh WAL header is already durable. */
+		mod_delayed_work(zns_gc_wq, &c->wal_rotate_work,
+				 msecs_to_jiffies(20));
+		return;
+	}
+
+	DMINFO("WAL rotation: old zone %u -> new zone %u; forcing checkpoint",
+	       old_zone, new_zone);
+	queue_work(zns_flush_wq, &flush_work->work);
+}
+
 /* c->lock held. A failed insertion must prevent the caller from resetting
  * the source zone, even though the copy and its WAL record are durable. */
 static int gc_commit_relocation(struct zns_base_c *c,
@@ -3059,18 +3627,30 @@ static int gc_relocate_batch(struct zns_base_c *c,
 			     struct gc_live_entry **entries, unsigned int count)
 {
 	void *data = NULL;
-	struct wal_page *wal = NULL;
+	struct wal_page **wal_pages = NULL;
 	sector_t data_phys, wal_phys;
 	sector_t data_sectors = (sector_t)count * BLOCK_SECTORS;
+	sector_t wal_sectors;
 	int new_data_zone = -1, new_wal_zone = -1;
-	unsigned int i;
+	unsigned int nr_wal_pages, i, p;
 	int ret = 0;
 
+	if (!count || count > WAL_PAGE_MAX_RECORDS * GC_RELOC_WAL_PAGES)
+		return -EINVAL;
+	nr_wal_pages = DIV_ROUND_UP(count, WAL_PAGE_MAX_RECORDS);
+	wal_sectors = (sector_t)nr_wal_pages * WAL_PAGE_SECTORS;
 	data = kvzalloc((size_t)data_sectors * 512, GFP_KERNEL);
-	wal = (struct wal_page *)get_zeroed_page(GFP_KERNEL);
-	if (!data || !wal) {
+	wal_pages = kcalloc(nr_wal_pages, sizeof(*wal_pages), GFP_KERNEL);
+	if (!data || !wal_pages) {
 		ret = -ENOMEM;
 		goto out;
+	}
+	for (p = 0; p < nr_wal_pages; p++) {
+		wal_pages[p] = (struct wal_page *)get_zeroed_page(GFP_KERNEL);
+		if (!wal_pages[p]) {
+			ret = -ENOMEM;
+			goto out;
+		}
 	}
 	for (i = 0; i < count;) {
 		unsigned int run = 1;
@@ -3136,10 +3716,10 @@ static int gc_relocate_batch(struct zns_base_c *c,
 	}
 
 	spin_lock_irq(&c->lock);
-	ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, WAL_PAGE_SECTORS,
+	ret = zone_pool_alloc(c->zp, ZONE_TAG_WAL, wal_sectors,
 			      &wal_phys, &new_wal_zone, true);
-	if (!ret && c->gc_wal_budget >= WAL_PAGE_SECTORS)
-		c->gc_wal_budget -= WAL_PAGE_SECTORS;
+	if (!ret && c->gc_wal_budget >= wal_sectors)
+		c->gc_wal_budget -= wal_sectors;
 	spin_unlock_irq(&c->lock);
 	if (ret) {
 		DMERR("gc: WAL allocation failed (err=%d)", ret);
@@ -3151,7 +3731,7 @@ static int gc_relocate_batch(struct zns_base_c *c,
 
 		if (!hdr) {
 			zone_dispatch_cancel(c, hdr_phys, 1);
-			zone_dispatch_cancel(c, wal_phys, WAL_PAGE_SECTORS);
+			zone_dispatch_cancel(c, wal_phys, wal_sectors);
 			zone_quarantine(c, new_wal_zone, ZONE_TAG_WAL,
 					BLK_STS_RESOURCE);
 			ret = -ENOMEM;
@@ -3165,37 +3745,78 @@ static int gc_relocate_batch(struct zns_base_c *c,
 		ret = gc_sync_gate_write(c, hdr_phys, hdr, false);
 		kfree(hdr);
 		if (ret) {
-			zone_dispatch_cancel(c, wal_phys, WAL_PAGE_SECTORS);
+			zone_dispatch_cancel(c, wal_phys, wal_sectors);
 			zone_quarantine(c, new_wal_zone, ZONE_TAG_WAL, BLK_STS_IOERR);
 			goto out;
 		}
 		zone_append_header_done(c, new_wal_zone, 0);
 	}
 
-	wal->magic = cpu_to_le32(WAL_PAGE_MAGIC);
-	wal->version = cpu_to_le16(WAL_PAGE_VERSION);
-	wal->count = cpu_to_le16(count);
-	for (i = 0; i < count; i++) {
-		wal->records[i].type = cpu_to_le32(WAL_REC_GC_PUT);
-		wal->records[i].gc_put.lba = cpu_to_le64(entries[i]->lba);
-		wal->records[i].gc_put.phys = cpu_to_le64(data_phys + (sector_t)i * BLOCK_SECTORS);
-		wal->records[i].gc_put.expected_old = cpu_to_le64(entries[i]->phys);
+	for (p = 0; p < nr_wal_pages; p++) {
+		struct wal_page *wal = wal_pages[p];
+		unsigned int first = p * WAL_PAGE_MAX_RECORDS;
+		unsigned int page_count = min_t(unsigned int,
+			WAL_PAGE_MAX_RECORDS, count - first);
+
+		wal->magic = cpu_to_le32(WAL_PAGE_MAGIC);
+		wal->version = cpu_to_le16(WAL_PAGE_VERSION);
+		wal->count = cpu_to_le16(page_count);
+		for (i = 0; i < page_count; i++) {
+			unsigned int entry = first + i;
+
+			wal->records[i].type = cpu_to_le32(WAL_REC_GC_PUT);
+			wal->records[i].gc_put.lba = cpu_to_le64(entries[entry]->lba);
+			wal->records[i].gc_put.phys = cpu_to_le64(data_phys +
+							 (sector_t)entry * BLOCK_SECTORS);
+			wal->records[i].gc_put.expected_old =
+				cpu_to_le64(entries[entry]->phys);
+		}
+		wal->crc32 = cpu_to_le32(crc32(~0U, wal, PAGE_SIZE));
 	}
-	wal->crc32 = cpu_to_le32(crc32(~0U, wal, PAGE_SIZE));
-	ret = wal_page_append_sync(c, wal_phys, wal, WAL_PAGE_SECTORS);
+	/* Data is already durable.  Append several independently checksummed WAL
+	 * pages and flush the device once for the whole group.  Replay may see
+	 * any valid prefix after a crash; expected_old makes every such prefix
+	 * safe, while mappings are not published in memory until all pages finish. */
+	for (p = 0; p < nr_wal_pages; p++) {
+		ret = wal_page_append_sync(c,
+			wal_phys + (sector_t)p * WAL_PAGE_SECTORS,
+			wal_pages[p], WAL_PAGE_SECTORS, false);
+		if (ret) {
+			DMERR("gc: grouped WAL append failed (page=%u/%u entries=%u err=%d)",
+			      p + 1, nr_wal_pages, count, ret);
+			zone_quarantine(c, zone_of(c->zp, wal_phys), ZONE_TAG_WAL,
+					BLK_STS_IOERR);
+			goto out;
+		}
+	}
+	ret = blkdev_issue_flush(c->dev->bdev);
 	if (ret) {
-		DMERR("gc: batch WAL append failed (%u entries, err=%d)", count, ret);
+		DMERR("gc: grouped WAL flush failed (%u pages, err=%d)",
+		      nr_wal_pages, ret);
 		zone_quarantine(c, zone_of(c->zp, wal_phys), ZONE_TAG_WAL,
 				BLK_STS_IOERR);
 		goto out;
 	}
 
-	spin_lock_irq(&c->lock);
-	ret = gc_commit_relocation(c, entries, count, data_phys);
-	spin_unlock_irq(&c->lock);
+	for (p = 0; p < nr_wal_pages; p++) {
+		unsigned int first = p * WAL_PAGE_MAX_RECORDS;
+		unsigned int page_count = min_t(unsigned int,
+			WAL_PAGE_MAX_RECORDS, count - first);
+
+		spin_lock_irq(&c->lock);
+		ret = gc_commit_relocation(c, &entries[first], page_count,
+					   data_phys + (sector_t)first * BLOCK_SECTORS);
+		spin_unlock_irq(&c->lock);
+		if (ret)
+			break;
+	}
 out:
-	if (wal)
-		free_page((unsigned long)wal);
+	if (wal_pages) {
+		for (p = 0; p < nr_wal_pages; p++)
+			if (wal_pages[p])
+				free_page((unsigned long)wal_pages[p]);
+		kfree(wal_pages);
+	}
 	kvfree(data);
 	return ret;
 }
@@ -3248,6 +3869,7 @@ static enum gc_reclaim_result gc_reclaim_one_victim(struct zns_base_c *c,
 	bool cached_at_entry = cycle->built;
 	bool ok = true;
 	bool reclaimed = false;
+	bool foreground_paused = false;
 	unsigned long victim_started = jiffies;
 	unsigned long relocation_started;
 
@@ -3432,13 +4054,10 @@ refresh_current:
 		kvfree(mt_candidates);
 		return GC_RECLAIM_TRY_NEXT;
 	}
-	/* 이주 data와 batch WAL page까지 감안해 물리 공간
-	 * 순이익이 없는 fallback victim은 건드리지 않는다. 안 그러면
-	 * 100% live zone을 GC_DATA로 복사하며 reserve만 소모할 수 있다. */
-	if (live_sectors +
-	    DIV_ROUND_UP_ULL(live_sectors / BLOCK_SECTORS,
-			     WAL_PAGE_MAX_RECORDS) * WAL_PAGE_SECTORS >=
-	    used_sectors) {
+	/* 여유가 있을 때는 relocation WAL까지 즉시 상환하는 victim만 고른다.
+	 * reserve 경계에서는 data 자체의 작은 순이익으로 foreground tail을
+	 * 만드는 bootstrap을 허용한다. 100% live victim은 항상 거절한다. */
+	if (!gc_reclaim_gain_allowed(used_sectors, live_sectors, free_at_start)) {
 		DMINFO("gc: skipping victim %u: no positive reclaim gain (used=%llu, live=%llu)",
 		       victim, (unsigned long long)used_sectors,
 		       (unsigned long long)live_sectors);
@@ -3446,6 +4065,12 @@ refresh_current:
 		kvfree(mt_candidates);
 		return GC_RECLAIM_TRY_NEXT;
 	}
+	if (live_sectors + gc_wal_sectors_for_data(live_sectors) >= used_sectors)
+		DMINFO("gc: reserve-boundary bootstrap victim %u (used=%llu, live=%llu, wal=%llu, free_zones=%u)",
+		       victim, (unsigned long long)used_sectors,
+		       (unsigned long long)live_sectors,
+		       (unsigned long long)gc_wal_sectors_for_data(live_sectors),
+		       free_at_start);
 	DMINFO("gc: relocating victim %u (used=%llu, live=%llu, invalid=%llu, entries=%llu, free_zones=%u)",
 	       victim, (unsigned long long)used_sectors,
 	       (unsigned long long)live_sectors,
@@ -3453,23 +4078,76 @@ refresh_current:
 	       (unsigned long long)(live_sectors / BLOCK_SECTORS),
 	       free_at_start);
 	relocation_started = jiffies;
+	/* Close new admission before reserving the victim WAL budget. Writes that
+	 * were already admitted must be allowed to append their WAL while draining;
+	 * protecting the victim budget first would deadlock that finite set. */
+	spin_lock_irq(&c->lock);
+	c->gc_foreground_pause = true;
+	foreground_paused = true;
+	spin_unlock_irq(&c->lock);
+	wait_event(c->flush_waitq,
+		   atomic_read(&c->foreground_writes) == 0 ||
+		   READ_ONCE(c->stopping));
+	if (READ_ONCE(c->stopping))
+		goto out_free_snapshot;
+	DMINFO("gc: foreground admission drained for victim %u relocation", victim);
+
 	/* Refuse partial evacuation without data + worst-case WAL workspace. */
 	{
 		unsigned int need, available;
+		u64 victim_wal = gc_wal_sectors_for_data(live_sectors);
+		bool roll_wal;
+		bool rotation_requested = false;
+		bool rotation_pending;
 
 		spin_lock_irq(&c->lock);
 		need = gc_workspace_required(c, live_sectors);
 		available = gc_count_free_zones(c->zp);
-		if (available >= need)
-			c->gc_wal_budget = DIV_ROUND_UP_ULL(live_sectors / BLOCK_SECTORS,
-				WAL_PAGE_MAX_RECORDS) * WAL_PAGE_SECTORS;
+		roll_wal = gc_wal_tail_needs_roll(c, victim_wal);
+		rotation_pending = c->wal_rotation_pending;
+		if (available >= need) {
+			if (roll_wal)
+				c->zp->active_zone[ZONE_TAG_WAL] = ZONE_NONE;
+			c->gc_wal_budget = victim_wal;
+		} else if (!rotation_pending && gc_wal_rotation_needed(c)) {
+			/* The foreground allocator used to be the only caller that
+			 * could start a reserve-boundary generation rotation.  At
+			 * free=1, however, GC can discover that it needs both a data
+			 * zone and a WAL zone while foreground still owns a writable
+			 * data tail. Waiting for that tail to fill makes progress depend
+			 * on repeated failed GC rounds and can exceed the ACK fail-fast.
+			 * Hand the existing, durable rotation protocol the remaining
+			 * free zone now; this worker will drop gc_active before the
+			 * queued rotation worker performs its drain and checkpoint. */
+			c->wal_rotation_pending = true;
+			rotation_requested = true;
+		}
 		spin_unlock_irq(&c->lock);
 		if (available < need) {
-			DMERR("gc: insufficient relocation workspace (free=%u need=%u), no reset",
-			      available, need);
+			if (rotation_requested) {
+				DMINFO("gc: requested reserve-boundary WAL generation rotation before victim %u (free=%u need=%u)",
+				       victim, available, need);
+				mod_delayed_work(zns_gc_wq, &c->wal_rotate_work, 0);
+			} else if (rotation_pending) {
+				/* Foreground can close admission while this GC worker is
+				 * already active.  The rotation worker is queued and must wait
+				 * for gc_active to drop; treating that deliberate handoff as a
+				 * relocation failure produces a false error even though no copy
+				 * or reset was attempted. */
+				DMINFO("gc: yielding victim %u for already pending WAL generation rotation (free=%u need=%u)",
+				       victim, available, need);
+			} else {
+				DMERR("gc: insufficient relocation workspace (free=%u need=%u), no reset",
+				      available, need);
+			}
 			goto out_free_snapshot;
 		}
+		if (roll_wal)
+			DMINFO("gc: rolled WAL tail to preserve next-victim floor (victim_wal=%llu reserve=%llu free=%u)",
+			       (unsigned long long)victim_wal,
+			       (unsigned long long)c->gc_wal_reserve, available);
 	}
+
 	reloc_batch = kvmalloc_array(live_sectors / BLOCK_SECTORS,
 				     sizeof(*reloc_batch), GFP_KERNEL);
 	if (!reloc_batch) {
@@ -3491,9 +4169,11 @@ refresh_current:
 
 	/* 이주 중 사용자 overwrite는 각 batch 마지막의
 	 * mapping_put_if_match가 걸러낸다. */
-	for (i = 0; i < reloc_count; i += WAL_PAGE_MAX_RECORDS) {
+	for (i = 0; i < reloc_count;
+	     i += WAL_PAGE_MAX_RECORDS * GC_RELOC_WAL_PAGES) {
 		unsigned int batch_count = min_t(unsigned int,
-			WAL_PAGE_MAX_RECORDS, reloc_count - i);
+			WAL_PAGE_MAX_RECORDS * GC_RELOC_WAL_PAGES,
+			reloc_count - i);
 
 		int reloc_ret = gc_relocate_batch(c, &reloc_batch[i], batch_count);
 
@@ -3550,7 +4230,11 @@ refresh_current:
 out_free_snapshot:
 	spin_lock_irq(&c->lock);
 	c->gc_wal_budget = 0;
+	if (foreground_paused)
+		c->gc_foreground_pause = false;
 	spin_unlock_irq(&c->lock);
+	if (foreground_paused)
+		wake_up_all(&c->flush_waitq);
 	kvfree(reloc_batch);
 	if (!cycle->built)
 		kvfree(live_map.entries);
@@ -3572,15 +4256,64 @@ static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag
 					   sector_t *phys_out, int *new_zone_out)
 {
 	int ret;
+	bool borrowed_seed = false;
+	bool handed_off_gc_tail = false;
+	bool rotation_requested = false;
+	bool rotation_credit_used = false;
+	unsigned int handoff_zone = ZONE_NONE;
 
 	spin_lock_irq(&c->lock);
 	if (c->metadata_failed) {
 		spin_unlock_irq(&c->lock);
 		return -EIO;
 	}
+	if (tag == ZONE_TAG_USER_DATA && c->wal_rotation_pending) {
+		spin_unlock_irq(&c->lock);
+		return -EAGAIN;
+	}
+	if (tag == ZONE_TAG_USER_DATA && c->gc_foreground_pause) {
+		spin_unlock_irq(&c->lock);
+		return -EAGAIN;
+	}
 	ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out, false);
+	if (ret == -ENOSPC && tag == ZONE_TAG_USER_DATA &&
+	    c->wal_rotation_credit && gc_count_free_zones(c->zp) > 0 &&
+	    gc_count_free_zones(c->zp) <= gc_reserved_zones) {
+		rotation_credit_used = true;
+	}
+	if (!rotation_credit_used && ret == -ENOSPC && tag == ZONE_TAG_USER_DATA &&
+	    gc_wal_rotation_needed(c)) {
+		c->wal_rotation_pending = true;
+		rotation_requested = true;
+		ret = -EAGAIN;
+	}
+	if (!rotation_requested && ret == -ENOSPC && tag == ZONE_TAG_USER_DATA &&
+	    !c->gc_active && gc_count_free_zones(c->zp) > 0 &&
+	    c->gc_wal_reserve) {
+		ret = zone_pool_handoff_gc_tail(c->zp, nr, phys_out,
+						&handoff_zone);
+		if (!ret && c->foreground_handoff_gc_zone != handoff_zone) {
+			c->foreground_handoff_gc_zone = handoff_zone;
+			handed_off_gc_tail = true;
+		}
+	}
+	if (!rotation_requested && ret == -ENOSPC && tag == ZONE_TAG_USER_DATA &&
+	    gc_seed_borrow_allowed(c)) {
+		ret = zone_pool_alloc(c->zp, tag, nr, phys_out, new_zone_out, true);
+		if (!ret) {
+			c->gc_wal_reserve = gc_wal_sectors_for_data(
+				c->zp->zone_sectors - 1);
+			borrowed_seed = true;
+		}
+	}
 	if (!ret) {
+		if (rotation_credit_used)
+			c->wal_rotation_credit = false;
 		c->gc_no_progress = 0;
+		/* Admission and the rotation gate share c->lock. The rotation worker
+		 * must never observe zero foreground writes after data space has been
+		 * reserved but before this write becomes visible to its drain check. */
+		atomic_inc(&c->foreground_writes);
 	} else if (ret == -ENOSPC && c->gc_no_progress < 3) {
 		/* zone_pool_alloc() 자체가 -ENOSPC를 반환하므로, GC가 아직
 		 * 무진전 판정을 충분히 반복하기 전에는 transient 상태로 바꾼다.
@@ -3591,6 +4324,17 @@ static int zone_pool_alloc_with_gc_retry(struct zns_base_c *c, enum zone_tag tag
 		ret = -EAGAIN;
 	}
 	spin_unlock_irq(&c->lock);
+	if (rotation_requested) {
+		DMINFO("foreground paused for reserve-boundary WAL generation rotation");
+		mod_delayed_work(zns_gc_wq, &c->wal_rotate_work, 0);
+		return -EAGAIN;
+	}
+	if (borrowed_seed)
+		DMINFO("foreground borrowed one reserve zone with protected GC data/WAL workspace (new_zone=%d)",
+		       new_zone_out ? *new_zone_out : -1);
+	if (handed_off_gc_tail)
+		DMINFO("foreground took sole ownership of inactive GC_DATA tail without consuming final reserve zone (zone=%u)",
+		       handoff_zone);
 
 	if (ret) {
 		if (ret == -ENOSPC) {
@@ -3628,6 +4372,7 @@ static int start_foreground_write(struct zns_base_c *c, struct bio *bio,
 	if (!ctx) {
 		zone_dispatch_cancel(c, phys, nr);
 		bio->bi_status = BLK_STS_RESOURCE;
+		foreground_write_done(c);
 		bio_endio(bio);
 		return 0;
 	}
@@ -3636,8 +4381,6 @@ static int start_foreground_write(struct zns_base_c *c, struct bio *bio,
 	ctx->lba = block_lba;
 	ctx->reserved_phys = phys;
 	ctx->reserved_nr = nr;
-	atomic_inc(&c->foreground_writes);
-
 	ctx->nr_headers = 0;
 	if (new_data_zone >= 0) {
 		ctx->headers[ctx->nr_headers].zone_id = new_data_zone;
@@ -3713,8 +4456,13 @@ static void gc_work_fn(struct work_struct *work)
 	enum gc_reclaim_result result;
 	unsigned int free_at_start;
 	unsigned int ckpt_inflight;
+	unsigned int no_progress;
+	bool log_no_progress_state = false;
+	bool foreground_waiting;
 
-	if (READ_ONCE(c->metadata_failed) || READ_ONCE(c->stopping))
+	if (READ_ONCE(c->metadata_failed) || READ_ONCE(c->stopping) ||
+	    READ_ONCE(c->sstable_rotation_pending) ||
+	    READ_ONCE(c->wal_rotation_pending))
 		return;
 
 	/* frozen memtable은 active memtable에서는 빠졌지만 SSTable 색인에
@@ -3722,7 +4470,8 @@ static void gc_work_fn(struct work_struct *work)
 	 * 최신 overwrite를 놓칠 수 있으므로 진행 중 flush가 있으면 미루고,
 	 * GC가 끝날 때까지 새 memtable swap을 막는다. */
 	spin_lock_irq(&c->lock);
-	if (c->metadata_failed || c->stopping) {
+	if (c->metadata_failed || c->stopping || c->wal_rotation_pending ||
+	    c->sstable_rotation_pending) {
 		spin_unlock_irq(&c->lock);
 		return;
 	}
@@ -3755,6 +4504,14 @@ static void gc_work_fn(struct work_struct *work)
 	}
 
 	for (attempts = 0; attempts < c->zp->nr_zones; attempts++) {
+		if (READ_ONCE(c->stopping)) {
+			DMINFO("gc: stopping at victim boundary");
+			break;
+		}
+		if (READ_ONCE(c->sstable_rotation_pending)) {
+			DMINFO("gc: yielding for reserve-boundary SSTable rotation");
+			break;
+		}
 		result = gc_reclaim_one_victim(c, &cycle);
 		if (result == GC_RECLAIM_STOP) {
 			DMINFO("gc: stopped without a reclaimable victim (attempt=%u, reclaimed=%u)",
@@ -3766,7 +4523,15 @@ static void gc_work_fn(struct work_struct *work)
 		reclaimed++;
 		spin_lock_irq(&c->lock);
 		still_low = gc_count_free_zones(c->zp) < gc_stop_watermark();
+		foreground_waiting = !list_empty(&c->pending_write_bios) ||
+			c->wal_pending_count;
 		spin_unlock_irq(&c->lock);
+		/* Do not let a multi-victim GC batch keep foreground asleep for an
+		 * entire large-zone relocation. out_finish wakes both pending paths. */
+		if (foreground_waiting) {
+			DMINFO("gc: yielding after reclaim for pending foreground I/O");
+			break;
+		}
 		if (!still_low)
 			break;
 	}
@@ -3786,14 +4551,20 @@ out_finish:
 		c->gc_no_progress = 0;
 	else if (c->gc_no_progress < UINT_MAX)
 		c->gc_no_progress++;
+	no_progress = c->gc_no_progress;
+	if (!reclaimed && no_progress == 3)
+		log_no_progress_state = true;
 	c->gc_active = false;
+	wake_up_all(&c->flush_waitq);
 	/* GC 때문에 임계값 flush를 건너뛴 WAL callback이 있었으면 새 PUT을
 	 * 기다리지 않고 즉시 재시도한다. */
-	flush_work = schedule_memtable_flush_locked(c);
+	flush_work = schedule_memtable_flush_locked(c, false);
 	free_at_start = gc_count_free_zones(c->zp);
 	spin_unlock_irq(&c->lock);
 	DMINFO("gc: worker finished (reclaimed=%u, free_zones=%u, no_progress=%u)",
-	       reclaimed, free_at_start, READ_ONCE(c->gc_no_progress));
+	       reclaimed, free_at_start, no_progress);
+	if (log_no_progress_state)
+		gc_log_no_progress_state(c, no_progress);
 	if (flush_work) {
 		DMINFO("gc: scheduled deferred memtable flush after worker completion");
 		queue_work(zns_flush_wq, &flush_work->work);
@@ -3820,6 +4591,7 @@ static void wal_reclaim_work_fn(struct work_struct *work)
 	for (rounds = 0; rounds < c->zp->nr_zones; rounds++) {
 		unsigned int z, victim = ZONE_NONE;
 		u64 durable;
+		bool rotation_completed = false;
 
 		spin_lock_irq(&c->lock);
 		durable = c->wal_durable_split_gen;
@@ -3847,9 +4619,21 @@ static void wal_reclaim_work_fn(struct work_struct *work)
 
 		spin_lock_irq(&c->lock);
 		zone_pool_mark_free(c->zp, victim);
+		if (c->wal_rotation_pending &&
+		    victim == c->wal_rotation_old_zone) {
+			c->wal_rotation_pending = false;
+			c->wal_rotation_credit = true;
+			c->wal_rotation_old_zone = ZONE_NONE;
+			rotation_completed = true;
+		}
 		spin_unlock_irq(&c->lock);
 		DMINFO("wal reclaim: reclaimed zone %u (gen < %llu)",
 		       victim, (unsigned long long)durable);
+		if (rotation_completed) {
+			DMINFO("WAL rotation: old generation reclaimed; foreground resumed");
+			mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
+			mod_delayed_work(zns_wq, &c->pending_write_work, 0);
+		}
 	}
 }
 
@@ -3996,6 +4780,8 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	/* 0은 "zone 0번"이라는 유효한 값이라 "미배정"을 뜻하는 ZONE_NONE으로 명시 초기화 */
 	for (i = 0; i < ZONE_TAG_COUNT; i++)
 		c->zp->active_zone[i] = ZONE_NONE;
+	c->foreground_handoff_gc_zone = ZONE_NONE;
+	c->wal_rotation_old_zone = ZONE_NONE;
 
 	c->memtable = kzalloc(sizeof(*c->memtable), GFP_KERNEL);
 	if (!c->memtable) {
@@ -4014,6 +4800,7 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	INIT_DELAYED_WORK(&c->pending_flush_work, pending_flush_work_fn);
 	INIT_LIST_HEAD(&c->pending_write_bios);
 	INIT_DELAYED_WORK(&c->pending_write_work, pending_write_work_fn);
+	INIT_DELAYED_WORK(&c->wal_rotate_work, wal_rotate_work_fn);
 	atomic_set(&c->foreground_writes, 0);
 
 	/* zone 스캔으로 크래시/재로드 이전 상태 복원(zone_tag[]/wp[] + WAL
@@ -4080,6 +4867,7 @@ static void zns_base_dtr(struct dm_target *ti)
 	spin_lock_irq(&c->lock);
 	c->stopping = true;
 	spin_unlock_irq(&c->lock);
+	wake_up_all(&c->flush_waitq);
 	flush_delayed_work(&c->wal_batch_work);
 	mod_delayed_work(zns_wq, &c->pending_write_work, 0);
 	flush_delayed_work(&c->pending_write_work);
@@ -4093,6 +4881,7 @@ static void zns_base_dtr(struct dm_target *ti)
 	/* 아직 큐잉/실행 중인 compaction이 있으면 완전히 끝날 때까지 기다린다(안 그러면 아래에서 c를 해제한 뒤 use-after-free) */
 	cancel_work_sync(&c->compaction_work);
 	cancel_work_sync(&c->gc_work);
+	cancel_delayed_work_sync(&c->wal_rotate_work);
 	cancel_work_sync(&c->wal_reclaim_work);
 
 	dm_put_device(ti, c->dev);
@@ -4247,6 +5036,14 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 			bio_endio(bio);
 			return DM_MAPIO_SUBMITTED;
 		}
+		spin_lock_irq(&c->lock);
+		if (c->wal_rotation_pending || c->gc_foreground_pause) {
+			spin_unlock_irq(&c->lock);
+			kfree(ctx);
+			return DM_MAPIO_REQUEUE;
+		}
+		atomic_inc(&c->foreground_writes);
+		spin_unlock_irq(&c->lock);
 		ctx->c = c;
 		ctx->orig_bio = bio;
 		ctx->lba = block_lba;
@@ -4254,7 +5051,6 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		ctx->is_discard = true;
 		ctx->discard_blocks = nr / BLOCK_SECTORS;
 		ctx->reserved_nr = 0;
-		atomic_inc(&c->foreground_writes);
 		submit_wal_async(ctx);
 		return DM_MAPIO_SUBMITTED;
 	}
