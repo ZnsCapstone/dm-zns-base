@@ -16,22 +16,33 @@ typedef uint64_t sector_t;
 #define BLK_STS_RESOURCE 2
 #define DMERR(...) ((void)0)
 #define BLOCK_SECTORS 8
+#define WAL_PAGE_MAX_RECORDS 127
+#define WAL_PAGE_SECTORS 8
+#define DIV_ROUND_UP_ULL(n, d) (((n) + (d) - 1) / (d))
+#define round_up(n, d) ((((n) + (d) - 1) / (d)) * (d))
+#define max(a, b) ((a) > (b) ? (a) : (b))
 #define ZONE_NONE UINT32_MAX
-enum zone_tag { ZONE_TAG_FREE, ZONE_TAG_USER_DATA, ZONE_TAG_GC_DATA, ZONE_TAG_WAL };
+enum zone_tag { ZONE_TAG_FREE, ZONE_TAG_USER_DATA, ZONE_TAG_GC_DATA,
+                ZONE_TAG_WAL, ZONE_TAG_SSTABLE, ZONE_TAG_COUNT };
 struct skiplist_node { u64 lba, phys; struct skiplist_node *forward[1]; };
 struct skiplist { struct skiplist_node *head; unsigned int count; };
+struct sstable_record { uint64_t lba, phys; };
 struct zone_pool {
-    unsigned int nr_zones, active_zone[4];
+    unsigned int nr_zones, active_zone[ZONE_TAG_COUNT];
     enum zone_tag zone_tag[8];
-    sector_t zone_sectors, wp[8];
+    sector_t zone_sectors, wp[8], dispatch_wp[8];
+    unsigned int sstable_live_count[8];
     u64 wal_gen[8], wal_next_gen;
 };
 struct zns_base_c {
     int lock;
+    int wal_ckpt_inflight;
     struct skiplist *memtable, *frozen_memtable;
     bool frozen_published, checkpoint_failed, metadata_failed;
+    bool wal_rotation_pending, wal_rotation_credit;
+    bool gc_active, sstable_rotation_pending;
     struct zone_pool *zp;
-    sector_t gc_wal_budget;
+    sector_t gc_wal_budget, gc_wal_reserve;
     u64 read_view_epoch;
     unsigned int nr_sstables;
     struct sstable_info *sstables;
@@ -41,6 +52,7 @@ struct gc_candidate { u64 lba; sector_t phys; };
 struct gc_live_entry { u64 lba; sector_t phys; bool used; };
 struct gc_live_map { struct gc_live_entry *entries; unsigned int capacity, count; };
 static unsigned int gc_reserved_zones = 2;
+static unsigned int compaction_k = 4;
 static bool fail_alloc;
 static unsigned int destroy_count;
 static int put_result;
@@ -65,7 +77,7 @@ static int mapping_put_if_match(struct zns_base_c *c, u64 lba, u64 old, u64 phys
     (void)c; (void)lba; (void)old; (void)phys;
     return put_result;
 }
-struct sstable_info { sector_t phys; };
+struct sstable_info { sector_t phys; u64 seq_no, record_count, min_lba, max_lba; };
 struct zns_read_pin { unsigned int zone; };
 struct bio {
     int bi_status;
