@@ -45,6 +45,20 @@
 #define IO_POOL_SIZE 128
 #define ZNS_BASE_MAX_WAL_GROUP_PAGES 64
 #define GC_RESERVE_ZONES 2
+#define ZNS_BASE_GC_READAHEAD_BLOCKS 32
+static bool gc_read_ahead = true;
+module_param(gc_read_ahead, bool, 0444);
+MODULE_PARM_DESC(gc_read_ahead, "batch contiguous victim reads during GC");
+
+/* Private to one GC worker invocation; never reused across victims. */
+struct zns_base_gc_read_buffer {
+	void *data;
+	unsigned int first_slot;
+	unsigned int blocks;
+	u64 read_ios;
+	u64 read_hits;
+	u64 lookup_ns, reserve_ns, read_ns, write_ns, wal_ns;
+};
 #define ZNS_BASE_LOOKUP_CACHE_BITS 12
 #define ZNS_BASE_LOOKUP_CACHE_SIZE (1U << ZNS_BASE_LOOKUP_CACHE_BITS)
 static bool sstable_lookup_cache = true;
@@ -547,7 +561,8 @@ static int zns_base_get_zone_slot(struct zns_base_c *c,sector_t physical_sector,
 static void zns_base_gc_work(struct work_struct *work);
 static void zns_base_schedule_gc(struct zns_base_c *c);
 static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *victim,
-  				  unsigned int victim_slot);
+				  unsigned int victim_slot,
+				  struct zns_base_gc_read_buffer *read_buffer);
 static int zns_base_reset_victim(struct zns_base_c *c, struct zns_base_zone *victim);
 static unsigned int zns_base_count_free_zones(struct zns_base_c *c);
 static int zns_base_select_victim(struct zns_base_c *c, struct zns_base_zone **victim_out);
@@ -1869,13 +1884,18 @@ static void zns_base_io_work(struct work_struct *work){
 static void zns_base_gc_work(struct work_struct *work)
 {
   	struct zns_base_c *c;
-	struct zns_base_zone *victim;
-  	unsigned int slot;
+	struct zns_base_zone *victim = NULL;
+	unsigned int slot = 0;
 	unsigned int reclaimable_blocks;
 	unsigned long phase_started, next_report;
+	struct zns_base_gc_read_buffer read_buffer = { 0 };
+	const char *phase = "select";
   	int ret;
 
   	c = container_of(work, struct zns_base_c, gc_work);
+	if (gc_read_ahead)
+		read_buffer.data = vzalloc(ZNS_BASE_GC_READAHEAD_BLOCKS *
+					  ZNS_BASE_BLOCK_SIZE);
 
 	spin_lock(&c->lock);
 	c->gc_running = true;
@@ -1900,6 +1920,14 @@ static void zns_base_gc_work(struct work_struct *work)
 
   		spin_unlock(&c->lock);
 
+		phase = "select";
+		victim = NULL;
+		slot = 0;
+		read_buffer.blocks = 0;
+		read_buffer.read_ios = 0;
+		read_buffer.read_hits = 0;
+		read_buffer.lookup_ns = read_buffer.reserve_ns = 0;
+		read_buffer.read_ns = read_buffer.write_ns = read_buffer.wal_ns = 0;
 		ret = zns_base_select_victim(c, &victim);
 		if (ret == -ENOENT) {
 			/* No useful FULL victim is not corruption.  A proactive GC can
@@ -1910,10 +1938,13 @@ static void zns_base_gc_work(struct work_struct *work)
 			ret = 0;
 			break;
 		}
+		if (ret)
+			break;
 
 		/* valid_blocks is deliberately conservative after a foreground write
 		 * misses in RAM.  Resolve the candidate exactly before spending a GC
 		 * destination zone on it. */
+		phase = "validate";
 		ret = zns_base_gc_validate_victim(c, victim,
 						  &reclaimable_blocks);
 		if (ret) {
@@ -1928,6 +1959,7 @@ static void zns_base_gc_work(struct work_struct *work)
 			continue;
 		}
 
+		phase = "move";
 		phase_started = jiffies;
 		next_report = phase_started + 5 * HZ;
 		if (gc_diagnostics)
@@ -1942,17 +1974,32 @@ static void zns_base_gc_work(struct work_struct *work)
 				       jiffies_to_msecs(jiffies - phase_started));
 				next_report = jiffies + 5 * HZ;
 			}
-  			ret = zns_base_gc_move_block(c, victim, slot);
+			ret = zns_base_gc_move_block(c, victim, slot, &read_buffer);
   			if (ret)
   				break;
   		}
 
+		if (gc_diagnostics)
+			DMINFO("gc-diag: phase=move end victim=%u scanned=%u read_ios=%llu read_hits=%llu elapsed_ms=%u ret=%d",
+			       (unsigned int)(victim - c->zone_state.zones), slot,
+			       (unsigned long long)read_buffer.read_ios,
+			       (unsigned long long)read_buffer.read_hits,
+			       jiffies_to_msecs(jiffies - phase_started), ret);
+		if (gc_diagnostics)
+			DMINFO("gc-diag: move-cost victim=%u lookup_ms=%llu reserve_ms=%llu read_ms=%llu write_ms=%llu wal_ms=%llu",
+			       (unsigned int)(victim - c->zone_state.zones),
+			       (unsigned long long)div_u64(read_buffer.lookup_ns, NSEC_PER_MSEC),
+			       (unsigned long long)div_u64(read_buffer.reserve_ns, NSEC_PER_MSEC),
+			       (unsigned long long)div_u64(read_buffer.read_ns, NSEC_PER_MSEC),
+			       (unsigned long long)div_u64(read_buffer.write_ns, NSEC_PER_MSEC),
+			       (unsigned long long)div_u64(read_buffer.wal_ns, NSEC_PER_MSEC));
 		if (ret) {
 			zns_base_release_victim(c, victim);
 			break;
 		}
 
 		/* Publish every staged GC move before the victim can be reset. */
+		phase = "wal-flush";
 		if (gc_diagnostics)
 			DMINFO("gc-diag: phase=wal-flush begin victim=%u move_elapsed_ms=%u",
 			       (unsigned int)(victim - c->zone_state.zones),
@@ -1965,6 +2012,7 @@ static void zns_base_gc_work(struct work_struct *work)
 
 		/* Selection statistics are only a heuristic.  Audit the exact,
 		 * versioned reverse map immediately before the destructive zone reset. */
+		phase = "reset-guard";
 		if (gc_diagnostics)
 			DMINFO("gc-diag: phase=reset-guard begin victim=%u",
 			       (unsigned int)(victim - c->zone_state.zones));
@@ -1977,6 +2025,7 @@ static void zns_base_gc_work(struct work_struct *work)
 		if (gc_diagnostics)
 			DMINFO("gc-diag: phase=reset begin victim=%u",
 			       (unsigned int)(victim - c->zone_state.zones));
+		phase = "reset";
 		ret = zns_base_reset_victim(c, victim);
 		if (gc_diagnostics)
 			DMINFO("gc-diag: phase=reset end victim=%u ret=%d",
@@ -1987,6 +2036,11 @@ static void zns_base_gc_work(struct work_struct *work)
   		}
   	}
 
+	if (ret)
+		DMERR("gc-diag: failure phase=%s victim=%u slot=%u ret=%d",
+		      phase, victim ? (unsigned int)(victim - c->zone_state.zones) :
+		      ZNS_BASE_NO_ZONE, slot, ret);
+	vfree(read_buffer.data);
 	spin_lock(&c->lock);
 
 	if (ret && ret != -ENOSPC && !c->stopping) {
@@ -2785,6 +2839,8 @@ static int zns_base_gc_validate_victim(struct zns_base_c *c,
 		spin_lock(&c->lock);
 		if (victim->state != ZNS_BASE_ZONE_GC_VICTIM) {
 			spin_unlock(&c->lock);
+			DMERR("gc-diag: validate failure stage=state-before victim=%u slot=%u",
+			      (unsigned int)(victim - c->zone_state.zones), slot_idx);
 			return -EIO;
 		}
 		if (!victim->slots[slot_idx].valid) {
@@ -2800,12 +2856,18 @@ static int zns_base_gc_validate_victim(struct zns_base_c *c,
 
 		lookups++;
 		ret = mapping_lookup(c, logical_block, &current_entry);
-		if (ret && ret != -ENOENT)
+		if (ret && ret != -ENOENT) {
+			DMERR("gc-diag: validate failure stage=lookup victim=%u slot=%u lba=%zu ret=%d",
+			      (unsigned int)(victim - c->zone_state.zones),
+			      slot_idx, logical_block, ret);
 			return ret;
+		}
 
 		spin_lock(&c->lock);
 		if (victim->state != ZNS_BASE_ZONE_GC_VICTIM) {
 			spin_unlock(&c->lock);
+			DMERR("gc-diag: validate failure stage=state-after victim=%u slot=%u",
+			      (unsigned int)(victim - c->zone_state.zones), slot_idx);
 			return -EIO;
 		}
 		if (victim->slots[slot_idx].valid &&
@@ -2986,8 +3048,83 @@ static int zns_base_commit_gc_block(struct zns_base_c *c, struct zns_base_zone *
   	return 0;
 }
 
+/* GC owns this victim until all moves and WAL publication finish. Its physical
+ * bytes are immutable even if foreground writes invalidate reverse-map slots.
+ * Cache bytes only: move_block and WAL publication still validate each mapping.
+ * Read only contiguous valid slots and never beyond the committed write pointer.
+ */
+static int zns_base_gc_read_page(struct zns_base_c *c,
+		struct zns_base_zone *victim, unsigned int slot,
+		struct page *page, struct zns_base_gc_read_buffer *buffer)
+{
+	unsigned int count = 0, limit, i;
+	sector_t sector = victim->start_sector + (sector_t)slot * SECTORS_PER_BLOCK;
+	struct bio *bio;
+	int ret;
+
+	if (!buffer->data) {
+		buffer->read_ios++;
+		return zns_base_submit_page(c, page, REQ_OP_READ, 0, sector);
+	}
+	if (slot >= buffer->first_slot &&
+	    slot - buffer->first_slot < buffer->blocks) {
+		buffer->read_hits++;
+		goto copy;
+	}
+	buffer->blocks = 0;
+	limit = min_t(unsigned int, ZNS_BASE_GC_READAHEAD_BLOCKS,
+		      zns_base_max_transfer_blocks(c));
+	spin_lock(&c->lock);
+	if (victim->state != ZNS_BASE_ZONE_GC_VICTIM || slot >= victim->nr_blocks) {
+		spin_unlock(&c->lock);
+		return -EIO;
+	}
+	limit = min(limit, victim->nr_blocks - slot);
+	while (count < limit && victim->slots[slot + count].valid &&
+	       sector + (sector_t)(count + 1) * SECTORS_PER_BLOCK <=
+		victim->write_pointer)
+		count++;
+	spin_unlock(&c->lock);
+	/* A concurrent overwrite may invalidate the first slot. Reading its old
+	 * bytes is still safe; the existing conditional WAL publish rejects it. */
+	if (!count) {
+		buffer->read_ios++;
+		return zns_base_submit_page(c, page, REQ_OP_READ, 0, sector);
+	}
+	bio = bio_alloc(GFP_KERNEL, count);
+	if (!bio) {
+		buffer->read_ios++;
+		return zns_base_submit_page(c, page, REQ_OP_READ, 0, sector);
+	}
+	bio_set_dev(bio, c->dev->bdev);
+	bio_set_op_attrs(bio, REQ_OP_READ, 0);
+	bio->bi_iter.bi_sector = sector;
+	for (i = 0; i < count; i++) {
+		if (bio_add_page(bio, vmalloc_to_page((u8 *)buffer->data +
+				 i * ZNS_BASE_BLOCK_SIZE), ZNS_BASE_BLOCK_SIZE, 0) !=
+		    ZNS_BASE_BLOCK_SIZE) {
+			bio_put(bio);
+			buffer->read_ios++;
+			return zns_base_submit_page(c, page, REQ_OP_READ, 0, sector);
+		}
+	}
+	buffer->read_ios++;
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+	if (ret)
+		return ret;
+	buffer->first_slot = slot;
+	buffer->blocks = count;
+copy:
+	memcpy(page_address(page), (u8 *)buffer->data +
+	       (slot - buffer->first_slot) * ZNS_BASE_BLOCK_SIZE,
+	       ZNS_BASE_BLOCK_SIZE);
+	return 0;
+}
+
 static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *victim,
-				  unsigned int victim_slot)
+				  unsigned int victim_slot,
+				  struct zns_base_gc_read_buffer *read_buffer)
 {
 	struct mapping_entry expected_entry;
 	struct zns_base_zone *new_zone;
@@ -2999,6 +3136,8 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
 	unsigned int new_slot;
 	bool wal_group_full;
 	bool mapping_slot_reserved = false;
+	const char *stage = "lookup";
+	u64 started;
 	int ret;
 
   	/*
@@ -3020,7 +3159,9 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
   		((sector_t)victim_slot * SECTORS_PER_BLOCK);
 
 	spin_unlock(&c->lock);
+	started = ktime_get_ns();
 	ret = mapping_lookup(c, logical_block, &expected_entry);
+	read_buffer->lookup_ns += ktime_get_ns() - started;
 	spin_lock(&c->lock);
 	if (victim->state != ZNS_BASE_ZONE_GC_VICTIM ||
 	    !victim->slots[victim_slot].valid ||
@@ -3046,20 +3187,30 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
 
   	if (ret) {
   		spin_unlock(&c->lock);
+		DMERR("gc-diag: move failure stage=lookup victim=%u slot=%u lba=%zu ret=%d",
+		      (unsigned int)(victim - c->zone_state.zones),
+		      victim_slot, logical_block, ret);
   		return ret;
   	}
 
 	spin_unlock(&c->lock);
 
+	started = ktime_get_ns();
 	ret = mapping_reserve_write_slot(c, logical_block);
-	if (ret)
+	read_buffer->reserve_ns += ktime_get_ns() - started;
+	if (ret) {
+		DMERR("gc-diag: move failure stage=reserve victim=%u slot=%u ret=%d",
+		      (unsigned int)(victim - c->zone_state.zones), victim_slot, ret);
 		return ret;
+	}
 	mapping_slot_reserved = true;
 
 	ret = zns_base_allocate_gc_block(c, &new_physical_sector,
 					 &new_zone, &new_slot);
 	if (ret) {
 		mapping_release_write_slot(c);
+		DMERR("gc-diag: move failure stage=allocate victim=%u slot=%u ret=%d",
+		      (unsigned int)(victim - c->zone_state.zones), victim_slot, ret);
   		return ret;
 	}
 
@@ -3069,16 +3220,22 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
   		return -ENOMEM;
 	}
 
-  	ret = zns_base_submit_page(c, page, REQ_OP_READ, 0,
-  				   old_physical_sector);
+	stage = "read";
+	started = ktime_get_ns();
+	ret = zns_base_gc_read_page(c, victim, victim_slot, page, read_buffer);
+	read_buffer->read_ns += ktime_get_ns() - started;
   	if (ret)
   		goto out_free_page;
 
+	stage = "write";
+	started = ktime_get_ns();
 	ret = zns_base_submit_page(c, page, REQ_OP_WRITE, 0,
   				   new_physical_sector);
+	read_buffer->write_ns += ktime_get_ns() - started;
   	if (ret)
   		goto out_free_page;
 
+	stage = "commit-pending";
 	spin_lock(&c->lock);
 	ret = zns_base_commit_gc_block(c, new_zone,
 				       new_physical_sector);
@@ -3091,9 +3248,12 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
 		goto out_free_page;
 
 	wal_group_full = false;
+	stage = "wal-stage";
+	started = ktime_get_ns();
 	ret = zns_base_wal_stage_gc(c, logical_block, new_physical_sector,
 					    new_zone, new_slot, victim, victim_slot,
 					    &expected_entry, &wal_group_full);
+	read_buffer->wal_ns += ktime_get_ns() - started;
 	/* zns_base_wal_stage_gc() owns the reservation on entry. */
 	mapping_slot_reserved = false;
 	if (ret) {
@@ -3109,6 +3269,11 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
 	ret = 0;
 	
   out_free_page:
+	if (ret)
+		DMERR("gc-diag: move failure stage=%s victim=%u slot=%u lba=%zu old=%llu new=%llu ret=%d",
+		      stage, (unsigned int)(victim - c->zone_state.zones),
+		      victim_slot, logical_block, (unsigned long long)old_physical_sector,
+		      (unsigned long long)new_physical_sector, ret);
 	if (mapping_slot_reserved)
 		mapping_release_write_slot(c);
   	__free_page(page);
@@ -4984,6 +5149,8 @@ static int zns_base_sstable_lookup(struct zns_base_c *c,
 		lookup_epoch = c->metadata.lookup_epoch;
 		descriptor_count = READ_ONCE(c->metadata.sstable_count);
 		if (descriptor_count > ZNS_BASE_MAX_MANIFEST_SSTABLES) {
+			DMERR("SSTable lookup invalid catalog count=%u lba=%zu",
+			      descriptor_count, logical_block);
 			ret = -EIO;
 			goto out;
 		}
@@ -5005,6 +5172,10 @@ static int zns_base_sstable_lookup(struct zns_base_c *c,
 			goto out;
 		header = (struct zns_base_sstable_header_disk *)buffer;
 		if (!zns_base_sstable_header_valid(header)) {
+			DMERR("SSTable lookup invalid header lba=%zu table=%u sector=%llu epoch=%llu",
+			      logical_block, table,
+			      (unsigned long long)le64_to_cpu(descriptor->start_sector),
+			      (unsigned long long)lookup_epoch);
 			ret = -EIO;
 			goto out;
 		}
