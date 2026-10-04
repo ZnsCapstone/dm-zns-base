@@ -3368,6 +3368,27 @@ static int zns_base_activate_next_zone(struct zns_base_c *c)
   	return -ENOSPC;
 }
 
+/* Called with c->lock held.  active_zone_idx may still refer to an old
+ * foreground zone now owned (or reset) by GC.  Never change its state unless
+ * it is still ACTIVE and actually exhausted. */
+static int zns_base_ensure_active_zone(struct zns_base_c *c)
+{
+	struct zns_base_zone *zone;
+	sector_t zone_end;
+
+	zone = &c->zone_state.zones[c->zone_state.active_zone_idx];
+	if (zone->role != ZNS_BASE_ZONE_DATA)
+		return -EIO;
+	zone_end = zone->start_sector + zone->capacity_sectors;
+	if (zone->state == ZNS_BASE_ZONE_ACTIVE) {
+		if (zone->write_pointer + SECTORS_PER_BLOCK <= zone_end)
+			return 0;
+		zone->state = ZNS_BASE_ZONE_FULL;
+	}
+
+	return zns_base_activate_next_zone(c);
+}
+
 static int zns_base_allocate_block(struct zns_base_c *c,
 					  sector_t *physical_sector)
 {
@@ -3378,22 +3399,11 @@ static int zns_base_allocate_block(struct zns_base_c *c,
 	if (c->data_write_error)
 		return c->data_write_error;
 
+	ret = zns_base_ensure_active_zone(c);
+	if (ret)
+		return ret;
 	zone = &c->zone_state.zones[c->zone_state.active_zone_idx];
-	if (zone->role != ZNS_BASE_ZONE_DATA)
-  		return -EIO;
-  	zone_end = zone->start_sector + zone->capacity_sectors;
-
-  	if (zone->state != ZNS_BASE_ZONE_ACTIVE ||
-  	    zone->write_pointer + SECTORS_PER_BLOCK > zone_end) {
-  		zone->state = ZNS_BASE_ZONE_FULL;
-
-		ret = zns_base_activate_next_zone(c);
-  		if (ret)
-  			return ret;
-
-		zone = &c->zone_state.zones[c->zone_state.active_zone_idx];
-		zone_end = zone->start_sector + zone->capacity_sectors;
-	}
+	zone_end = zone->start_sector + zone->capacity_sectors;
 
 	/* Reserve now, before the asynchronous lower write is submitted.  The
 	 * single foreground dispatcher therefore gives every in-flight bio a
@@ -3432,17 +3442,9 @@ static int zns_base_write_full_blocks(struct zns_base_c *c,
 	 * that cannot cross the current physical zone. */
 retry_zone:
 	spin_lock(&c->lock);
+	ret = zns_base_ensure_active_zone(c);
 	zone = &c->zone_state.zones[c->zone_state.active_zone_idx];
 	zone_end = zone->start_sector + zone->capacity_sectors;
-	if (zone->state != ZNS_BASE_ZONE_ACTIVE ||
-	    zone->write_pointer + SECTORS_PER_BLOCK > zone_end) {
-		zone->state = ZNS_BASE_ZONE_FULL;
-		ret = zns_base_activate_next_zone(c);
-		if (!ret) {
-			zone = &c->zone_state.zones[c->zone_state.active_zone_idx];
-			zone_end = zone->start_sector + zone->capacity_sectors;
-		}
-	}
 	if (!ret && c->data_write_error)
 		ret = c->data_write_error;
 	if (!ret)
