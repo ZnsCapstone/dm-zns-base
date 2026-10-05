@@ -5164,6 +5164,7 @@ static int zns_base_sstable_lookup(struct zns_base_c *c,
 		const struct zns_base_sstable_descriptor_disk *descriptor =
 			&descriptors[table];
 		u64 left, right, entry_count;
+		sector_t buffered_sector, candidate_sector;
 
 		if (logical_block < le64_to_cpu(descriptor->min_logical_block) ||
 		    logical_block > le64_to_cpu(descriptor->max_logical_block))
@@ -5182,6 +5183,7 @@ static int zns_base_sstable_lookup(struct zns_base_c *c,
 			goto out;
 		}
 		entry_count = le64_to_cpu(header->entry_count);
+		buffered_sector = le64_to_cpu(descriptor->start_sector);
 		left = 0;
 		right = entry_count;
 		while (left < right) {
@@ -5192,9 +5194,15 @@ static int zns_base_sstable_lookup(struct zns_base_c *c,
 			unsigned int offset = middle %
 				(ZNS_BASE_BLOCK_SIZE / sizeof(*disk_entry));
 
-			ret = zns_base_lookup_read_block(c, lookup_epoch, sector, buffer);
-			if (ret)
-				goto out;
+			/* The immutable block already in this private buffer remains
+			 * valid under catalog SRCU. Avoid repeated 4 KiB cache copies
+			 * for the final binary-search steps within the same block. */
+			if (sector != buffered_sector) {
+				ret = zns_base_lookup_read_block(c, lookup_epoch, sector, buffer);
+				if (ret)
+					goto out;
+				buffered_sector = sector;
+			}
 			disk_entry = (struct zns_base_sstable_entry_disk *)buffer + offset;
 			if (le64_to_cpu(disk_entry->logical_block) < logical_block)
 				left = middle + 1;
@@ -5203,11 +5211,15 @@ static int zns_base_sstable_lookup(struct zns_base_c *c,
 		}
 		if (left == entry_count)
 			continue;
-		ret = zns_base_lookup_read_block(c, lookup_epoch,
-			le64_to_cpu(descriptor->start_sector) + SECTORS_PER_BLOCK *
-			(1 + left / (ZNS_BASE_BLOCK_SIZE / sizeof(*disk_entry))), buffer);
-		if (ret)
-			goto out;
+		candidate_sector = le64_to_cpu(descriptor->start_sector) +
+			SECTORS_PER_BLOCK *
+			(1 + left / (ZNS_BASE_BLOCK_SIZE / sizeof(*disk_entry)));
+		if (candidate_sector != buffered_sector) {
+			ret = zns_base_lookup_read_block(c, lookup_epoch,
+				candidate_sector, buffer);
+			if (ret)
+				goto out;
+		}
 		disk_entry = (struct zns_base_sstable_entry_disk *)buffer +
 			(left % (ZNS_BASE_BLOCK_SIZE / sizeof(*disk_entry)));
 		if (le64_to_cpu(disk_entry->logical_block) == logical_block &&
@@ -6034,6 +6046,8 @@ static void zns_base_wal_flush_work(struct work_struct *work)
 	struct zns_base_wal_pending_commit *next;
 	LIST_HEAD(done_commits);
 	bool published = false;
+	u64 timing_start, lock_ns, durability_ns = 0, publish_ns = 0;
+	unsigned int timed_records = 0;
 	int ret = 0;
 
 	wal = container_of(work, struct zns_base_wal_state,
@@ -6043,13 +6057,18 @@ static void zns_base_wal_flush_work(struct work_struct *work)
 
 	/* WAL order and mapping publication share one worker.  SSTable compaction
 	 * uses metadata.lock independently and cannot block ordinary WAL pages. */
+	timing_start = ktime_get_ns();
 	mutex_lock(&c->mapping_wal_lock);
 	mutex_lock(&wal->lock);
+	lock_ns = ktime_get_ns() - timing_start;
 
   	if (wal->record_count == 0)
   		goto out_unlock;
 
+	timed_records = wal->record_count;
+	timing_start = ktime_get_ns();
 	ret = zns_base_wal_write_group_locked(c);
+	durability_ns = ktime_get_ns() - timing_start;
 	if (ret) {
 		DMERR("WAL durability group flush failed: %d", ret);
 		wal->flush_error = ret;
@@ -6072,6 +6091,7 @@ static void zns_base_wal_flush_work(struct work_struct *work)
   		goto out_unlock;
   	}
 
+	timing_start = ktime_get_ns();
   	/*
 	 * WAL durability group이 FUA로 기록된 뒤에만
   	 * RAM mapping과 reverse map을 publish한다.
@@ -6108,6 +6128,7 @@ static void zns_base_wal_flush_work(struct work_struct *work)
   		list_move_tail(&commit->node, &done_commits);
   	}
 
+	publish_ns = ktime_get_ns() - timing_start;
   	zns_base_wal_reset_page_locked(wal);
 
   out_unlock:
@@ -6115,6 +6136,13 @@ static void zns_base_wal_flush_work(struct work_struct *work)
 
 	mutex_unlock(&wal->lock);
 	mutex_unlock(&c->mapping_wal_lock);
+	if (gc_diagnostics && timed_records &&
+	    lock_ns + durability_ns + publish_ns >= 100 * NSEC_PER_MSEC)
+		DMINFO("wal-diag: records=%u lock_ms=%llu durability_ms=%llu publish_ms=%llu ret=%d",
+		       timed_records,
+		       (unsigned long long)div_u64(lock_ns, NSEC_PER_MSEC),
+		       (unsigned long long)div_u64(durability_ns, NSEC_PER_MSEC),
+		       (unsigned long long)div_u64(publish_ns, NSEC_PER_MSEC), ret);
 
 	zns_base_wal_finish_commits(c, &done_commits);
 	if (published)
