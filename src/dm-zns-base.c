@@ -598,7 +598,7 @@ static int zns_base_gc_lookup_validated(struct zns_base_c *c,
 	ret = mapping_lookup_ram_locked(c, logical_block, entry);
 	spin_unlock(&c->lock);
 	if (ret != -ENOENT)
-		return !ret && entry->physical_sector == DISCARDED_PBA ? -ENOENT : ret;
+		return !ret && entry->physical_sector == ZNS_BASE_DISCARDED_PBA ? -ENOENT : ret;
 	if (epoch != READ_ONCE(c->metadata.lookup_epoch) ||
 	    read_seqcount_retry(&c->metadata.catalog_seq, version))
 		return mapping_lookup(c, logical_block, entry);
