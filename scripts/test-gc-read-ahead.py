@@ -162,7 +162,7 @@ int main(void) {
                              SOURCE.index("static int zns_base_gc_read_page("))
         end = SOURCE.index("\n}\n", start) + 3
         move = SOURCE[start:end]
-        self.assertLess(move.index("mapping_lookup(c"), move.index("zns_base_gc_read_page(c"))
+        self.assertLess(move.index("zns_base_gc_lookup_validated(c"), move.index("zns_base_gc_read_page(c"))
         self.assertLess(move.index("zns_base_gc_read_page(c"), move.index("zns_base_wal_stage_gc(c"))
         self.assertIn("zns_base_gc_verify_reset_safe(c, victim)", SOURCE)
         self.assertIn("current_entry.seq != commit->expected_seq", SOURCE)

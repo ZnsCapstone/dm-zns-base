@@ -53,6 +53,8 @@ MODULE_PARM_DESC(gc_read_ahead, "batch contiguous victim reads during GC");
 /* Private to one GC worker invocation; never reused across victims. */
 struct zns_base_gc_read_buffer {
 	void *data;
+	u64 *validated_epochs;
+	u64 validated_hits;
 	unsigned int first_slot;
 	unsigned int blocks;
 	u64 read_ios;
@@ -554,6 +556,8 @@ struct zns_base_c {
 
 static int mapping_update(struct zns_base_c *c, size_t logical_block, sector_t physical_sector, u64 seq);
 static int mapping_lookup(struct zns_base_c *c, size_t logical_block, struct mapping_entry *entry);
+static int mapping_lookup_ram_locked(struct zns_base_c *c,
+		size_t logical_block, struct mapping_entry *entry);
 static int mapping_lookup_latest(struct zns_base_c *c, size_t logical_block,
 				 struct mapping_entry *entry);
 static int mapping_lookup_visible(struct zns_base_c *c, size_t logical_block,
@@ -573,6 +577,38 @@ static int zns_base_get_zone_slot(struct zns_base_c *c,sector_t physical_sector,
   				  struct zns_base_zone **zone_out, unsigned int *slot_out);
 static void zns_base_gc_work(struct work_struct *work);
 static void zns_base_schedule_gc(struct zns_base_c *c);
+/* A validated victim slot cannot acquire a new version while isolated.
+ * RAM overrides the saved version. Frozen RAM entries are removed only after
+ * catalog publication, so an unchanged epoch plus a RAM miss is sufficient.
+ * Check the seqcount across BOTH the RAM lookup and epoch read: publication
+ * racing with RAM eviction must fall back to the ordinary lookup.
+ */
+static int zns_base_gc_lookup_validated(struct zns_base_c *c,
+		u64 epoch, size_t logical_block, sector_t physical_sector, u64 seq,
+		struct mapping_entry *entry, bool *hit)
+{
+	unsigned int version;
+	int ret;
+
+	*hit = false;
+	if (!epoch)
+		return mapping_lookup(c, logical_block, entry);
+	version = read_seqcount_begin(&c->metadata.catalog_seq);
+	spin_lock(&c->lock);
+	ret = mapping_lookup_ram_locked(c, logical_block, entry);
+	spin_unlock(&c->lock);
+	if (ret != -ENOENT)
+		return !ret && entry->physical_sector == DISCARDED_PBA ? -ENOENT : ret;
+	if (epoch != READ_ONCE(c->metadata.lookup_epoch) ||
+	    read_seqcount_retry(&c->metadata.catalog_seq, version))
+		return mapping_lookup(c, logical_block, entry);
+	entry->logical_block = logical_block;
+	entry->physical_sector = physical_sector;
+	entry->seq = seq;
+	*hit = true;
+	return 0;
+}
+
 static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *victim,
 				  unsigned int victim_slot,
 				  struct zns_base_gc_read_buffer *read_buffer);
@@ -580,7 +616,8 @@ static int zns_base_reset_victim(struct zns_base_c *c, struct zns_base_zone *vic
 static unsigned int zns_base_count_free_zones(struct zns_base_c *c);
 static int zns_base_select_victim(struct zns_base_c *c, struct zns_base_zone **victim_out);
 static int zns_base_gc_validate_victim(struct zns_base_c *c,
-		struct zns_base_zone *victim, unsigned int *stale_blocks);
+		struct zns_base_zone *victim, unsigned int *stale_blocks,
+		struct zns_base_gc_read_buffer *read_buffer);
 static int zns_base_gc_verify_reset_safe(struct zns_base_c *c,
 		struct zns_base_zone *victim);
 static void zns_base_release_victim(struct zns_base_c *c, struct zns_base_zone *victim);
@@ -1958,8 +1995,15 @@ static void zns_base_gc_work(struct work_struct *work)
 		 * misses in RAM.  Resolve the candidate exactly before spending a GC
 		 * destination zone on it. */
 		phase = "validate";
+		kvfree(read_buffer.validated_epochs);
+		read_buffer.validated_epochs = NULL;
+		read_buffer.validated_hits = 0;
+		/* Optional, bounded to 8 MiB; allocation failure falls back. */
+		if (sstable_lookup_cache && victim->nr_blocks <= (1U << 20))
+			read_buffer.validated_epochs = kvcalloc(victim->nr_blocks,
+				sizeof(*read_buffer.validated_epochs), GFP_KERNEL);
 		ret = zns_base_gc_validate_victim(c, victim,
-						  &reclaimable_blocks);
+						  &reclaimable_blocks, &read_buffer);
 		if (ret) {
 			zns_base_release_victim(c, victim);
 			break;
@@ -1998,6 +2042,10 @@ static void zns_base_gc_work(struct work_struct *work)
 			       (unsigned long long)read_buffer.read_ios,
 			       (unsigned long long)read_buffer.read_hits,
 			       jiffies_to_msecs(jiffies - phase_started), ret);
+		if (gc_diagnostics)
+			DMINFO("gc-diag: validated-reuse victim=%u hits=%llu",
+			       (unsigned int)(victim - c->zone_state.zones),
+			       (unsigned long long)read_buffer.validated_hits);
 		if (gc_diagnostics)
 			DMINFO("gc-diag: move-cost victim=%u lookup_ms=%llu reserve_ms=%llu read_ms=%llu write_ms=%llu wal_ms=%llu",
 			       (unsigned int)(victim - c->zone_state.zones),
@@ -2054,6 +2102,7 @@ static void zns_base_gc_work(struct work_struct *work)
 		      phase, victim ? (unsigned int)(victim - c->zone_state.zones) :
 		      ZNS_BASE_NO_ZONE, slot, ret);
 	vfree(read_buffer.data);
+	kvfree(read_buffer.validated_epochs);
 	spin_lock(&c->lock);
 
 	if (ret && ret != -ENOSPC && !c->stopping) {
@@ -2825,7 +2874,8 @@ static int zns_base_select_victim(struct zns_base_c *c,
  * this pass compares every reverse-map version with the newest visible map.
  * The victim remains isolated in GC_VICTIM state throughout the scan. */
 static int zns_base_gc_validate_victim(struct zns_base_c *c,
-	struct zns_base_zone *victim, unsigned int *reclaimable_blocks)
+	struct zns_base_zone *victim, unsigned int *reclaimable_blocks,
+	struct zns_base_gc_read_buffer *read_buffer)
 {
 	struct mapping_entry current_entry;
 	sector_t physical_sector;
@@ -2868,7 +2918,17 @@ static int zns_base_gc_validate_victim(struct zns_base_c *c,
 		spin_unlock(&c->lock);
 
 		lookups++;
-		ret = mapping_lookup(c, logical_block, &current_entry);
+		{
+			unsigned int version = read_seqcount_begin(&c->metadata.catalog_seq);
+			u64 epoch = READ_ONCE(c->metadata.lookup_epoch);
+
+			ret = mapping_lookup(c, logical_block, &current_entry);
+			if (read_buffer->validated_epochs && epoch && !ret &&
+			    current_entry.physical_sector == physical_sector &&
+			    current_entry.seq == seq &&
+			    !read_seqcount_retry(&c->metadata.catalog_seq, version))
+				read_buffer->validated_epochs[slot_idx] = epoch;
+		}
 		if (ret && ret != -ENOENT) {
 			DMERR("gc-diag: validate failure stage=lookup victim=%u slot=%u lba=%zu ret=%d",
 			      (unsigned int)(victim - c->zone_state.zones),
@@ -3148,6 +3208,7 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
 	u64 victim_seq;
 	unsigned int new_slot;
 	bool wal_group_full;
+	bool validated_hit;
 	bool mapping_slot_reserved = false;
 	const char *stage = "lookup";
 	u64 started;
@@ -3173,7 +3234,11 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
 
 	spin_unlock(&c->lock);
 	started = ktime_get_ns();
-	ret = mapping_lookup(c, logical_block, &expected_entry);
+	ret = zns_base_gc_lookup_validated(c,
+		read_buffer->validated_epochs ? read_buffer->validated_epochs[victim_slot] : 0,
+		logical_block, old_physical_sector, victim_seq, &expected_entry,
+		&validated_hit);
+	read_buffer->validated_hits += validated_hit;
 	read_buffer->lookup_ns += ktime_get_ns() - started;
 	spin_lock(&c->lock);
 	if (victim->state != ZNS_BASE_ZONE_GC_VICTIM ||
