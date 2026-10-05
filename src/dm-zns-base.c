@@ -178,6 +178,16 @@ struct mapping_entry {
 	u64 seq;
 };
 
+#define ZNS_BASE_RESULT_CACHE_BITS 14
+#define ZNS_BASE_RESULT_CACHE_SIZE (1U << ZNS_BASE_RESULT_CACHE_BITS)
+struct zns_base_lookup_result {
+	u64 epoch;
+	size_t logical_block;
+	struct mapping_entry entry;
+	int result;
+	bool valid;
+};
+
 /* A MemTable preallocates these nodes, then links them by logical block. */
 struct mapping_memtable_entry {
 	struct rb_node node;
@@ -474,6 +484,9 @@ struct zns_base_metadata_state {
 	seqcount_t catalog_seq;
 	u64 lookup_epoch; /* Published with catalog_seq; never persisted. */
 	struct zns_base_lookup_cache_entry *lookup_cache;
+	struct zns_base_lookup_result *result_cache;
+	atomic64_t result_cache_hits;
+	atomic64_t result_cache_misses;
 	spinlock_t lookup_cache_lock;
 	atomic64_t lookup_cache_hits;
 	atomic64_t lookup_cache_misses;
@@ -3581,6 +3594,11 @@ static int zns_base_metadata_init(struct zns_base_c *c)
 	spin_lock_init(&c->metadata.lookup_cache_lock);
 	atomic64_set(&c->metadata.lookup_cache_hits, 0);
 	atomic64_set(&c->metadata.lookup_cache_misses, 0);
+	atomic64_set(&c->metadata.result_cache_hits, 0);
+	atomic64_set(&c->metadata.result_cache_misses, 0);
+	if (sstable_lookup_cache)
+		c->metadata.result_cache = vzalloc(array_size(ZNS_BASE_RESULT_CACHE_SIZE,
+						 sizeof(*c->metadata.result_cache)));
 	/* Optional bounded (~16 MiB) cache. Allocation failure keeps old behavior. */
 	if (sstable_lookup_cache)
 		c->metadata.lookup_cache = vzalloc(array_size(ZNS_BASE_LOOKUP_CACHE_SIZE,
@@ -3644,6 +3662,8 @@ static int zns_base_metadata_init(struct zns_base_c *c)
 static void zns_base_metadata_destroy(struct zns_base_c *c)
 {
 	vfree(c->metadata.lookup_cache);
+	vfree(c->metadata.result_cache);
+	c->metadata.result_cache = NULL;
 	c->metadata.lookup_cache = NULL;
 	vfree(c->metadata.wal.page_buffer);
 	c->metadata.wal.page_buffer = NULL;
@@ -5116,6 +5136,54 @@ static int zns_base_lookup_read_block(struct zns_base_c *c, u64 epoch,
 	return 0;
 }
 
+/* Cache only the immutable SSTable answer, never the combined RAM/disk
+ * mapping. Callers still check RAM first. Catalog publication changes epoch,
+ * so flush/compaction invalidate both positive and negative answers. */
+static bool zns_base_result_cache_get(struct zns_base_c *c, u64 epoch,
+		size_t logical_block, struct mapping_entry *entry, int *result)
+{
+	struct zns_base_lookup_result *cached;
+	bool hit = false;
+
+	if (!c->metadata.result_cache)
+		return false;
+	cached = &c->metadata.result_cache[
+		hash_64(logical_block, ZNS_BASE_RESULT_CACHE_BITS)];
+	spin_lock(&c->metadata.lookup_cache_lock);
+	if (cached->valid && cached->epoch == epoch &&
+	    cached->logical_block == logical_block) {
+		*result = cached->result;
+		if (!*result)
+			*entry = cached->entry;
+		hit = true;
+	}
+	spin_unlock(&c->metadata.lookup_cache_lock);
+	if (hit)
+		atomic64_inc(&c->metadata.result_cache_hits);
+	else
+		atomic64_inc(&c->metadata.result_cache_misses);
+	return hit;
+}
+
+static void zns_base_result_cache_put(struct zns_base_c *c, u64 epoch,
+		size_t logical_block, const struct mapping_entry *entry, int result)
+{
+	struct zns_base_lookup_result *cached;
+
+	if (!c->metadata.result_cache || (result && result != -ENOENT))
+		return;
+	cached = &c->metadata.result_cache[
+		hash_64(logical_block, ZNS_BASE_RESULT_CACHE_BITS)];
+	spin_lock(&c->metadata.lookup_cache_lock);
+	cached->epoch = epoch;
+	cached->logical_block = logical_block;
+	cached->result = result;
+	if (!result)
+		cached->entry = *entry;
+	cached->valid = true;
+	spin_unlock(&c->metadata.lookup_cache_lock);
+}
+
 /* Take a lockless catalog snapshot, then pin all currently published SSTable
  * zones until the lookup finishes.  Compaction can do body I/O concurrently
  * and waits for this reader epoch only before resetting an old zone. */
@@ -5159,6 +5227,9 @@ static int zns_base_sstable_lookup(struct zns_base_c *c,
 		memcpy(descriptors, c->metadata.sstables,
 		       descriptor_count * sizeof(*descriptors));
 	} while (read_seqcount_retry(&c->metadata.catalog_seq, catalog_seq));
+
+	if (zns_base_result_cache_get(c, lookup_epoch, logical_block, entry, &ret))
+		goto out;
 
 	for (table = 0; table < descriptor_count; table++) {
 		const struct zns_base_sstable_descriptor_disk *descriptor =
@@ -5235,6 +5306,7 @@ static int zns_base_sstable_lookup(struct zns_base_c *c,
 	} else {
 		ret = -ENOENT;
 	}
+	zns_base_result_cache_put(c, lookup_epoch, logical_block, &best, ret);
 out:
 	srcu_read_unlock(&c->metadata.catalog_srcu, srcu_idx);
 	kvfree(buffer);
@@ -6841,6 +6913,10 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		!!c->metadata.lookup_cache,
 		(unsigned long long)atomic64_read(&c->metadata.lookup_cache_hits),
 		(unsigned long long)atomic64_read(&c->metadata.lookup_cache_misses));
+	DMEMIT(" result_cache_enabled=%u result_cache_hits=%llu result_cache_misses=%llu",
+		!!c->metadata.result_cache,
+		(unsigned long long)atomic64_read(&c->metadata.result_cache_hits),
+		(unsigned long long)atomic64_read(&c->metadata.result_cache_misses));
 }
 
 static struct target_type zns_base_target = {
