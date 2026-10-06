@@ -3337,7 +3337,7 @@ static int zns_base_gc_move_blocks(struct zns_base_c *c,
 
 	while (scanned < limit) {
 		struct zns_base_gc_move_item *item = &items[count];
-		struct mapping_entry current;
+		struct mapping_entry current_entry;
 		unsigned int slot = first_slot + scanned;
 		bool validated_hit;
 
@@ -3364,7 +3364,7 @@ static int zns_base_gc_move_blocks(struct zns_base_c *c,
 			read_buffer->validated_epochs ?
 			read_buffer->validated_epochs[slot] : 0,
 			item->logical_block, item->old_physical_sector,
-			item->victim_seq, &current, &validated_hit);
+			item->victim_seq, &current_entry, &validated_hit);
 		read_buffer->lookup_ns += ktime_get_ns() - started;
 		read_buffer->validated_hits += validated_hit;
 
@@ -3378,8 +3378,8 @@ static int zns_base_gc_move_blocks(struct zns_base_c *c,
 			continue;
 		}
 		if (ret == -ENOENT || (!ret &&
-		    (current.physical_sector != item->old_physical_sector ||
-		     current.seq != item->victim_seq))) {
+		    (current_entry.physical_sector != item->old_physical_sector ||
+		     current_entry.seq != item->victim_seq))) {
 			victim->slots[slot].valid = false;
 			victim->valid_blocks--;
 			spin_unlock(&c->lock);
@@ -3389,7 +3389,7 @@ static int zns_base_gc_move_blocks(struct zns_base_c *c,
 		spin_unlock(&c->lock);
 		if (ret)
 			goto out;
-		item->expected_entry = current;
+		item->expected_entry = current_entry;
 
 		started = ktime_get_ns();
 		ret = mapping_reserve_write_slot(c, item->logical_block);

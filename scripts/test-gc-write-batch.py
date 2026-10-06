@@ -87,6 +87,8 @@ int main(void) {
                         SOURCE.index('static int zns_base_select_victim(', worker_start)]
         self.assertIn('if (read_buffer.write_data)', worker)
         self.assertIn('zns_base_gc_move_block(c', worker)
+        # `current` is a Linux kernel macro for get_current().
+        self.assertNotIn('struct mapping_entry current;', body)
 
 
 if __name__ == '__main__':
