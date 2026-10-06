@@ -5,6 +5,9 @@ queue transfer limit or remaining destination capacity) into one sequential
 bio. Per-LBA mapping validation, MemTable reservations, conditional WAL
 publication, and victim reset guards remain unchanged.
 
+The move-item array and write buffer are allocated once per GC worker run, not
+on the kernel stack. If either allocation fails, GC uses the single-block path.
+
 The device write completes before the destination software write pointer and
 pending reverse-map slots are committed together under the target lock. WAL
 staging then retains ownership of each pending slot and mapping reservation.

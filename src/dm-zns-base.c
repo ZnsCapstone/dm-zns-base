@@ -53,10 +53,13 @@ static bool gc_write_batch = true;
 module_param(gc_write_batch, bool, 0444);
 MODULE_PARM_DESC(gc_write_batch, "batch sequential GC relocation writes");
 
+struct zns_base_gc_move_item;
+
 /* Private to one GC worker invocation; never reused across victims. */
 struct zns_base_gc_read_buffer {
 	void *data;
 	void *write_data;
+	struct zns_base_gc_move_item *move_items;
 	u64 *validated_epochs;
 	u64 validated_hits;
 	unsigned int first_slot;
@@ -1973,6 +1976,14 @@ static void zns_base_gc_work(struct work_struct *work)
 	if (gc_write_batch)
 		read_buffer.write_data = vzalloc(ZNS_BASE_GC_READAHEAD_BLOCKS *
 						ZNS_BASE_BLOCK_SIZE);
+	if (read_buffer.write_data)
+		read_buffer.move_items = kcalloc(ZNS_BASE_GC_READAHEAD_BLOCKS,
+						 sizeof(*read_buffer.move_items),
+						 GFP_KERNEL);
+	if (!read_buffer.move_items) {
+		vfree(read_buffer.write_data);
+		read_buffer.write_data = NULL;
+	}
 
 	spin_lock(&c->lock);
 	c->gc_running = true;
@@ -2142,6 +2153,7 @@ static void zns_base_gc_work(struct work_struct *work)
 		      ZNS_BASE_NO_ZONE, slot, ret);
 	vfree(read_buffer.data);
 	vfree(read_buffer.write_data);
+	kfree(read_buffer.move_items);
 	kvfree(read_buffer.validated_epochs);
 	spin_lock(&c->lock);
 
@@ -3302,7 +3314,7 @@ static int zns_base_gc_move_blocks(struct zns_base_c *c,
 		struct zns_base_zone *victim, unsigned int first_slot,
 		unsigned int *consumed, struct zns_base_gc_read_buffer *read_buffer)
 {
-	struct zns_base_gc_move_item items[ZNS_BASE_GC_READAHEAD_BLOCKS] = { 0 };
+	struct zns_base_gc_move_item *items = read_buffer->move_items;
 	struct zns_base_zone *destination;
 	struct page *scratch_page = NULL;
 	sector_t first_sector;
@@ -3311,6 +3323,7 @@ static int zns_base_gc_move_blocks(struct zns_base_c *c,
 	int ret;
 
 	*consumed = 1;
+	memset(items, 0, ZNS_BASE_GC_READAHEAD_BLOCKS * sizeof(*items));
 	ret = zns_base_get_gc_destination(c, &destination);
 	if (ret)
 		return ret;
