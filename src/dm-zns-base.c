@@ -49,16 +49,22 @@
 static bool gc_read_ahead = true;
 module_param(gc_read_ahead, bool, 0444);
 MODULE_PARM_DESC(gc_read_ahead, "batch contiguous victim reads during GC");
+static bool gc_write_batch = true;
+module_param(gc_write_batch, bool, 0444);
+MODULE_PARM_DESC(gc_write_batch, "batch sequential GC relocation writes");
 
 /* Private to one GC worker invocation; never reused across victims. */
 struct zns_base_gc_read_buffer {
 	void *data;
+	void *write_data;
 	u64 *validated_epochs;
 	u64 validated_hits;
 	unsigned int first_slot;
 	unsigned int blocks;
 	u64 read_ios;
 	u64 read_hits;
+	u64 write_ios;
+	u64 write_blocks;
 	u64 lookup_ns, reserve_ns, read_ns, write_ns, wal_ns;
 };
 #define ZNS_BASE_LOOKUP_CACHE_BITS 12
@@ -174,10 +180,25 @@ enum zns_base_zone_role {
   	ZNS_BASE_ZONE_DATA,
 };
 
+struct zns_base_zone;
+
 struct mapping_entry {
 	size_t logical_block;
 	sector_t physical_sector;
 	u64 seq;
+};
+
+struct zns_base_gc_move_item {
+	struct mapping_entry expected_entry;
+	struct zns_base_zone *new_zone;
+	sector_t old_physical_sector;
+	sector_t new_physical_sector;
+	size_t logical_block;
+	u64 victim_seq;
+	unsigned int victim_slot;
+	unsigned int new_slot;
+	bool mapping_slot_reserved;
+	bool pending_reserved;
 };
 
 #define ZNS_BASE_RESULT_CACHE_BITS 14
@@ -612,6 +633,9 @@ static int zns_base_gc_lookup_validated(struct zns_base_c *c,
 static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *victim,
 				  unsigned int victim_slot,
 				  struct zns_base_gc_read_buffer *read_buffer);
+static int zns_base_gc_move_blocks(struct zns_base_c *c,
+		struct zns_base_zone *victim, unsigned int first_slot,
+		unsigned int *consumed, struct zns_base_gc_read_buffer *read_buffer);
 static int zns_base_reset_victim(struct zns_base_c *c, struct zns_base_zone *victim);
 static unsigned int zns_base_count_free_zones(struct zns_base_c *c);
 static int zns_base_select_victim(struct zns_base_c *c, struct zns_base_zone **victim_out);
@@ -1942,10 +1966,13 @@ static void zns_base_gc_work(struct work_struct *work)
 	const char *phase = "select";
   	int ret;
 
-  	c = container_of(work, struct zns_base_c, gc_work);
+	c = container_of(work, struct zns_base_c, gc_work);
 	if (gc_read_ahead)
 		read_buffer.data = vzalloc(ZNS_BASE_GC_READAHEAD_BLOCKS *
 					  ZNS_BASE_BLOCK_SIZE);
+	if (gc_write_batch)
+		read_buffer.write_data = vzalloc(ZNS_BASE_GC_READAHEAD_BLOCKS *
+						ZNS_BASE_BLOCK_SIZE);
 
 	spin_lock(&c->lock);
 	c->gc_running = true;
@@ -1976,6 +2003,8 @@ static void zns_base_gc_work(struct work_struct *work)
 		read_buffer.blocks = 0;
 		read_buffer.read_ios = 0;
 		read_buffer.read_hits = 0;
+		read_buffer.write_ios = 0;
+		read_buffer.write_blocks = 0;
 		read_buffer.lookup_ns = read_buffer.reserve_ns = 0;
 		read_buffer.read_ns = read_buffer.write_ns = read_buffer.wal_ns = 0;
 		ret = zns_base_select_victim(c, &victim);
@@ -2023,7 +2052,9 @@ static void zns_base_gc_work(struct work_struct *work)
 			DMINFO("gc-diag: phase=move begin victim=%u slots=%u reclaimable=%u",
 			       (unsigned int)(victim - c->zone_state.zones),
 			       victim->nr_blocks, reclaimable_blocks);
-		for (slot = 0; slot < victim->nr_blocks; slot++) {
+		for (slot = 0; slot < victim->nr_blocks;) {
+			unsigned int consumed = 1;
+
 			if (gc_diagnostics && time_after_eq(jiffies, next_report)) {
 				DMINFO("gc-diag: phase=move victim=%u scanned=%u/%u elapsed_ms=%u",
 				       (unsigned int)(victim - c->zone_state.zones),
@@ -2031,16 +2062,24 @@ static void zns_base_gc_work(struct work_struct *work)
 				       jiffies_to_msecs(jiffies - phase_started));
 				next_report = jiffies + 5 * HZ;
 			}
-			ret = zns_base_gc_move_block(c, victim, slot, &read_buffer);
+			if (read_buffer.write_data)
+				ret = zns_base_gc_move_blocks(c, victim, slot,
+							      &consumed, &read_buffer);
+			else
+				ret = zns_base_gc_move_block(c, victim, slot,
+							     &read_buffer);
   			if (ret)
   				break;
+			slot += consumed;
   		}
 
 		if (gc_diagnostics)
-			DMINFO("gc-diag: phase=move end victim=%u scanned=%u read_ios=%llu read_hits=%llu elapsed_ms=%u ret=%d",
+			DMINFO("gc-diag: phase=move end victim=%u scanned=%u read_ios=%llu read_hits=%llu write_ios=%llu write_blocks=%llu elapsed_ms=%u ret=%d",
 			       (unsigned int)(victim - c->zone_state.zones), slot,
 			       (unsigned long long)read_buffer.read_ios,
 			       (unsigned long long)read_buffer.read_hits,
+			       (unsigned long long)read_buffer.write_ios,
+			       (unsigned long long)read_buffer.write_blocks,
 			       jiffies_to_msecs(jiffies - phase_started), ret);
 		if (gc_diagnostics)
 			DMINFO("gc-diag: validated-reuse victim=%u hits=%llu",
@@ -2102,6 +2141,7 @@ static void zns_base_gc_work(struct work_struct *work)
 		      phase, victim ? (unsigned int)(victim - c->zone_state.zones) :
 		      ZNS_BASE_NO_ZONE, slot, ret);
 	vfree(read_buffer.data);
+	vfree(read_buffer.write_data);
 	kvfree(read_buffer.validated_epochs);
 	spin_lock(&c->lock);
 
@@ -3193,6 +3233,235 @@ copy:
 	       (slot - buffer->first_slot) * ZNS_BASE_BLOCK_SIZE,
 	       ZNS_BASE_BLOCK_SIZE);
 	return 0;
+}
+
+/* Publish destination ownership only after the complete sequential bio has
+ * succeeded.  The GC worker is the sole allocator of GC_DEST, so the write
+ * pointer cannot change between preparation and this locked commit. */
+static int zns_base_commit_gc_blocks(struct zns_base_c *c,
+		struct zns_base_zone *zone, sector_t first_sector,
+		struct zns_base_gc_move_item *items, unsigned int count)
+{
+	sector_t end = first_sector + (sector_t)count * SECTORS_PER_BLOCK;
+	sector_t zone_end = zone->start_sector + zone->capacity_sectors;
+	unsigned int i;
+	int ret = 0;
+
+	spin_lock(&c->lock);
+	if (zone->state != ZNS_BASE_ZONE_GC_DEST ||
+	    zone->write_pointer != first_sector || end > zone_end) {
+		ret = -EIO;
+		goto out;
+	}
+	for (i = 0; i < count; i++) {
+		struct zns_base_zone *found;
+		unsigned int slot;
+
+		ret = zns_base_get_zone_slot(c, items[i].new_physical_sector,
+					     &found, &slot);
+		if (ret || found != zone || found->slots[slot].valid ||
+		    found->slots[slot].pending) {
+			ret = -EIO;
+			goto out;
+		}
+		items[i].new_zone = found;
+		items[i].new_slot = slot;
+	}
+	for (i = 0; i < count; i++) {
+		ret = zns_base_reserve_pending_slot_locked(zone, items[i].new_slot,
+							 items[i].logical_block);
+		if (ret)
+			goto rollback;
+		items[i].pending_reserved = true;
+	}
+	zone->write_pointer = end;
+	if (end == zone_end) {
+		zone->state = ZNS_BASE_ZONE_FULL;
+		c->zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;
+	}
+	goto out;
+
+rollback:
+	while (i--) {
+		struct zns_base_zone_slot *slot = &zone->slots[items[i].new_slot];
+
+		slot->pending = false;
+		slot->seq = 0;
+		zone->pending_blocks--;
+		items[i].pending_reserved = false;
+	}
+out:
+	spin_unlock(&c->lock);
+	return ret;
+}
+
+/* Pack up to one readahead window of live victim blocks into one sequential
+ * destination bio. Mapping checks and reservations remain per LBA; WAL
+ * publication remains conditional per item. */
+static int zns_base_gc_move_blocks(struct zns_base_c *c,
+		struct zns_base_zone *victim, unsigned int first_slot,
+		unsigned int *consumed, struct zns_base_gc_read_buffer *read_buffer)
+{
+	struct zns_base_gc_move_item items[ZNS_BASE_GC_READAHEAD_BLOCKS] = { 0 };
+	struct zns_base_zone *destination;
+	struct page *scratch_page = NULL;
+	sector_t first_sector;
+	unsigned int limit, scanned = 0, count = 0, i;
+	u64 started;
+	int ret;
+
+	*consumed = 1;
+	ret = zns_base_get_gc_destination(c, &destination);
+	if (ret)
+		return ret;
+	spin_lock(&c->lock);
+	first_sector = destination->write_pointer;
+	if (destination->state != ZNS_BASE_ZONE_GC_DEST ||
+	    first_sector >= destination->start_sector + destination->capacity_sectors) {
+		spin_unlock(&c->lock);
+		return -EIO;
+	}
+	limit = min_t(unsigned int, ZNS_BASE_GC_READAHEAD_BLOCKS,
+		zns_base_max_transfer_blocks(c));
+	limit = min_t(unsigned int, limit,
+		(destination->start_sector + destination->capacity_sectors -
+		 first_sector) / SECTORS_PER_BLOCK);
+	limit = min_t(unsigned int, limit, victim->nr_blocks - first_slot);
+	spin_unlock(&c->lock);
+	if (!limit)
+		return -EIO;
+
+	scratch_page = alloc_page(GFP_KERNEL);
+	if (!scratch_page)
+		return -ENOMEM;
+
+	while (scanned < limit) {
+		struct zns_base_gc_move_item *item = &items[count];
+		struct mapping_entry current;
+		unsigned int slot = first_slot + scanned;
+		bool validated_hit;
+
+		spin_lock(&c->lock);
+		if (victim->state != ZNS_BASE_ZONE_GC_VICTIM) {
+			spin_unlock(&c->lock);
+			ret = -EIO;
+			goto out;
+		}
+		if (!victim->slots[slot].valid) {
+			spin_unlock(&c->lock);
+			scanned++;
+			continue;
+		}
+		item->logical_block = victim->slots[slot].logical_block;
+		item->victim_seq = victim->slots[slot].seq;
+		item->victim_slot = slot;
+		item->old_physical_sector = victim->start_sector +
+			(sector_t)slot * SECTORS_PER_BLOCK;
+		spin_unlock(&c->lock);
+
+		started = ktime_get_ns();
+		ret = zns_base_gc_lookup_validated(c,
+			read_buffer->validated_epochs ?
+			read_buffer->validated_epochs[slot] : 0,
+			item->logical_block, item->old_physical_sector,
+			item->victim_seq, &current, &validated_hit);
+		read_buffer->lookup_ns += ktime_get_ns() - started;
+		read_buffer->validated_hits += validated_hit;
+
+		spin_lock(&c->lock);
+		if (victim->state != ZNS_BASE_ZONE_GC_VICTIM ||
+		    !victim->slots[slot].valid ||
+		    victim->slots[slot].logical_block != item->logical_block ||
+		    victim->slots[slot].seq != item->victim_seq) {
+			spin_unlock(&c->lock);
+			scanned++;
+			continue;
+		}
+		if (ret == -ENOENT || (!ret &&
+		    (current.physical_sector != item->old_physical_sector ||
+		     current.seq != item->victim_seq))) {
+			victim->slots[slot].valid = false;
+			victim->valid_blocks--;
+			spin_unlock(&c->lock);
+			scanned++;
+			continue;
+		}
+		spin_unlock(&c->lock);
+		if (ret)
+			goto out;
+		item->expected_entry = current;
+
+		started = ktime_get_ns();
+		ret = mapping_reserve_write_slot(c, item->logical_block);
+		read_buffer->reserve_ns += ktime_get_ns() - started;
+		if (ret)
+			goto out;
+		item->mapping_slot_reserved = true;
+
+		started = ktime_get_ns();
+		ret = zns_base_gc_read_page(c, victim, slot, scratch_page,
+					    read_buffer);
+		read_buffer->read_ns += ktime_get_ns() - started;
+		if (ret)
+			goto out;
+		memcpy((u8 *)read_buffer->write_data +
+		       (size_t)count * ZNS_BASE_BLOCK_SIZE,
+		       page_address(scratch_page), ZNS_BASE_BLOCK_SIZE);
+		item->new_physical_sector = first_sector +
+			(sector_t)count * SECTORS_PER_BLOCK;
+		count++;
+		scanned++;
+	}
+
+	*consumed = scanned ? scanned : 1;
+	if (!count) {
+		ret = 0;
+		goto out;
+	}
+	started = ktime_get_ns();
+	ret = zns_base_submit_buffer_blocks(c, read_buffer->write_data, count,
+					    first_sector, 0, NULL, NULL);
+	read_buffer->write_ns += ktime_get_ns() - started;
+	if (ret)
+		goto out;
+	read_buffer->write_ios++;
+	read_buffer->write_blocks += count;
+
+	ret = zns_base_commit_gc_blocks(c, destination, first_sector, items, count);
+	if (ret)
+		goto out;
+
+	for (i = 0; i < count; i++) {
+		bool wal_group_full = false;
+
+		started = ktime_get_ns();
+		ret = zns_base_wal_stage_gc(c, items[i].logical_block,
+			items[i].new_physical_sector, items[i].new_zone,
+			items[i].new_slot, victim, items[i].victim_slot,
+			&items[i].expected_entry, &wal_group_full);
+		read_buffer->wal_ns += ktime_get_ns() - started;
+		items[i].mapping_slot_reserved = false;
+		if (ret) {
+			zns_base_release_pending_slot(c, items[i].new_zone,
+				items[i].new_slot, items[i].logical_block);
+			items[i].pending_reserved = false;
+			goto out;
+		}
+		items[i].pending_reserved = false; /* WAL owns it now. */
+		if (wal_group_full)
+			zns_base_wal_schedule_flush(c, true);
+	}
+	ret = 0;
+out:
+	for (i = 0; i < count; i++) {
+		if (items[i].pending_reserved)
+			zns_base_release_pending_slot(c, items[i].new_zone,
+				items[i].new_slot, items[i].logical_block);
+		if (items[i].mapping_slot_reserved)
+			mapping_release_write_slot(c);
+	}
+	__free_page(scratch_page);
+	return ret;
 }
 
 static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *victim,

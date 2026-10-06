@@ -20,7 +20,6 @@ class ValidatedLookupTests(unittest.TestCase):
 #include <errno.h>
 typedef uint64_t u64;
 typedef uint64_t sector_t;
-#define DISCARDED_PBA UINT64_MAX
 #define READ_ONCE(x) (x)
 struct mapping_entry { size_t logical_block; sector_t physical_sector; u64 seq; };
 struct zns_base_c { int lock; struct { unsigned catalog_seq; u64 lookup_epoch; } metadata; };
@@ -53,7 +52,7 @@ int main(void) {
     race = 0; ram_ret = 0; ram = (struct mapping_entry){9, 160, 11};
     assert(!zns_base_gc_lookup_validated(&c, 7, 9, 80, 10, &out, &hit));
     assert(!hit && out.physical_sector == 160 && out.seq == 11);
-    ram.physical_sector = DISCARDED_PBA;
+    ram.physical_sector = ZNS_BASE_DISCARDED_PBA;
     assert(zns_base_gc_lookup_validated(&c, 7, 9, 80, 10, &out, &hit) == -ENOENT && !hit);
     ram_ret = -EIO;
     assert(zns_base_gc_lookup_validated(&c, 7, 9, 80, 10, &out, &hit) == -EIO && !hit);
@@ -63,7 +62,12 @@ int main(void) {
         with tempfile.TemporaryDirectory() as tmp:
             source = pathlib.Path(tmp) / 'test.c'
             exe = pathlib.Path(tmp) / 'test'
-            source.write_text(harness + SOURCE[start:end] + cases)
+            # Use the production definition, not a test-only alias that could
+            # hide an undefined identifier in the kernel build.
+            definition = next(line for line in SOURCE.splitlines()
+                              if line.startswith('#define ZNS_BASE_DISCARDED_PBA '))
+            self.assertLess(SOURCE.index(definition), start)
+            source.write_text(harness + '\n' + definition + '\n' + SOURCE[start:end] + cases)
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
                             '-fsanitize=undefined', str(source), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True)
