@@ -664,6 +664,7 @@ static int zns_base_gc_move_blocks(struct zns_base_c *c,
 		unsigned int *consumed, struct zns_base_gc_read_buffer *read_buffer);
 static int zns_base_reset_victim(struct zns_base_c *c, struct zns_base_zone *victim);
 static unsigned int zns_base_count_free_zones(struct zns_base_c *c);
+static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c);
 static int zns_base_select_victim(struct zns_base_c *c, struct zns_base_zone **victim_out);
 static int zns_base_gc_validate_victim(struct zns_base_c *c,
 		struct zns_base_zone *victim, unsigned int *stale_blocks,
