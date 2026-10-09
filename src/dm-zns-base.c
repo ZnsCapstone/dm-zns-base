@@ -139,6 +139,22 @@ module_param(gc_target_free_zones, uint, 0444);
 MODULE_PARM_DESC(gc_target_free_zones,
 	"free data-zone count at which a background GC run stops");
 
+/* Avoid spending a relocation zone on nearly-clean victims while other FULL
+ * zones may offer materially more stale space.  Under foreground pressure the
+ * best candidate found in the current scan is still used as a fallback. */
+static unsigned int gc_min_reclaim_percent = 10;
+module_param(gc_min_reclaim_percent, uint, 0444);
+MODULE_PARM_DESC(gc_min_reclaim_percent,
+	"prefer victims with at least this percentage reclaimable (0 disables)");
+
+/* A FULL zone proven completely live cannot create free capacity.  Remember
+ * that result across GC work invocations instead of rescanning it every few
+ * seconds; an exact reverse-map invalidation clears the cooldown early. */
+static unsigned int gc_clean_zone_cooldown_ms = 30000;
+module_param(gc_clean_zone_cooldown_ms, uint, 0444);
+MODULE_PARM_DESC(gc_clean_zone_cooldown_ms,
+	"milliseconds before reconsidering a FULL zone proven completely live");
+
 /* Production generations must amortize SSTable and Manifest traffic.  Eight
  * 64K-entry tables also leave enough foreground headroom for compaction. */
 static unsigned int memtable_capacity_entries = 65536;
@@ -242,6 +258,11 @@ struct mapping_state {
 	struct list_head frozen_memtables;
 
 	u64 next_seq;
+	/* Latest published version per LBA.  Sequence numbers are globally unique,
+	 * so GC can conditionally publish a relocation without repeating an
+	 * SSTable lookup for every WAL record.  Recovery rebuilds this from the
+	 * checkpoint snapshot and subsequent WAL replay. */
+	u64 *latest_seq;
 
 	size_t spare_count;
 	size_t reserved_slots;
@@ -272,9 +293,9 @@ struct zns_base_zone {
 	atomic_t inflight_reads;
 	wait_queue_head_t read_waitq;
 	/* This zone was fully checked and found to have no reclaimable blocks in
-	 * this GC run.  Lazy invalidation makes valid_blocks conservative, so a
-	 * per-run skip marker prevents repeatedly selecting the same clean zone. */
+	 * this GC run.  Lazy invalidation makes valid_blocks conservative. */
 	u64 gc_skip_run;
+	unsigned long gc_skip_until;
 };
 
 struct zns_base_zone_state_table {
@@ -463,7 +484,6 @@ struct zns_base_wal_pending_commit {
   	struct zns_base_zone *old_zone;
   	unsigned int old_slot;
 
-  	sector_t expected_physical_sector;
   	u64 expected_seq;
 
   	/* 다음 단계에서 원본 bio 완료 상태를 연결한다. */
@@ -567,6 +587,7 @@ struct zns_base_c {
 	u64 gc_reset_count;
 	u64 gc_moved_blocks;
 	u64 discarded_blocks;
+	unsigned int foreground_waiters;
 
 	mempool_t *io_pool;
 	/* quiescing rejects new upper bios while already-issued data completions
@@ -2021,11 +2042,14 @@ static void zns_base_gc_work(struct work_struct *work)
 {
   	struct zns_base_c *c;
 	struct zns_base_zone *victim = NULL;
+	struct zns_base_zone *fallback_victim = NULL;
 	unsigned int slot = 0;
 	unsigned int reclaimable_blocks;
+	unsigned int fallback_reclaimable = 0;
 	unsigned long phase_started, next_report;
 	struct zns_base_gc_read_buffer read_buffer = { 0 };
 	const char *phase = "select";
+	bool force_fallback = false;
   	int ret;
 
 	c = container_of(work, struct zns_base_c, gc_work);
@@ -2055,10 +2079,10 @@ static void zns_base_gc_work(struct work_struct *work)
   	for (;;) {
   		spin_lock(&c->lock);
 
-		if (c->stopping ||
-		    (c->quiescing && !c->io_work_scheduled &&
-		     !c->foreground_data_inflight &&
-		     list_empty(&c->pending_bios)) ||
+		if (c->stopping || c->quiescing ||
+		    (c->foreground_waiters &&
+		     zns_base_count_free_zones(c) >
+			zns_base_foreground_reserve_locked(c)) ||
 		    zns_base_count_free_zones(c) >=
 		    gc_target_free_zones) {
   			spin_unlock(&c->lock);
@@ -2079,6 +2103,25 @@ static void zns_base_gc_work(struct work_struct *work)
 		read_buffer.read_ns = read_buffer.write_ns = read_buffer.wal_ns = 0;
 		ret = zns_base_select_victim(c, &victim);
 		if (ret == -ENOENT) {
+			/* Under real foreground pressure, retry the best sub-threshold
+			 * candidate after all FULL zones have been measured. */
+			if (fallback_victim) {
+				spin_lock(&c->lock);
+				if (fallback_victim->state == ZNS_BASE_ZONE_FULL) {
+					fallback_victim->gc_skip_run = 0;
+					force_fallback = true;
+					spin_unlock(&c->lock);
+					if (gc_diagnostics)
+						DMINFO("gc-diag: victim fallback victim=%u reclaimable=%u",
+						       (unsigned int)(fallback_victim -
+							c->zone_state.zones),
+						       fallback_reclaimable);
+					continue;
+				}
+				spin_unlock(&c->lock);
+				fallback_victim = NULL;
+				fallback_reclaimable = 0;
+			}
 			/* No useful FULL victim is not corruption.  A proactive GC can
 			 * legitimately run while the current ACTIVE zone still has room.
 			 * End this round without poisoning every later foreground write;
@@ -2110,7 +2153,39 @@ static void zns_base_gc_work(struct work_struct *work)
 		if (!reclaimable_blocks) {
 			spin_lock(&c->lock);
 			victim->gc_skip_run = c->gc_runs;
+			victim->gc_skip_until = jiffies +
+				msecs_to_jiffies(gc_clean_zone_cooldown_ms);
 			spin_unlock(&c->lock);
+			if (gc_diagnostics)
+				DMINFO("gc-diag: victim deferred victim=%u reclaimable=0 cooldown_ms=%u",
+				       (unsigned int)(victim - c->zone_state.zones),
+				       gc_clean_zone_cooldown_ms);
+			zns_base_release_victim(c, victim);
+			continue;
+		}
+		if (gc_min_reclaim_percent && !force_fallback &&
+		    (u64)reclaimable_blocks * 100 <
+			(u64)victim->nr_blocks * gc_min_reclaim_percent) {
+			bool foreground_waiting;
+
+			spin_lock(&c->lock);
+			foreground_waiting = c->foreground_waiters != 0;
+			victim->gc_skip_run = c->gc_runs;
+			if (!foreground_waiting)
+				victim->gc_skip_until = jiffies +
+					msecs_to_jiffies(gc_clean_zone_cooldown_ms);
+			spin_unlock(&c->lock);
+			if (foreground_waiting &&
+			    (!fallback_victim ||
+			     reclaimable_blocks > fallback_reclaimable)) {
+				fallback_victim = victim;
+				fallback_reclaimable = reclaimable_blocks;
+			}
+			if (gc_diagnostics)
+				DMINFO("gc-diag: victim deferred victim=%u reclaimable=%u threshold_pct=%u foreground_waiting=%u",
+				       (unsigned int)(victim - c->zone_state.zones),
+				       reclaimable_blocks, gc_min_reclaim_percent,
+				       foreground_waiting);
 			zns_base_release_victim(c, victim);
 			continue;
 		}
@@ -2204,6 +2279,12 @@ static void zns_base_gc_work(struct work_struct *work)
   			zns_base_release_victim(c, victim);
   			break;
   		}
+		/* Re-evaluate pressure after every successful reset.  In particular,
+		 * never retain a newly freed victim merely to chase the background high
+		 * watermark while an upper write is already waiting. */
+		fallback_victim = NULL;
+		fallback_reclaimable = 0;
+		force_fallback = false;
   	}
 
 	if (ret)
@@ -2437,6 +2518,12 @@ static int mapping_init(struct zns_base_c *c, sector_t target_sectors)
 	}
 
 	c -> nr_logical_blocks = nr_logical_blocks;
+	c->mapping.latest_seq = kvcalloc(nr_logical_blocks,
+					 sizeof(*c->mapping.latest_seq), GFP_KERNEL);
+	if (!c->mapping.latest_seq) {
+		ret = -ENOMEM;
+		goto out_free_pool;
+	}
 	c -> mapping.next_seq = 1;
 	INIT_WORK(&c -> mapping.flush_work, mapping_flush_work);
 	c -> mapping.flush_pending = false;
@@ -2445,6 +2532,8 @@ static int mapping_init(struct zns_base_c *c, sector_t target_sectors)
 	return 0;
 
 out_free_pool:
+	kvfree(c->mapping.latest_seq);
+	c->mapping.latest_seq = NULL;
 	mapping_memtable_free(c -> mapping.active_memtable);
 	c -> mapping.active_memtable = NULL;
 
@@ -2480,6 +2569,8 @@ static void mapping_destroy(struct zns_base_c *c)
 	}
 
 	c -> nr_logical_blocks = 0;
+	kvfree(c->mapping.latest_seq);
+	c->mapping.latest_seq = NULL;
 	c->mapping.spare_count = 0;
 	c->mapping.reserved_slots = 0;
 	c -> mapping.next_seq = 0;
@@ -2497,10 +2588,16 @@ static int mapping_update(struct zns_base_c *c, size_t logical_block,
 	active_memtable = c -> mapping.active_memtable;
 
 	/* Existing logical blocks are updated in place and do not consume a slot. */
+	if (logical_block >= c->nr_logical_blocks || !c->mapping.latest_seq)
+		return -EINVAL;
+
 	ret = mapping_memtable_upsert(active_memtable, logical_block,
 					 physical_sector, seq);
-	if (ret != -ENOSPC)
+	if (ret != -ENOSPC) {
+		if (!ret)
+			c->mapping.latest_seq[logical_block] = seq;
 		return ret;
+	}
 
 	if (ret == -ENOSPC) {
 		if(list_empty(&c -> mapping.spare_memtables)){
@@ -2522,8 +2619,11 @@ static int mapping_update(struct zns_base_c *c, size_t logical_block,
 		}
 	}
 
-	return mapping_memtable_upsert(active_memtable, logical_block,
+	ret = mapping_memtable_upsert(active_memtable, logical_block,
 					 physical_sector, seq);
+	if (!ret)
+		c->mapping.latest_seq[logical_block] = seq;
+	return ret;
 }
 
 /* Caller holds c->lock. This is the non-sleeping MemTable portion only. */
@@ -2664,6 +2764,7 @@ static bool zns_base_invalidate_entry_slot_locked(
 
 	slot->valid = false;
 	zone->valid_blocks--;
+	zone->gc_skip_until = 0;
 	return true;
 }
 
@@ -2706,6 +2807,7 @@ static int zns_base_report_zone(struct blk_zone *zone,
 	z->valid_blocks = 0;
 	z->pending_blocks = 0;
 	z->gc_skip_run = 0;
+	z->gc_skip_until = 0;
   	z->state = ZNS_BASE_ZONE_FREE;
 	atomic_set(&z->inflight_reads, 0);
 	init_waitqueue_head(&z->read_waitq);
@@ -2814,8 +2916,18 @@ static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c)
 {
 	unsigned int reserve = GC_RESERVE_ZONES;
 
-	if (c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE && reserve)
-		reserve--;
+	/* During teardown there is no future GC round to reserve for.  Under live
+	 * foreground pressure an existing GC destination is itself sufficient
+	 * reserve after the current victim has been reset; let the writer consume
+	 * that newly FREE victim instead of forcing a second long relocation. */
+	if (c->quiescing)
+		return 0;
+	if (c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE) {
+		if (c->foreground_waiters)
+			return 0;
+		if (reserve)
+			reserve--;
+	}
 	return reserve;
 }
 
@@ -2841,26 +2953,29 @@ static int zns_base_wait_for_gc_space(struct zns_base_c *c)
 	bool attempted_gc = false;
 	unsigned long started = jiffies;
 	unsigned int free_zones, reserve;
+	int ret;
+
+	spin_lock(&c->lock);
+	c->foreground_waiters++;
+	spin_unlock(&c->lock);
 
 	for (;;) {
   		spin_lock(&c->lock);
 
   		if (c->stopping) {
-  			spin_unlock(&c->lock);
-  			return -EIO;
+			ret = -EIO;
+			goto out_unlock;
   		}
 
   		if (c->gc_error) {
-  			int ret = c->gc_error;
-
-  			spin_unlock(&c->lock);
-  			return ret;
+			ret = c->gc_error;
+			goto out_unlock;
   		}
 
 		if (zns_base_count_free_zones(c) >
 		    zns_base_foreground_reserve_locked(c)) {
-			spin_unlock(&c->lock);
-			return 0;
+			ret = 0;
+			goto out_unlock;
 		}
 
 		/* A GC round completed but could not create an admissible FREE
@@ -2868,8 +2983,8 @@ static int zns_base_wait_for_gc_space(struct zns_base_c *c)
 		 * the target remains usable instead of becoming permanently EIO. */
 		if (attempted_gc && !c->gc_running && !c->gc_scheduled) {
 			c->gc_last_error = -ENOSPC;
-			spin_unlock(&c->lock);
-			return -ENOSPC;
+			ret = -ENOSPC;
+			goto out_unlock;
 		}
 
   		spin_unlock(&c->lock);
@@ -2895,6 +3010,15 @@ static int zns_base_wait_for_gc_space(struct zns_base_c *c)
 			DMINFO("gc-diag: phase=foreground-space-wait wake elapsed_ms=%u",
 			       jiffies_to_msecs(jiffies - started));
   	}
+
+out_unlock:
+	if (WARN_ON_ONCE(!c->foreground_waiters)) {
+		spin_unlock(&c->lock);
+		return -EIO;
+	}
+	c->foreground_waiters--;
+	spin_unlock(&c->lock);
+	return ret;
 }
 
 static bool zns_base_gc_needed(struct zns_base_c *c)
@@ -2955,6 +3079,11 @@ static int zns_base_select_victim(struct zns_base_c *c,
 		 * run; other FULL zones, including conservatively all-valid ones, remain
 		 * candidates for the exact validation pass. */
 		if (zone->gc_skip_run == c->gc_runs)
+			continue;
+		/* Cooldown avoids repeated background scans.  It must never hide the
+		 * only usable victim from a writer that is already out of space. */
+		if (!c->foreground_waiters &&
+		    time_before(jiffies, zone->gc_skip_until))
 			continue;
 
   		if (!victim ||
@@ -3056,6 +3185,7 @@ static int zns_base_gc_validate_victim_point(struct zns_base_c *c,
 		     current_entry.seq != seq)) {
 			victim->slots[slot_idx].valid = false;
 			victim->valid_blocks--;
+			victim->gc_skip_until = 0;
 		}
 		spin_unlock(&c->lock);
 	}
@@ -3140,6 +3270,7 @@ static int zns_base_gc_validate_victim_bulk(struct zns_base_c *c,
 		     current_entry.seq != seq)) {
 			victim->slots[slot_idx].valid = false;
 			victim->valid_blocks--;
+			victim->gc_skip_until = 0;
 		}
 		spin_unlock(&c->lock);
 	}
@@ -3559,6 +3690,7 @@ static int zns_base_gc_move_blocks(struct zns_base_c *c,
 		     current_entry.seq != item->victim_seq))) {
 			victim->slots[slot].valid = false;
 			victim->valid_blocks--;
+			victim->gc_skip_until = 0;
 			spin_unlock(&c->lock);
 			scanned++;
 			continue;
@@ -3706,6 +3838,7 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
 	      expected_entry.seq != victim_seq))) {
   		victim->slots[victim_slot].valid = false;
   		victim->valid_blocks--;
+		victim->gc_skip_until = 0;
   		spin_unlock(&c->lock);
   		return 0;
   	}
@@ -3850,6 +3983,7 @@ static int zns_base_reset_victim(struct zns_base_c *c,
 	victim->valid_blocks = 0;
 	victim->pending_blocks = 0;
 	victim->gc_skip_run = 0;
+	victim->gc_skip_until = 0;
   	victim->state = ZNS_BASE_ZONE_FREE;
 	c->gc_reset_count++;
 
@@ -4368,7 +4502,6 @@ static int zns_base_wal_stage_gc(
 	commit->mapping_slot_reserved = true;
 	commit->old_zone = old_zone;
 	commit->old_slot = old_slot;
-	commit->expected_physical_sector = expected_entry->physical_sector;
 	commit->expected_seq = expected_entry->seq;
 	commit->io = NULL;
 
@@ -4552,6 +4685,7 @@ static int zns_base_wal_publish_foreground_locked(
   	if (had_old_mapping) {
   		old_zone->slots[old_slot].valid = false;
   		old_zone->valid_blocks--;
+		old_zone->gc_skip_until = 0;
   	}
 
   out_unlock:
@@ -6066,6 +6200,7 @@ static int zns_base_manifest_recover(struct zns_base_c *c)
 		if (!snapshot[i].seq)
 			continue;
 		max_seq = max(max_seq, snapshot[i].seq);
+		c->mapping.latest_seq[i] = snapshot[i].seq;
 		if (snapshot[i].physical_sector == ZNS_BASE_DISCARDED_PBA)
 			continue;
 		ret = zns_base_get_zone_slot(c, snapshot[i].physical_sector,
@@ -6160,6 +6295,7 @@ static int zns_base_replay_wal_put(struct zns_base_c *c,
 		    zone->slots[slot].seq == old_entry.seq) {
 			zone->slots[slot].valid = false;
 			zone->valid_blocks--;
+			zone->gc_skip_until = 0;
 		}
 	} else
 		ret = 0;
@@ -6869,11 +7005,7 @@ static int zns_base_wal_publish_gc_locked(
 	struct zns_base_c *c,
 	struct zns_base_wal_pending_commit *commit)
 {
-	struct mapping_entry current_entry;
 	int ret;
-
-	/* Capacity was reserved before the GC copy was issued. */
-	ret = mapping_lookup(c, commit->logical_block, &current_entry);
 
 	spin_lock(&c->lock);
 
@@ -6884,10 +7016,14 @@ static int zns_base_wal_publish_gc_locked(
 		goto out_unlock;
 	}
 
-	if (ret == -ENOENT ||
-	    (!ret && (current_entry.physical_sector !=
-		      commit->expected_physical_sector ||
-		      current_entry.seq != commit->expected_seq))) {
+	/* mapping_update() maintains the latest published sequence under this same
+	 * lock.  Global sequence uniqueness makes this an exact conditional-publish
+	 * check without one sleeping SSTable lookup per relocated block.  WAL list
+	 * order is preserved: an earlier foreground commit updates latest_seq before
+	 * this check, while a later foreground commit correctly supersedes us. */
+	if (commit->logical_block >= c->nr_logical_blocks ||
+	    c->mapping.latest_seq[commit->logical_block] !=
+		commit->expected_seq) {
 		/* A newer foreground write won while this block was being copied. */
 		commit->new_zone->slots[commit->new_slot].pending = false;
 		commit->new_zone->pending_blocks--;
@@ -6899,14 +7035,12 @@ static int zns_base_wal_publish_gc_locked(
 		    commit->expected_seq) {
 			commit->old_zone->slots[commit->old_slot].valid = false;
 			commit->old_zone->valid_blocks--;
+			commit->old_zone->gc_skip_until = 0;
 		}
 
 		ret = 0;
 		goto out_unlock;
 	}
-
-	if (ret)
-		goto out_unlock;
 
 	ret = mapping_update(c, commit->logical_block,
 			     commit->new_physical_sector, commit->seq);
@@ -6927,6 +7061,7 @@ static int zns_base_wal_publish_gc_locked(
 	    commit->expected_seq) {
 		commit->old_zone->slots[commit->old_slot].valid = false;
 		commit->old_zone->valid_blocks--;
+		commit->old_zone->gc_skip_until = 0;
 	}
 
 out_unlock:
@@ -6955,6 +7090,10 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	if (!wal_group_pages ||
 	    wal_group_pages > ZNS_BASE_MAX_WAL_GROUP_PAGES) {
 		ti->error = "invalid wal_group_pages";
+		return -EINVAL;
+	}
+	if (gc_min_reclaim_percent > 100) {
+		ti->error = "invalid gc_min_reclaim_percent";
 		return -EINVAL;
 	}
 
@@ -7072,6 +7211,7 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	c -> gc_running = false;
 	c->gc_error = 0;
 	c->gc_last_error = 0;
+	c->foreground_waiters = 0;
 	c->quiescing = false;
 	c -> stopping = false;
 
@@ -7365,6 +7505,7 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	unsigned int data_write_queued = 0;
 	unsigned int data_write_queued_blocks = 0;
 	unsigned int data_write_inflight;
+	unsigned int foreground_waiters;
 	size_t mapping_reserved_slots;
 	unsigned int active_data_zone;
 	struct zns_base_data_write *queued_write;
@@ -7454,6 +7595,7 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	gc_last_error = c->gc_last_error;
 	data_write_error = c->data_write_error;
 	data_write_inflight = c->data_write_inflight;
+	foreground_waiters = c->foreground_waiters;
 	list_for_each_entry(queued_write, &c->data_write_queue, node) {
 		data_write_queued++;
 		data_write_queued_blocks += queued_write->mapping_count;
@@ -7471,9 +7613,9 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		(unsigned long long)gc_moved_blocks,
 		(unsigned long long)discarded_blocks,
 		gc_error, gc_last_error);
-	DMEMIT("data_write_inflight=%u data_write_queued=%u data_write_queued_blocks=%u data_write_error=%d mapping_reserved_slots=%zu active_data_zone=%u active_data_wp=%llu ",
+	DMEMIT("data_write_inflight=%u data_write_queued=%u data_write_queued_blocks=%u data_write_error=%d mapping_reserved_slots=%zu foreground_waiters=%u active_data_zone=%u active_data_wp=%llu ",
 		data_write_inflight, data_write_queued, data_write_queued_blocks,
-		data_write_error, mapping_reserved_slots,
+		data_write_error, mapping_reserved_slots, foreground_waiters,
 		active_data_zone, (unsigned long long)active_data_wp);
 	DMEMIT("wal_zone=%u wal_generation=%llu wal_used_blocks=%llu wal_capacity_blocks=%llu wal_staged_records=%u wal_error=%d ",
 		wal_zone_idx, (unsigned long long)wal_generation,

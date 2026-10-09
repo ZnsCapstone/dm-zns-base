@@ -165,7 +165,9 @@ int main(void) {
         self.assertLess(move.index("zns_base_gc_lookup_validated(c"), move.index("zns_base_gc_read_page(c"))
         self.assertLess(move.index("zns_base_gc_read_page(c"), move.index("zns_base_wal_stage_gc(c"))
         self.assertIn("zns_base_gc_verify_reset_safe(c, victim)", SOURCE)
-        self.assertIn("current_entry.seq != commit->expected_seq", SOURCE)
+        publish = SOURCE[SOURCE.rindex("static int zns_base_wal_publish_gc_locked("):]
+        self.assertIn("c->mapping.latest_seq[commit->logical_block]", publish)
+        self.assertIn("commit->expected_seq", publish)
         self.assertIn("read_buffer.blocks = 0;", SOURCE)
         self.assertIn("vfree(read_buffer.data);", SOURCE)
 

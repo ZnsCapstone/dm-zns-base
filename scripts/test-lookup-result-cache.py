@@ -81,8 +81,9 @@ int main(void) {
         self.assertLess(lookup.index("mapping_lookup_ram_locked"), lookup.index("zns_base_sstable_lookup"))
         start = SOURCE.rindex("static int zns_base_wal_publish_gc_locked(")
         publish = SOURCE[start:SOURCE.index("\n}\n", start)]
-        self.assertIn("mapping_lookup(c, commit->logical_block", publish)
-        self.assertIn("current_entry.seq != commit->expected_seq", publish)
+        self.assertIn("c->mapping.latest_seq[commit->logical_block]", publish)
+        self.assertIn("commit->expected_seq", publish)
+        self.assertNotIn("mapping_lookup(c, commit->logical_block", publish)
         self.assertEqual(SOURCE.count("c->metadata.lookup_epoch++;"), 2)
 
 

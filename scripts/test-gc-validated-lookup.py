@@ -74,8 +74,9 @@ int main(void) {
         self.assertIn('if (gc_validated_reuse && victim->nr_blocks', SOURCE)
         start = SOURCE.rindex('static int zns_base_wal_publish_gc_locked(')
         publish = SOURCE[start:SOURCE.index('\n}\n', start)]
-        self.assertIn('mapping_lookup(c, commit->logical_block', publish)
-        self.assertIn('current_entry.seq != commit->expected_seq', publish)
+        self.assertIn('c->mapping.latest_seq[commit->logical_block]', publish)
+        self.assertIn('commit->expected_seq', publish)
+        self.assertNotIn('mapping_lookup(c, commit->logical_block', publish)
 
 
 if __name__ == '__main__':

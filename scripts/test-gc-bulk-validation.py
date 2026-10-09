@@ -60,8 +60,9 @@ class GCBulkValidationTests(unittest.TestCase):
 
     def test_conditional_wal_publish_and_reset_guard_remain(self):
         publish = function_body('static int zns_base_wal_publish_gc_locked(')
-        self.assertIn('mapping_lookup(c, commit->logical_block', publish)
-        self.assertIn('current_entry.seq != commit->expected_seq', publish)
+        self.assertIn('c->mapping.latest_seq[commit->logical_block]', publish)
+        self.assertIn('commit->expected_seq', publish)
+        self.assertNotIn('mapping_lookup(', publish)
         reset = function_body('static int zns_base_gc_verify_reset_safe(')
         self.assertIn('pending_blocks', reset)
         self.assertIn('valid_blocks', reset)
