@@ -56,6 +56,10 @@ static bool gc_validated_reuse = true;
 module_param(gc_validated_reuse, bool, 0444);
 MODULE_PARM_DESC(gc_validated_reuse,
 	"reuse exact GC validation results before conditional WAL publish");
+static bool gc_bulk_validation = true;
+module_param(gc_bulk_validation, bool, 0444);
+MODULE_PARM_DESC(gc_bulk_validation,
+	"validate GC victims with one sequential SSTable snapshot scan");
 
 struct zns_base_gc_move_item;
 
@@ -643,6 +647,8 @@ static int zns_base_select_victim(struct zns_base_c *c, struct zns_base_zone **v
 static int zns_base_gc_validate_victim(struct zns_base_c *c,
 		struct zns_base_zone *victim, unsigned int *stale_blocks,
 		struct zns_base_gc_read_buffer *read_buffer);
+static int zns_base_gc_build_bulk_snapshot(struct zns_base_c *c,
+		struct mapping_entry **snapshot_out, unsigned int *table_count);
 static int zns_base_gc_verify_reset_safe(struct zns_base_c *c,
 		struct zns_base_zone *victim);
 static void zns_base_release_victim(struct zns_base_c *c, struct zns_base_zone *victim);
@@ -1216,6 +1222,61 @@ static int zns_base_submit_buffer_blocks(struct zns_base_c *c,
 	if (submitted_blocks)
 		*submitted_blocks = completed;
 	return ret;
+}
+
+/* Read a virtually contiguous, page-aligned buffer with bounded multi-page
+ * bios.  Bulk SSTable scans use this instead of one submit_bio_wait() per
+ * 4 KiB block. */
+static int zns_base_submit_read_buffer_blocks(struct zns_base_c *c,
+		void *buffer, unsigned int block_count, sector_t physical_sector)
+{
+	unsigned int max_blocks = zns_base_max_transfer_blocks(c);
+	unsigned int completed = 0;
+
+	if (!buffer || !block_count || offset_in_page(buffer))
+		return -EINVAL;
+
+	while (completed < block_count) {
+		unsigned int count = min(block_count - completed, max_blocks);
+		struct bio *bio;
+		unsigned int i;
+		int ret = 0;
+
+		bio = bio_alloc(GFP_KERNEL, count);
+		if (!bio)
+			return -ENOMEM;
+		bio_set_dev(bio, c->dev->bdev);
+		bio_set_op_attrs(bio, REQ_OP_READ, 0);
+		bio->bi_iter.bi_sector = physical_sector +
+			(sector_t)completed * SECTORS_PER_BLOCK;
+
+		for (i = 0; i < count; i++) {
+			void *addr = buffer +
+				(size_t)(completed + i) * ZNS_BASE_BLOCK_SIZE;
+			struct page *page = is_vmalloc_addr(addr) ?
+				vmalloc_to_page(addr) : virt_to_page(addr);
+			int added;
+
+			if (!page) {
+				ret = -EFAULT;
+				break;
+			}
+			added = bio_add_page(bio, page, ZNS_BASE_BLOCK_SIZE,
+				offset_in_page(addr));
+			if (added != ZNS_BASE_BLOCK_SIZE) {
+				ret = -EIO;
+				break;
+			}
+		}
+		if (!ret)
+			ret = submit_bio_wait(bio);
+		bio_put(bio);
+		if (ret)
+			return ret;
+		completed += count;
+	}
+
+	return 0;
 }
 
 static void zns_base_submit_data_write(struct zns_base_data_write *write)
@@ -2923,7 +2984,7 @@ static int zns_base_select_victim(struct zns_base_c *c,
  * invalidate mappings found in RAM, so valid_blocks is an upper bound until
  * this pass compares every reverse-map version with the newest visible map.
  * The victim remains isolated in GC_VICTIM state throughout the scan. */
-static int zns_base_gc_validate_victim(struct zns_base_c *c,
+static int zns_base_gc_validate_victim_point(struct zns_base_c *c,
 	struct zns_base_zone *victim, unsigned int *reclaimable_blocks,
 	struct zns_base_gc_read_buffer *read_buffer)
 {
@@ -3011,6 +3072,117 @@ static int zns_base_gc_validate_victim(struct zns_base_c *c,
 		       (unsigned int)(victim - c->zone_state.zones), slot_idx,
 		       lookups, *reclaimable_blocks, jiffies_to_msecs(jiffies - started));
 	return 0;
+}
+
+/* Validate against one immutable catalog snapshot instead of issuing one
+ * binary-search lookup per victim slot.  The snapshot builder merges RAM both
+ * before and after its sequential SSTable scan, closing the MemTable flush
+ * hand-off race while preserving newest-sequence semantics. */
+static int zns_base_gc_validate_victim_bulk(struct zns_base_c *c,
+	struct zns_base_zone *victim, unsigned int *reclaimable_blocks,
+	struct zns_base_gc_read_buffer *read_buffer)
+{
+	struct mapping_entry *snapshot;
+	unsigned int table_count = 0;
+	unsigned int slot_idx;
+	unsigned long started = jiffies;
+	int ret;
+
+	ret = zns_base_gc_build_bulk_snapshot(c, &snapshot, &table_count);
+	if (ret)
+		return ret;
+
+	for (slot_idx = 0; slot_idx < victim->nr_blocks; slot_idx++) {
+		struct mapping_entry current_entry;
+		sector_t physical_sector;
+		size_t logical_block;
+		u64 seq;
+
+		spin_lock(&c->lock);
+		if (victim->state != ZNS_BASE_ZONE_GC_VICTIM) {
+			spin_unlock(&c->lock);
+			ret = -EIO;
+			goto out;
+		}
+		if (!victim->slots[slot_idx].valid) {
+			spin_unlock(&c->lock);
+			continue;
+		}
+		logical_block = victim->slots[slot_idx].logical_block;
+		seq = victim->slots[slot_idx].seq;
+		physical_sector = victim->start_sector +
+			(sector_t)slot_idx * SECTORS_PER_BLOCK;
+		spin_unlock(&c->lock);
+
+		if (logical_block >= c->nr_logical_blocks) {
+			ret = -EIO;
+			goto out;
+		}
+		current_entry = snapshot[logical_block];
+		if (read_buffer->validated_slots && current_entry.seq &&
+		    current_entry.physical_sector != ZNS_BASE_DISCARDED_PBA &&
+		    current_entry.physical_sector == physical_sector &&
+		    current_entry.seq == seq)
+			read_buffer->validated_slots[slot_idx] = 1;
+
+		spin_lock(&c->lock);
+		if (victim->state != ZNS_BASE_ZONE_GC_VICTIM) {
+			spin_unlock(&c->lock);
+			ret = -EIO;
+			goto out;
+		}
+		if (victim->slots[slot_idx].valid &&
+		    victim->slots[slot_idx].logical_block == logical_block &&
+		    victim->slots[slot_idx].seq == seq &&
+		    (!current_entry.seq ||
+		     current_entry.physical_sector == ZNS_BASE_DISCARDED_PBA ||
+		     current_entry.physical_sector != physical_sector ||
+		     current_entry.seq != seq)) {
+			victim->slots[slot_idx].valid = false;
+			victim->valid_blocks--;
+		}
+		spin_unlock(&c->lock);
+	}
+
+	spin_lock(&c->lock);
+	if (victim->state != ZNS_BASE_ZONE_GC_VICTIM) {
+		spin_unlock(&c->lock);
+		ret = -EIO;
+		goto out;
+	}
+	*reclaimable_blocks = victim->nr_blocks - victim->valid_blocks;
+	spin_unlock(&c->lock);
+	ret = 0;
+	if (gc_diagnostics)
+		DMINFO("gc-diag: phase=validate end victim=%u mode=bulk tables=%u scanned=%u reclaimable=%u elapsed_ms=%u",
+		       (unsigned int)(victim - c->zone_state.zones), table_count,
+		       slot_idx, *reclaimable_blocks,
+		       jiffies_to_msecs(jiffies - started));
+out:
+	kvfree(snapshot);
+	return ret;
+}
+
+static int zns_base_gc_validate_victim(struct zns_base_c *c,
+	struct zns_base_zone *victim, unsigned int *reclaimable_blocks,
+	struct zns_base_gc_read_buffer *read_buffer)
+{
+	int ret;
+
+	if (gc_bulk_validation) {
+		if (gc_diagnostics)
+			DMINFO("gc-diag: phase=validate begin victim=%u slots=%u mode=bulk",
+			       (unsigned int)(victim - c->zone_state.zones),
+			       victim->nr_blocks);
+		ret = zns_base_gc_validate_victim_bulk(c, victim,
+			reclaimable_blocks, read_buffer);
+		if (ret != -ENOMEM)
+			return ret;
+		DMWARN("gc bulk validation allocation failed; using point lookups");
+	}
+
+	return zns_base_gc_validate_victim_point(c, victim,
+		reclaimable_blocks, read_buffer);
 }
 
 /* Destructive reset guard.  Every path is required to invalidate a slot only
@@ -4546,20 +4718,14 @@ static void zns_base_snapshot_consider(struct mapping_entry *snapshot,
 		snapshot[entry->logical_block] = *entry;
 }
 
-/* Caller holds mapping_wal_lock. The spinlock is held only while copying RAM metadata. */
-static struct mapping_entry *zns_base_build_snapshot(struct zns_base_c *c,
-						      size_t *entry_count,
-						      u64 *max_seq)
+/* Merge every currently RAM-visible generation into a caller-owned snapshot.
+ * Holding c->lock keeps the active/frozen hand-off stable while it is copied. */
+static void zns_base_snapshot_ram(struct zns_base_c *c,
+				 struct mapping_entry *snapshot)
 {
-	struct mapping_entry *snapshot;
 	struct mapping_memtable *memtable;
 	struct mapping_memtable_entry *memtable_entry;
 	struct rb_node *node;
-	size_t i, out = 0;
-
-	snapshot = kvcalloc(c->nr_logical_blocks, sizeof(*snapshot), GFP_KERNEL);
-	if (!snapshot)
-		return NULL;
 
 	spin_lock(&c->lock);
 	for (node = rb_first(&c->mapping.active_memtable->root); node;
@@ -4568,7 +4734,6 @@ static struct mapping_entry *zns_base_build_snapshot(struct zns_base_c *c,
 			struct mapping_memtable_entry, node);
 		zns_base_snapshot_consider(snapshot, &memtable_entry->entry);
 	}
-
 	list_for_each_entry(memtable, &c->mapping.frozen_memtables, node) {
 		for (node = rb_first(&memtable->root); node;
 		     node = rb_next(node)) {
@@ -4577,8 +4742,22 @@ static struct mapping_entry *zns_base_build_snapshot(struct zns_base_c *c,
 			zns_base_snapshot_consider(snapshot, &memtable_entry->entry);
 		}
 	}
-
 	spin_unlock(&c->lock);
+}
+
+/* Caller holds mapping_wal_lock. The spinlock is held only while copying RAM metadata. */
+static struct mapping_entry *zns_base_build_snapshot(struct zns_base_c *c,
+						      size_t *entry_count,
+						      u64 *max_seq)
+{
+	struct mapping_entry *snapshot;
+	size_t i, out = 0;
+
+	snapshot = kvcalloc(c->nr_logical_blocks, sizeof(*snapshot), GFP_KERNEL);
+	if (!snapshot)
+		return NULL;
+
+	zns_base_snapshot_ram(c, snapshot);
 
 	/* metadata.lock is held by the checkpoint caller. */
 	for (i = 0; i < c->metadata.sstable_count; i++) {
@@ -4901,7 +5080,6 @@ static int zns_base_sstable_apply_to_snapshot_locked(
 	struct mapping_entry *snapshot)
 {
 	struct zns_base_sstable_header_disk *header;
-	struct zns_base_sstable_entry_disk *entry;
 	u8 *buffer;
 	u64 count, i = 0;
 	sector_t sector;
@@ -4913,7 +5091,7 @@ static int zns_base_sstable_apply_to_snapshot_locked(
 		ZNS_BASE_ZONE_SSTABLE)
 		return -EINVAL;
 
-	buffer = kvzalloc(ZNS_BASE_BLOCK_SIZE, GFP_KERNEL);
+	buffer = vzalloc(ZNS_BASE_GC_READAHEAD_BLOCKS * ZNS_BASE_BLOCK_SIZE);
 	if (!buffer)
 		return -ENOMEM;
 	ret = zns_base_metadata_read_block(c,
@@ -4936,31 +5114,45 @@ static int zns_base_sstable_apply_to_snapshot_locked(
 	}
 
 	for (sector = le64_to_cpu(descriptor->start_sector) + SECTORS_PER_BLOCK;
-	     i < count; sector += SECTORS_PER_BLOCK) {
-		unsigned int page_entries;
+	     i < count;) {
+		unsigned int entries_per_block =
+			ZNS_BASE_BLOCK_SIZE /
+			sizeof(struct zns_base_sstable_entry_disk);
+		unsigned int blocks = min_t(u64,
+			DIV_ROUND_UP(count - i, entries_per_block),
+			ZNS_BASE_GC_READAHEAD_BLOCKS);
+		unsigned int block;
 
-		ret = zns_base_metadata_read_block(c, sector, buffer);
+		ret = zns_base_submit_read_buffer_blocks(c, buffer, blocks, sector);
 		if (ret)
 			goto out;
-		page_entries = min_t(u64, count - i,
-			ZNS_BASE_BLOCK_SIZE / sizeof(*entry));
-		entry = (struct zns_base_sstable_entry_disk *)buffer;
-		while (page_entries--) {
-			struct mapping_entry candidate = {
-				.logical_block = le64_to_cpu(entry->logical_block),
-				.physical_sector = le64_to_cpu(entry->physical_sector),
-				.seq = le64_to_cpu(entry->seq),
-			};
+		for (block = 0; block < blocks && i < count; block++) {
+			struct zns_base_sstable_entry_disk *entry =
+				(struct zns_base_sstable_entry_disk *)(buffer +
+					(size_t)block * ZNS_BASE_BLOCK_SIZE);
+			unsigned int page_entries = min_t(u64, count - i,
+				entries_per_block);
 
-			crc = crc32c(crc, entry, sizeof(*entry));
-			if (candidate.logical_block >= c->nr_logical_blocks) {
-				ret = -EIO;
-				goto out;
+			while (page_entries--) {
+				struct mapping_entry candidate = {
+					.logical_block =
+						le64_to_cpu(entry->logical_block),
+					.physical_sector =
+						le64_to_cpu(entry->physical_sector),
+					.seq = le64_to_cpu(entry->seq),
+				};
+
+				crc = crc32c(crc, entry, sizeof(*entry));
+				if (candidate.logical_block >= c->nr_logical_blocks) {
+					ret = -EIO;
+					goto out;
+				}
+				zns_base_snapshot_consider(snapshot, &candidate);
+				entry++;
+				i++;
 			}
-			zns_base_snapshot_consider(snapshot, &candidate);
-			entry++;
-			i++;
 		}
+		sector += (sector_t)blocks * SECTORS_PER_BLOCK;
 	}
 	if (crc != le32_to_cpu(descriptor->payload_crc32c)) {
 		DMERR("SSTable CRC mismatch actual=%08x descriptor=%08x", crc,
@@ -4969,6 +5161,69 @@ static int zns_base_sstable_apply_to_snapshot_locked(
 	}
 out:
 	kvfree(buffer);
+	return ret;
+}
+
+/* Build the same newest-sequence map used by checkpoint/compaction without
+ * taking metadata.lock.  SRCU pins the copied catalog's zones while each
+ * SSTable is read sequentially.  RAM is merged on both sides of the catalog
+ * snapshot: an entry flushed out of a frozen MemTable is therefore present in
+ * either the first RAM copy or the copied catalog, and later writes are picked
+ * up by the second RAM copy. */
+static int zns_base_gc_build_bulk_snapshot(struct zns_base_c *c,
+	struct mapping_entry **snapshot_out, unsigned int *table_count)
+{
+	struct zns_base_sstable_descriptor_disk *descriptors;
+	struct mapping_entry *snapshot;
+	unsigned int catalog_seq;
+	unsigned int descriptor_count;
+	unsigned int i;
+	int srcu_idx;
+	int ret = 0;
+
+	*snapshot_out = NULL;
+	*table_count = 0;
+	descriptors = kcalloc(ZNS_BASE_MAX_MANIFEST_SSTABLES,
+			      sizeof(*descriptors), GFP_KERNEL);
+	if (!descriptors)
+		return -ENOMEM;
+	snapshot = kvcalloc(c->nr_logical_blocks, sizeof(*snapshot), GFP_KERNEL);
+	if (!snapshot) {
+		kfree(descriptors);
+		return -ENOMEM;
+	}
+
+	zns_base_snapshot_ram(c, snapshot);
+	srcu_idx = srcu_read_lock(&c->metadata.catalog_srcu);
+	do {
+		catalog_seq = read_seqcount_begin(&c->metadata.catalog_seq);
+		descriptor_count = READ_ONCE(c->metadata.sstable_count);
+		if (descriptor_count > ZNS_BASE_MAX_MANIFEST_SSTABLES) {
+			ret = -EIO;
+			goto out_srcu;
+		}
+		memcpy(descriptors, c->metadata.sstables,
+		       descriptor_count * sizeof(*descriptors));
+	} while (read_seqcount_retry(&c->metadata.catalog_seq, catalog_seq));
+
+	for (i = 0; i < descriptor_count; i++) {
+		ret = zns_base_sstable_apply_to_snapshot_locked(c,
+			&descriptors[i], snapshot);
+		if (ret)
+			goto out_srcu;
+	}
+out_srcu:
+	srcu_read_unlock(&c->metadata.catalog_srcu, srcu_idx);
+	if (ret)
+		goto out;
+
+	zns_base_snapshot_ram(c, snapshot);
+	*snapshot_out = snapshot;
+	*table_count = descriptor_count;
+	snapshot = NULL;
+out:
+	kvfree(snapshot);
+	kfree(descriptors);
 	return ret;
 }
 
