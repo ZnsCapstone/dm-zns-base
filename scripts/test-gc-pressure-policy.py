@@ -40,7 +40,8 @@ class GCPressurePolicyTests(unittest.TestCase):
 
     def test_waiter_can_take_first_reset_zone_and_gc_yields(self):
         reserve = function_body('static unsigned int zns_base_foreground_reserve_locked(')
-        self.assertIn('if (c->foreground_waiters)', reserve)
+        self.assertIn('c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE', reserve)
+        self.assertNotIn('if (c->foreground_waiters)', reserve)
         self.assertIn('return 0;', reserve)
         wait = function_body('static int zns_base_wait_for_gc_space(')
         self.assertIn('c->foreground_waiters++;', wait)

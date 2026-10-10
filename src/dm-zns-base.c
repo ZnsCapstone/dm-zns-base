@@ -2923,12 +2923,13 @@ static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c)
 	 * that newly FREE victim instead of forcing a second long relocation. */
 	if (c->quiescing)
 		return 0;
-	if (c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE) {
-		if (c->foreground_waiters)
-			return 0;
-		if (reserve)
-			reserve--;
-	}
+	/* Keep admission stable across wait_for_gc_space() returning and the
+	 * subsequent activate_next_zone() call.  Making this depend on the transient
+	 * waiter count creates an EAGAIN retry loop when free=1 and a GC destination
+	 * already exists.  The destination itself is the complete relocation
+	 * reserve, so the remaining FREE zone is safe for foreground activation. */
+	if (c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE)
+		return 0;
 	return reserve;
 }
 
