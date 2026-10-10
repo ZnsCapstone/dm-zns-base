@@ -22,9 +22,10 @@ record.
   logical block.  It is updated under `c->lock`, restored from the checkpoint,
   and advanced by WAL replay.  GC conditional publish compares this exact
   version instead of doing a sleeping SSTable lookup per relocated record.
-- `foreground_waiters` makes a GC worker yield after the first reset that makes
-  a zone admissible.  With an existing GC destination, the waiting writer can
-  use that newly freed zone instead of waiting for a second victim relocation.
+- A successful reset observed by `foreground_waiters` creates a persistent
+  `foreground_zone_grant`.  GC yields immediately and cannot take that FREE
+  zone in a new round.  The grant is consumed only when the writer activates
+  the zone, so admission stays stable after the waiter count is decremented.
 - `gc_min_reclaim_percent` defaults to 10.  Background GC defers victims below
   that reclaim ratio.  Under foreground pressure it scans all candidates and
   retries the best sub-threshold victim if no better victim exists.
@@ -41,7 +42,8 @@ foreground-wins conditional publication remain in place.
 
 ## Diagnostics
 
-`dmsetup status` now includes `foreground_waiters`.  With
+`dmsetup status` now includes `foreground_waiters` and
+`foreground_zone_grant`.  With
 `gc_diagnostics=1`, policy decisions also emit `victim deferred` and
 `victim fallback` records.  Existing `phase=move`, `move-cost`,
 `foreground-space-wait`, WAL, and reset diagnostics remain available.

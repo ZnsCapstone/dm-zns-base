@@ -588,6 +588,10 @@ struct zns_base_c {
 	u64 gc_moved_blocks;
 	u64 discarded_blocks;
 	unsigned int foreground_waiters;
+	/* A successful reset may hand exactly one FREE zone to a blocked writer.
+	 * Keep this grant until activation so admission cannot change between the
+	 * wait completing and zns_base_activate_next_zone(). */
+	bool foreground_zone_grant;
 
 	mempool_t *io_pool;
 	/* quiescing rejects new upper bios while already-issued data completions
@@ -2081,6 +2085,7 @@ static void zns_base_gc_work(struct work_struct *work)
   		spin_lock(&c->lock);
 
 		if (c->stopping || c->quiescing ||
+		    c->foreground_zone_grant ||
 		    (c->foreground_waiters &&
 		     zns_base_count_free_zones(c) >
 			zns_base_foreground_reserve_locked(c)) ||
@@ -2926,6 +2931,11 @@ static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c)
 
 	/* During teardown there is no future GC round to reserve for. */
 	if (c->quiescing)
+		return 0;
+	/* A reset completed specifically for a blocked foreground allocation.  This
+	 * is persistent state, unlike foreground_waiters, so wait completion and the
+	 * following activation observe the same admission rule. */
+	if (c->foreground_zone_grant)
 		return 0;
 	/* Keep admission stable across wait_for_gc_space() returning and the
 	 * subsequent activate_next_zone() call.  Making this depend on the transient
@@ -3949,6 +3959,7 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
 static int zns_base_reset_victim(struct zns_base_c *c,
   				 struct zns_base_zone *victim)
 {
+	bool granted_foreground = false;
   	int ret;
 
   	spin_lock(&c->lock);
@@ -3994,9 +4005,16 @@ static int zns_base_reset_victim(struct zns_base_c *c,
 	victim->gc_skip_until = 0;
   	victim->state = ZNS_BASE_ZONE_FREE;
 	c->gc_reset_count++;
+	if (c->foreground_waiters && !c->foreground_zone_grant) {
+		c->foreground_zone_grant = true;
+		granted_foreground = true;
+	}
 
   	spin_unlock(&c->lock);
 
+	if (granted_foreground && gc_diagnostics)
+		DMINFO("gc-diag: foreground-zone-grant victim=%u",
+		       (unsigned int)(victim - c->zone_state.zones));
   	wake_up_all(&c->gc_waitq);
   	return 0;
 }
@@ -4029,6 +4047,7 @@ static int zns_base_activate_next_zone(struct zns_base_c *c)
 
   		zone->state = ZNS_BASE_ZONE_ACTIVE;
   		c->zone_state.active_zone_idx = i;
+		c->foreground_zone_grant = false;
   		return 0;
   	}
 
@@ -7220,6 +7239,7 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	c->gc_error = 0;
 	c->gc_last_error = 0;
 	c->foreground_waiters = 0;
+	c->foreground_zone_grant = false;
 	c->quiescing = false;
 	c -> stopping = false;
 
@@ -7514,6 +7534,7 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	unsigned int data_write_queued_blocks = 0;
 	unsigned int data_write_inflight;
 	unsigned int foreground_waiters;
+	unsigned int foreground_zone_grant;
 	size_t mapping_reserved_slots;
 	unsigned int active_data_zone;
 	struct zns_base_data_write *queued_write;
@@ -7604,6 +7625,7 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	data_write_error = c->data_write_error;
 	data_write_inflight = c->data_write_inflight;
 	foreground_waiters = c->foreground_waiters;
+	foreground_zone_grant = c->foreground_zone_grant;
 	list_for_each_entry(queued_write, &c->data_write_queue, node) {
 		data_write_queued++;
 		data_write_queued_blocks += queued_write->mapping_count;
@@ -7621,10 +7643,11 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		(unsigned long long)gc_moved_blocks,
 		(unsigned long long)discarded_blocks,
 		gc_error, gc_last_error);
-	DMEMIT("data_write_inflight=%u data_write_queued=%u data_write_queued_blocks=%u data_write_error=%d mapping_reserved_slots=%zu foreground_waiters=%u active_data_zone=%u active_data_wp=%llu ",
+	DMEMIT("data_write_inflight=%u data_write_queued=%u data_write_queued_blocks=%u data_write_error=%d mapping_reserved_slots=%zu foreground_waiters=%u foreground_zone_grant=%u active_data_zone=%u active_data_wp=%llu ",
 		data_write_inflight, data_write_queued, data_write_queued_blocks,
 		data_write_error, mapping_reserved_slots, foreground_waiters,
-		active_data_zone, (unsigned long long)active_data_wp);
+		foreground_zone_grant, active_data_zone,
+		(unsigned long long)active_data_wp);
 	DMEMIT("wal_zone=%u wal_generation=%llu wal_used_blocks=%llu wal_capacity_blocks=%llu wal_staged_records=%u wal_error=%d ",
 		wal_zone_idx, (unsigned long long)wal_generation,
 		(unsigned long long)(wal_used_sectors / SECTORS_PER_BLOCK),

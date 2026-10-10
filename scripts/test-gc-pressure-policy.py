@@ -38,17 +38,23 @@ class GCPressurePolicyTests(unittest.TestCase):
         self.assertIn('fallback_victim->gc_skip_run = 0;', worker)
         self.assertIn('foreground_waiting', worker)
 
-    def test_gc_destination_counts_as_one_reserve_and_gc_yields(self):
+    def test_gc_destination_counts_as_one_reserve_and_reset_grant_yields(self):
         reserve = function_body('static unsigned int zns_base_foreground_reserve_locked(')
         self.assertIn('c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE', reserve)
         self.assertNotIn('if (c->foreground_waiters)', reserve)
+        self.assertIn('if (c->foreground_zone_grant)', reserve)
         self.assertIn('GC_RESERVE_ZONES - 1', reserve)
         wait = function_body('static int zns_base_wait_for_gc_space(')
         self.assertIn('c->foreground_waiters++;', wait)
         self.assertIn('c->foreground_waiters--;', wait)
         worker = function_body('static void zns_base_gc_work(')
+        self.assertIn('c->foreground_zone_grant ||', worker)
         self.assertIn('c->foreground_waiters &&', worker)
         self.assertIn('c->stopping || c->quiescing ||', worker)
+        reset = function_body('static int zns_base_reset_victim(')
+        self.assertIn('c->foreground_zone_grant = true;', reset)
+        activate = function_body('static int zns_base_activate_next_zone(')
+        self.assertIn('c->foreground_zone_grant = false;', activate)
 
     def test_fully_stale_victim_does_not_require_relocation_space(self):
         worker = function_body('static void zns_base_gc_work(')

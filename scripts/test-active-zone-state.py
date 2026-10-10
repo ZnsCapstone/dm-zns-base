@@ -18,6 +18,7 @@ class ActiveZoneTests(unittest.TestCase):
     def test_state_transitions(self):
         prelude = r'''
 #include <assert.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <stdint.h>
 typedef uint64_t sector_t;
@@ -35,6 +36,7 @@ struct zns_base_c {
              unsigned int nr_zones, active_zone_idx; } zone_state;
     unsigned int reserve;
     int data_write_error;
+    bool foreground_zone_grant;
 };
 static unsigned int zns_base_count_free_zones(struct zns_base_c *c) {
     unsigned int n = 0;
@@ -43,6 +45,8 @@ static unsigned int zns_base_count_free_zones(struct zns_base_c *c) {
     return n;
 }
 static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c) {
+    if (c->foreground_zone_grant)
+        return 0;
     return c->reserve;
 }
 '''
@@ -78,8 +82,17 @@ int main(void) {
     assert(zns_base_allocate_block(&c, &pba) == 0 && pba == 8);
     assert(c.zone_state.zones[0].state == ZNS_BASE_ZONE_FULL);
     assert(zns_base_allocate_block(&c, &pba) == -EAGAIN);
+    /* A persistent reset grant admits exactly one otherwise-reserved zone. */
+    c.zone_state.zones[2].state = ZNS_BASE_ZONE_FREE;
+    c.foreground_zone_grant = true;
+    assert(zns_base_allocate_block(&c, &pba) == 0);
+    assert(!c.foreground_zone_grant);
+    c.zone_state.zones[1].write_pointer = 16;
+    assert(zns_base_ensure_active_zone(&c) == -EAGAIN);
     /* GC-owned stale zone remains untouched when another zone is selected. */
     c.zone_state.zones[0].state = ZNS_BASE_ZONE_GC_VICTIM;
+    c.zone_state.zones[1].state = ZNS_BASE_ZONE_FREE;
+    c.zone_state.zones[1].write_pointer = 0;
     c.zone_state.zones[2].state = ZNS_BASE_ZONE_FREE;
     assert(zns_base_allocate_block(&c, &pba) == 0);
     assert(c.zone_state.active_zone_idx == 1);
