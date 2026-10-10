@@ -132,7 +132,7 @@ MODULE_PARM_DESC(data_zone_capacity_mib,
 static unsigned int gc_low_watermark = GC_DEFAULT_LOW_WATERMARK;
 module_param(gc_low_watermark, uint, 0444);
 MODULE_PARM_DESC(gc_low_watermark,
-	"free data-zone floor that schedules GC and paces foreground zone rollover");
+	"free data-zone count at or below which background GC is scheduled");
 
 static unsigned int gc_target_free_zones = GC_DEFAULT_TARGET_FREE_ZONES;
 module_param(gc_target_free_zones, uint, 0444);
@@ -671,8 +671,6 @@ static int zns_base_gc_move_blocks(struct zns_base_c *c,
 static int zns_base_reset_victim(struct zns_base_c *c, struct zns_base_zone *victim);
 static unsigned int zns_base_count_free_zones(struct zns_base_c *c);
 static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c);
-static unsigned int zns_base_foreground_admission_floor_locked(
-	struct zns_base_c *c);
 static int zns_base_select_victim(struct zns_base_c *c, struct zns_base_zone **victim_out);
 static int zns_base_gc_validate_victim(struct zns_base_c *c,
 		struct zns_base_zone *victim, unsigned int *stale_blocks,
@@ -2096,7 +2094,7 @@ static void zns_base_gc_work(struct work_struct *work)
 		    c->foreground_zone_grant ||
 		    (c->foreground_waiters &&
 		     zns_base_count_free_zones(c) >
-			zns_base_foreground_admission_floor_locked(c)) ||
+			zns_base_foreground_reserve_locked(c)) ||
 		    (!c->foreground_waiters &&
 		     zns_base_count_free_zones(c) >=
 		     gc_target_free_zones)) {
@@ -2959,22 +2957,6 @@ static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c)
 	return reserve;
 }
 
-/* Keep foreground allocation ahead of the hard relocation reserve.  The low
- * watermark is normally three zones while the hard reserve is two, so a zone
- * rollover begins waiting while GC still has working room instead of after
- * free space has collapsed to zero or one.  A reset grant bypasses this floor
- * for exactly the zone chosen by GC, preserving the deadlock-free emergency
- * handoff.  Caller holds c->lock. */
-static unsigned int zns_base_foreground_admission_floor_locked(
-	struct zns_base_c *c)
-{
-	unsigned int reserve = zns_base_foreground_reserve_locked(c);
-
-	if (c->quiescing || c->foreground_zone_grant)
-		return reserve;
-	return max(reserve, gc_low_watermark);
-}
-
 static bool zns_base_gc_space_ready(struct zns_base_c *c)
 {
   	bool ready;
@@ -2984,7 +2966,7 @@ static bool zns_base_gc_space_ready(struct zns_base_c *c)
 	ready = c->stopping ||
 		c->gc_error ||
 		zns_base_count_free_zones(c) >
-			zns_base_foreground_admission_floor_locked(c) ||
+			zns_base_foreground_reserve_locked(c) ||
 		(!c->gc_running && !c->gc_scheduled);
 
   	spin_unlock(&c->lock);
@@ -3017,7 +2999,7 @@ static int zns_base_wait_for_gc_space(struct zns_base_c *c)
   		}
 
 		if (zns_base_count_free_zones(c) >
-		    zns_base_foreground_admission_floor_locked(c)) {
+		    zns_base_foreground_reserve_locked(c)) {
 			ret = 0;
 			goto out_unlock;
 		}
@@ -3036,7 +3018,7 @@ static int zns_base_wait_for_gc_space(struct zns_base_c *c)
 		if (gc_diagnostics && !attempted_gc) {
 			spin_lock(&c->lock);
 			free_zones = zns_base_count_free_zones(c);
-			reserve = zns_base_foreground_admission_floor_locked(c);
+			reserve = zns_base_foreground_reserve_locked(c);
 			spin_unlock(&c->lock);
 			DMINFO("gc-diag: phase=foreground-space-wait begin free=%u reserve=%u",
 			       free_zones, reserve);
@@ -4094,7 +4076,7 @@ static int zns_base_activate_next_zone(struct zns_base_c *c)
 	sector_t zone_end;
 
 	if (zns_base_count_free_zones(c) <=
-	    zns_base_foreground_admission_floor_locked(c))
+	    zns_base_foreground_reserve_locked(c))
   		return -EAGAIN;
 
 	/* A reset grant names the exact zone selected under the GC lock.  It may be

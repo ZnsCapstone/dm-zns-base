@@ -47,19 +47,14 @@ class GCPressurePolicyTests(unittest.TestCase):
         self.assertNotIn('fallback_victim', worker)
         self.assertLess(worker.index(emergency), worker.index(move))
 
-    def test_foreground_rollover_uses_low_watermark_admission_floor(self):
-        floor = function_body(
-            'static unsigned int zns_base_foreground_admission_floor_locked(')
-        self.assertIn('max(reserve, gc_low_watermark)', floor)
-        self.assertIn('c->foreground_zone_grant', floor)
+    def test_foreground_rollover_uses_hard_reserve_not_low_watermark(self):
         ready = function_body('static bool zns_base_gc_space_ready(')
         wait = function_body('static int zns_base_wait_for_gc_space(')
         activate = function_body('static int zns_base_activate_next_zone(')
         worker = function_body('static void zns_base_gc_work(')
-        self.assertIn('zns_base_foreground_admission_floor_locked(c)', ready)
-        self.assertIn('zns_base_foreground_admission_floor_locked(c)', wait)
-        self.assertIn('zns_base_foreground_admission_floor_locked(c)', activate)
-        self.assertIn('zns_base_foreground_admission_floor_locked(c)', worker)
+        for body in (ready, wait, activate, worker):
+            self.assertIn('zns_base_foreground_reserve_locked(c)', body)
+            self.assertNotIn('gc_low_watermark', body)
         self.assertIn('!c->foreground_waiters &&', worker)
 
     def test_gc_destination_counts_as_one_reserve_and_reset_grant_yields(self):

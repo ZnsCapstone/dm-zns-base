@@ -33,11 +33,12 @@ record.
   Foreground emergency GC ranks FULL zones by this hint, exactly validates only
   the best candidate, and relocates it immediately.  It no longer puts a full
   multi-zone validation pass on the blocked writer's critical path.
-- The foreground rollover admission floor is the greater of the hard GC
-  reserve and `gc_low_watermark`.  With the defaults, a writer begins waiting
-  at three FREE zones instead of consuming inventory down to the final reserve.
-  A zone-specific reset grant still bypasses the floor, so emergency progress
-  does not depend on reaching the background high watermark.
+- `gc_low_watermark` schedules background work only; it does not block a
+  foreground zone rollover.  Foreground admission uses the hard relocation
+  reserve.  This separation is intentional: forcing emergency collection at
+  the low watermark can relocate an almost entirely live zone before ongoing
+  overwrites have created enough reclaimable space.  A zone-specific reset
+  grant still bypasses the hard reserve for deadlock-free emergency progress.
 - `gc_min_reclaim_percent` defaults to 10.  Background GC defers victims below
   that reclaim ratio.  Foreground emergency GC bypasses this quality threshold
   after validating its single ranked candidate because bounded latency takes

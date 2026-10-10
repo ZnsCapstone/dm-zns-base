@@ -86,11 +86,12 @@ struct zns_base_zone {
 - `valid_blocks`: GC victim 선정의 기준이며, overwrite된 이전 PBA는 invalid 처리됩니다.
 
 DATA zone은 `GC_RESERVE_ZONES=2`를 hard reserve로 남겨둡니다. free zone이 low
-watermark 이하가 되면 GC를 실행하는 동시에 다음 foreground zone rollover를
-일시 정지합니다. GC가 reset한 zone을 명시적으로 grant하면 이 admission floor를
-우회해 진행하므로, 일반 write가 reserve를 먼저 소모하거나 high watermark를
-기다리며 교착되는 상황을 피합니다. Foreground emergency GC는 `valid_blocks` 기반
-reclaimable 힌트로 후보를 고르고 해당 후보 하나만 정확 검증합니다.
+watermark 이하가 되면 background GC를 시작하지만 foreground zone rollover는
+hard reserve에 도달하기 전까지 계속 진행합니다. 따라서 overwrite가 reclaimable
+공간을 만들 시간을 확보하면서도 일반 write가 마지막 relocation reserve를 소모하지
+않게 합니다. GC가 reset한 zone을 명시적으로 grant하면 hard reserve를 우회해
+교착 없이 진행합니다. Foreground emergency GC는 `valid_blocks` 기반 reclaimable
+힌트로 후보를 고르고 해당 후보 하나만 정확 검증합니다.
 
 ---
 
