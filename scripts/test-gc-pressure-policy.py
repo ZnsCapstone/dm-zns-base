@@ -59,6 +59,11 @@ class GCPressurePolicyTests(unittest.TestCase):
         self.assertIn('c->zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;', activate)
         self.assertIn('c->foreground_zone_grant = false;', activate)
 
+    def test_foreground_wait_does_not_depend_on_background_watermark(self):
+        schedule = function_body('static void zns_base_schedule_gc(')
+        self.assertIn('c->foreground_waiters || zns_base_gc_needed(c)',
+                      schedule)
+
     def test_fully_stale_victim_does_not_require_relocation_space(self):
         worker = function_body('static void zns_base_gc_work(')
         skip = 'if (reclaimable_blocks == victim->nr_blocks)'

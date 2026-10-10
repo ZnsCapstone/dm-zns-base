@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * dm-zns-base: M0 scaffold for the capstone project.
+ * dm-zns-base: persistent random-to-sequential device-mapper target for a
+ * host-managed zoned block device.
  *
- * Registers a zoned-aware pass-through DM target on top of a host-managed
- * zoned device. The random-to-sequential translation that the project is
- * actually about is left out on purpose — that's the student's work.
- * See docs/07-milestones.md.
+ * DATA writes are appended sequentially, mappings are protected by a WAL and
+ * immutable SSTables, and garbage collection relocates live blocks before a
+ * zone reset.
  */
 
 #include <linux/module.h>
@@ -782,10 +782,7 @@ static sector_t zns_base_usable_logical_sectors(struct zns_base_c *c)
   				c->zone_state.zones[i].capacity_sectors;
   	}
 
-  	/*
-  	 * 현재 null_blk처럼 모든 data zone 크기가 동일하다는
-  	 * 첫 구현 전제다.
-  	 */
+	/* zone_init() enforces equal DATA-zone capacities. */
   	capacity -= (sector_t)GC_RESERVE_ZONES *
   		c->zone_state.zones[ZNS_BASE_METADATA_ZONES]
   			.capacity_sectors;
@@ -1969,8 +1966,6 @@ static bool zns_base_process_bio(struct zns_base_c *c, struct zns_base_io *io){
 	struct bio *bio = io->bio;
 	int ret;
 
-	/* Student work goes here: translate random writes into sequential ones. */
-
 	if(bio_op(bio) == REQ_OP_FLUSH){
 		ret = zns_base_wal_flush_sync(c);
 		if (!ret)
@@ -2004,6 +1999,16 @@ static bool zns_base_process_bio(struct zns_base_c *c, struct zns_base_io *io){
 	return false;
 }
 
+/* Partial writes read the previous 4 KiB image before constructing their new
+ * DATA block.  They must observe every earlier asynchronous write, including
+ * one that has completed on media but has not entered the WAL overlay yet. */
+static bool zns_base_write_needs_rmw_ordering(struct bio *bio)
+{
+	return bio_op(bio) == REQ_OP_WRITE &&
+		(bio->bi_iter.bi_sector % SECTORS_PER_BLOCK != 0 ||
+		 bio->bi_iter.bi_size % ZNS_BASE_BLOCK_SIZE != 0);
+}
+
 static void zns_base_io_work(struct work_struct *work){
 	struct zns_base_c *c;
 	struct zns_base_io *io;
@@ -2025,10 +2030,10 @@ static void zns_base_io_work(struct work_struct *work){
 
 		io = list_first_entry(&c -> pending_bios, struct zns_base_io, node);
 		list_del_init(&io -> node);
-		/* A read or FLUSH is an ordering boundary.  Let already-issued data
-		 * writes reach completion work (and hence WAL staging) before this
-		 * single dispatcher handles the boundary request. */
-		wait_for_data = bio_op(io->bio) != REQ_OP_WRITE &&
+		/* Reads, metadata boundaries, and read-modify-write bios must observe
+		 * already-issued DATA after completion work has staged its WAL overlay. */
+		wait_for_data = (bio_op(io->bio) != REQ_OP_WRITE ||
+			zns_base_write_needs_rmw_ordering(io->bio)) &&
 			c->foreground_data_inflight;
 		if (wait_for_data) {
 			list_add(&io->node, &c->pending_bios);
@@ -2846,6 +2851,7 @@ static void zns_base_zone_destroy(struct zns_base_c *c)
 static int zns_base_zone_init(struct zns_base_c *c)
 {
   	struct request_queue *queue;
+	sector_t data_zone_capacity;
   	unsigned int nr_zones;
 	unsigned int i;
   	int ret;
@@ -2889,6 +2895,16 @@ static int zns_base_zone_init(struct zns_base_c *c)
   		c->zone_state.nr_zones = 0;
   		return -EINVAL;
   	}
+
+	data_zone_capacity =
+		c->zone_state.zones[ZNS_BASE_METADATA_ZONES].capacity_sectors;
+	for (i = ZNS_BASE_METADATA_ZONES + 1; i < nr_zones; i++) {
+		if (c->zone_state.zones[i].capacity_sectors !=
+		    data_zone_capacity) {
+			zns_base_zone_destroy(c);
+			return -EINVAL;
+		}
+	}
 
 	for (i = 0; i < nr_zones; i++) {
 		if (c->zone_state.zones[i].role != ZNS_BASE_ZONE_DATA)
@@ -3059,7 +3075,7 @@ static void zns_base_schedule_gc(struct zns_base_c *c)
 	if (!c->stopping &&
 	    (!c->quiescing || draining_foreground) &&
 	    !c->gc_scheduled &&
-	    zns_base_gc_needed(c)) {
+	    (c->foreground_waiters || zns_base_gc_needed(c))) {
   		c->gc_scheduled = true;
   		queue_gc = true;
   	}
@@ -5853,6 +5869,8 @@ static int zns_base_checkpoint_locked(struct zns_base_c *c)
 		c->metadata.wal.stream.active_zone_idx = ZNS_BASE_MANIFEST_ZONES;
 		c->metadata.wal.stream.generation++;
 		c->metadata.wal.header_written = false;
+		c->zone_state.zones[ZNS_BASE_MANIFEST_ZONES].state =
+			ZNS_BASE_ZONE_ACTIVE;
 	}
 out:
 	kvfree(entries);
@@ -6277,6 +6295,14 @@ static int zns_base_manifest_recover(struct zns_base_c *c)
 					     &zone, &slot);
 		if (ret)
 			goto out_snapshot;
+		/* A durable mapping can only reference a completed DATA block.  Also
+		 * reject two recovered LBAs claiming the same physical slot instead of
+		 * silently replacing its reverse-map owner. */
+		if (snapshot[i].physical_sector >= zone->write_pointer ||
+		    zone->slots[slot].valid || zone->slots[slot].pending) {
+			ret = -EIO;
+			goto out_snapshot;
+		}
 		zone->slots[slot].logical_block = i;
 		zone->slots[slot].seq = snapshot[i].seq;
 		zone->slots[slot].valid = true;
@@ -6372,7 +6398,10 @@ static int zns_base_replay_wal_put(struct zns_base_c *c,
 
 	if (!ret)
 		ret = zns_base_get_zone_slot(c, physical_sector, &zone, &slot);
-	if (!ret && !zone->slots[slot].valid) {
+	if (!ret && (physical_sector >= zone->write_pointer ||
+		     zone->slots[slot].valid || zone->slots[slot].pending))
+		ret = -EIO;
+	if (!ret) {
 		zone->slots[slot].logical_block = logical_block;
 		zone->slots[slot].seq = seq;
 		zone->slots[slot].valid = true;
@@ -6424,6 +6453,7 @@ static int zns_base_wal_recover(struct zns_base_c *c)
 	struct zns_base_wal_record_disk *record;
 	u8 *buffer;
 	u64 generation[ZNS_BASE_WAL_ZONES] = {};
+	bool sealed[ZNS_BASE_WAL_ZONES] = {};
 	u64 max_seq = c->metadata.checkpoint_seq;
 	u64 latest_generation = 1;
 	unsigned int zone_idx[ZNS_BASE_WAL_ZONES];
@@ -6478,8 +6508,11 @@ static int zns_base_wal_recover(struct zns_base_c *c)
 			if (ret)
 				goto out;
 			page_header = (struct zns_base_wal_page_header_disk *)buffer;
-			if (!zns_base_wal_page_valid(page_header))
+			if (!zns_base_wal_page_valid(page_header) ||
+			    le64_to_cpu(page_header->generation) != lowest) {
+				sealed[selected] = true;
 				break; /* torn or unused tail */
+			}
 
 			for (record_idx = 0;
 			     record_idx < le16_to_cpu(page_header->record_count);
@@ -6494,8 +6527,10 @@ static int zns_base_wal_recover(struct zns_base_c *c)
 				record->crc32c = 0;
 				actual_crc = crc32c(~0, record, sizeof(*record));
 				record->crc32c = cpu_to_le32(stored_crc);
-				if (actual_crc != stored_crc)
+				if (actual_crc != stored_crc) {
+					sealed[selected] = true;
 					goto next_zone;
+				}
 
 				if (le32_to_cpu(record->op_flags) ==
 				    ZNS_BASE_WAL_OP_PUT)
@@ -6552,10 +6587,12 @@ next_zone:
 		for (i = 0; i < ZNS_BASE_WAL_ZONES; i++) {
 			struct zns_base_zone *zone =
 				&c->zone_state.zones[ZNS_BASE_MANIFEST_ZONES + i];
+			sector_t end = zone->start_sector + zone->capacity_sectors;
 
 			if (zone->write_pointer == zone->start_sector)
 				zone->state = ZNS_BASE_ZONE_FREE;
-			else if (ZNS_BASE_MANIFEST_ZONES + i == latest)
+			else if (ZNS_BASE_MANIFEST_ZONES + i == latest &&
+				 !sealed[i] && zone->write_pointer < end)
 				zone->state = ZNS_BASE_ZONE_ACTIVE;
 			else
 				zone->state = ZNS_BASE_ZONE_FULL;
@@ -6563,6 +6600,24 @@ next_zone:
 		c->metadata.wal.stream.active_zone_idx = latest;
 		c->metadata.wal.stream.generation = latest_generation;
 		c->metadata.wal.header_written = true;
+	} else {
+		/* Never append behind a non-empty, unauthenticated WAL prefix.  It may
+		 * be a torn header, but treating possible media corruption as an empty
+		 * log would silently discard mappings, so require operator recovery. */
+		for (i = 0; i < ZNS_BASE_WAL_ZONES; i++) {
+			unsigned int idx = ZNS_BASE_MANIFEST_ZONES + i;
+
+			if (c->zone_state.zones[idx].write_pointer !=
+			    c->zone_state.zones[idx].start_sector) {
+				ret = -EIO;
+				goto out;
+			}
+			c->zone_state.zones[idx].state = ZNS_BASE_ZONE_FREE;
+		}
+		c->metadata.wal.stream.active_zone_idx = ZNS_BASE_MANIFEST_ZONES;
+		c->zone_state.zones[ZNS_BASE_MANIFEST_ZONES].state =
+			ZNS_BASE_ZONE_ACTIVE;
+		c->metadata.wal.header_written = false;
 	}
 out:
 	kvfree(buffer);
@@ -6612,6 +6667,9 @@ static bool zns_base_metadata_has_space(
   	sector_t zone_end;
 
   	zone = &c->zone_state.zones[stream->active_zone_idx];
+	if (zone->role != stream->role ||
+	    zone->state != ZNS_BASE_ZONE_ACTIVE)
+		return false;
   	zone_end = zone->start_sector + zone->capacity_sectors;
 
   	return zone->write_pointer +
@@ -7767,6 +7825,6 @@ static void __exit zns_base_exit(void)
 module_init(zns_base_init);
 module_exit(zns_base_exit);
 
-MODULE_DESCRIPTION("ZNS base dm target (zoned-aware pass-through scaffold)");
+MODULE_DESCRIPTION("Persistent random-to-sequential device-mapper target for ZNS");
 MODULE_AUTHOR("SPLAB");
 MODULE_LICENSE("GPL");
