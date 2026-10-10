@@ -24,6 +24,7 @@ class ActiveZoneTests(unittest.TestCase):
 typedef uint64_t sector_t;
 #define SECTORS_PER_BLOCK 8
 #define ZNS_BASE_METADATA_ZONES 0
+#define ZNS_BASE_NO_ZONE UINT32_MAX
 enum { ZNS_BASE_ZONE_FREE, ZNS_BASE_ZONE_ACTIVE, ZNS_BASE_ZONE_FULL,
        ZNS_BASE_ZONE_GC_VICTIM, ZNS_BASE_ZONE_GC_DEST };
 #define ZNS_BASE_ZONE_DATA 1
@@ -33,7 +34,7 @@ struct zns_base_zone {
 };
 struct zns_base_c {
     struct { struct zns_base_zone zones[4];
-             unsigned int nr_zones, active_zone_idx; } zone_state;
+             unsigned int nr_zones, active_zone_idx, gc_dest_zone_idx; } zone_state;
     unsigned int reserve;
     int data_write_error;
     bool foreground_zone_grant;
@@ -55,6 +56,7 @@ int main(void) {
     struct zns_base_c c = {0};
     sector_t pba = 999;
     c.zone_state.nr_zones = 4;
+    c.zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;
     c.reserve = 1;
     for (int i = 0; i < 4; i++) {
         c.zone_state.zones[i].role = ZNS_BASE_ZONE_DATA;
@@ -82,11 +84,17 @@ int main(void) {
     assert(zns_base_allocate_block(&c, &pba) == 0 && pba == 8);
     assert(c.zone_state.zones[0].state == ZNS_BASE_ZONE_FULL);
     assert(zns_base_allocate_block(&c, &pba) == -EAGAIN);
-    /* A persistent reset grant admits exactly one otherwise-reserved zone. */
+    /* A persistent reset grant promotes GC_DEST and preserves the FREE zone. */
+    c.zone_state.zones[1].state = ZNS_BASE_ZONE_GC_DEST;
+    c.zone_state.zones[1].write_pointer = 8;
     c.zone_state.zones[2].state = ZNS_BASE_ZONE_FREE;
+    c.zone_state.gc_dest_zone_idx = 1;
     c.foreground_zone_grant = true;
     assert(zns_base_allocate_block(&c, &pba) == 0);
     assert(!c.foreground_zone_grant);
+    assert(c.zone_state.gc_dest_zone_idx == ZNS_BASE_NO_ZONE);
+    assert(c.zone_state.active_zone_idx == 1);
+    assert(c.zone_state.zones[2].state == ZNS_BASE_ZONE_FREE);
     c.zone_state.zones[1].write_pointer = 16;
     assert(zns_base_ensure_active_zone(&c) == -EAGAIN);
     /* GC-owned stale zone remains untouched when another zone is selected. */

@@ -23,9 +23,11 @@ record.
   and advanced by WAL replay.  GC conditional publish compares this exact
   version instead of doing a sleeping SSTable lookup per relocated record.
 - A successful reset observed by `foreground_waiters` creates a persistent
-  `foreground_zone_grant`.  GC yields immediately and cannot take that FREE
-  zone in a new round.  The grant is consumed only when the writer activates
-  the zone, so admission stays stable after the waiter count is decremented.
+  `foreground_zone_grant`.  GC yields immediately, and the writer promotes the
+  still-open GC destination to ACTIVE instead of consuming the reset victim.
+  The reset victim therefore remains FREE for the next relocation round.  The
+  grant is consumed only during activation, so admission stays stable after
+  the waiter count is decremented.
 - `gc_min_reclaim_percent` defaults to 10.  Background GC defers victims below
   that reclaim ratio.  Under foreground pressure it scans all candidates and
   retries the best sub-threshold victim if no better victim exists.

@@ -53,7 +53,10 @@ class GCPressurePolicyTests(unittest.TestCase):
         self.assertIn('c->stopping || c->quiescing ||', worker)
         reset = function_body('static int zns_base_reset_victim(')
         self.assertIn('c->foreground_zone_grant = true;', reset)
+        self.assertIn('gc_destination->state == ZNS_BASE_ZONE_GC_DEST', reset)
         activate = function_body('static int zns_base_activate_next_zone(')
+        self.assertIn('zone->state = ZNS_BASE_ZONE_ACTIVE;', activate)
+        self.assertIn('c->zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;', activate)
         self.assertIn('c->foreground_zone_grant = false;', activate)
 
     def test_fully_stale_victim_does_not_require_relocation_space(self):

@@ -588,9 +588,10 @@ struct zns_base_c {
 	u64 gc_moved_blocks;
 	u64 discarded_blocks;
 	unsigned int foreground_waiters;
-	/* A successful reset may hand exactly one FREE zone to a blocked writer.
-	 * Keep this grant until activation so admission cannot change between the
-	 * wait completing and zns_base_activate_next_zone(). */
+	/* A successful reset may hand the current GC destination to a blocked
+	 * writer while preserving the reset victim as GC reserve.  Keep this grant
+	 * until activation so admission cannot change between the wait completing
+	 * and zns_base_activate_next_zone(). */
 	bool foreground_zone_grant;
 
 	mempool_t *io_pool;
@@ -3959,7 +3960,10 @@ static int zns_base_gc_move_block(struct zns_base_c *c, struct zns_base_zone *vi
 static int zns_base_reset_victim(struct zns_base_c *c,
   				 struct zns_base_zone *victim)
 {
+	struct zns_base_zone *gc_destination = NULL;
 	bool granted_foreground = false;
+	unsigned int granted_zone_idx = ZNS_BASE_NO_ZONE;
+	sector_t destination_end;
   	int ret;
 
   	spin_lock(&c->lock);
@@ -4005,16 +4009,31 @@ static int zns_base_reset_victim(struct zns_base_c *c,
 	victim->gc_skip_until = 0;
   	victim->state = ZNS_BASE_ZONE_FREE;
 	c->gc_reset_count++;
-	if (c->foreground_waiters && !c->foreground_zone_grant) {
+	if (c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE) {
+		gc_destination = &c->zone_state.zones[
+			c->zone_state.gc_dest_zone_idx];
+		destination_end = gc_destination->start_sector +
+			gc_destination->capacity_sectors;
+	}
+	/* Promote the partially filled relocation stream to foreground ACTIVE
+	 * instead of consuming the newly reset FREE victim.  This preserves one
+	 * physical zone for the next GC destination and prevents the free=0,
+	 * no-destination ENOSPC loop. */
+	if (c->foreground_waiters && !c->foreground_zone_grant &&
+	    gc_destination &&
+	    gc_destination->state == ZNS_BASE_ZONE_GC_DEST &&
+	    gc_destination->write_pointer + SECTORS_PER_BLOCK <= destination_end) {
 		c->foreground_zone_grant = true;
 		granted_foreground = true;
+		granted_zone_idx = c->zone_state.gc_dest_zone_idx;
 	}
 
   	spin_unlock(&c->lock);
 
 	if (granted_foreground && gc_diagnostics)
-		DMINFO("gc-diag: foreground-zone-grant victim=%u",
-		       (unsigned int)(victim - c->zone_state.zones));
+		DMINFO("gc-diag: foreground-zone-grant victim=%u gc_dest=%u",
+		       (unsigned int)(victim - c->zone_state.zones),
+		       granted_zone_idx);
   	wake_up_all(&c->gc_waitq);
   	return 0;
 }
@@ -4034,10 +4053,35 @@ static int zns_base_activate_next_zone(struct zns_base_c *c)
 {
   	unsigned int i;
   	struct zns_base_zone *zone;
+	sector_t zone_end;
 
 	if (zns_base_count_free_zones(c) <=
 	    zns_base_foreground_reserve_locked(c))
   		return -EAGAIN;
+
+	/* A reset grant transfers the still-open GC destination to foreground and
+	 * deliberately leaves the reset victim FREE for the next relocation round.
+	 * No GC worker can mutate the destination while the persistent grant is set. */
+	if (c->foreground_zone_grant) {
+		i = c->zone_state.gc_dest_zone_idx;
+		if (i == ZNS_BASE_NO_ZONE || i >= c->zone_state.nr_zones)
+			return -EIO;
+		zone = &c->zone_state.zones[i];
+		if (zone->state != ZNS_BASE_ZONE_GC_DEST)
+			return -EIO;
+		zone_end = zone->start_sector + zone->capacity_sectors;
+		if (zone->write_pointer + SECTORS_PER_BLOCK > zone_end) {
+			zone->state = ZNS_BASE_ZONE_FULL;
+			c->zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;
+			c->foreground_zone_grant = false;
+			return -EAGAIN;
+		}
+		zone->state = ZNS_BASE_ZONE_ACTIVE;
+		c->zone_state.active_zone_idx = i;
+		c->zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;
+		c->foreground_zone_grant = false;
+		return 0;
+	}
 
   	for (i = ZNS_BASE_METADATA_ZONES; i < c->zone_state.nr_zones; i++) {
   		zone = &c->zone_state.zones[i];
@@ -4047,7 +4091,6 @@ static int zns_base_activate_next_zone(struct zns_base_c *c)
 
   		zone->state = ZNS_BASE_ZONE_ACTIVE;
   		c->zone_state.active_zone_idx = i;
-		c->foreground_zone_grant = false;
   		return 0;
   	}
 
