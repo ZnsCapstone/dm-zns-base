@@ -38,6 +38,7 @@ struct zns_base_c {
     unsigned int reserve;
     int data_write_error;
     bool foreground_zone_grant;
+    unsigned int foreground_grant_zone_idx;
 };
 static unsigned int zns_base_count_free_zones(struct zns_base_c *c) {
     unsigned int n = 0;
@@ -90,13 +91,30 @@ int main(void) {
     c.zone_state.zones[2].state = ZNS_BASE_ZONE_FREE;
     c.zone_state.gc_dest_zone_idx = 1;
     c.foreground_zone_grant = true;
+    c.foreground_grant_zone_idx = 1;
     assert(zns_base_allocate_block(&c, &pba) == 0);
     assert(!c.foreground_zone_grant);
+    assert(c.foreground_grant_zone_idx == ZNS_BASE_NO_ZONE);
     assert(c.zone_state.gc_dest_zone_idx == ZNS_BASE_NO_ZONE);
     assert(c.zone_state.active_zone_idx == 1);
     assert(c.zone_state.zones[2].state == ZNS_BASE_ZONE_FREE);
     c.zone_state.zones[1].write_pointer = 16;
     assert(zns_base_ensure_active_zone(&c) == -EAGAIN);
+    /* With a safe reserve, a grant can select a completely empty reset zone
+       while leaving the existing relocation destination under GC ownership. */
+    c.zone_state.zones[0].state = ZNS_BASE_ZONE_GC_DEST;
+    c.zone_state.zones[0].write_pointer = 8;
+    c.zone_state.zones[1].state = ZNS_BASE_ZONE_FREE;
+    c.zone_state.zones[1].write_pointer = 0;
+    c.zone_state.zones[2].state = ZNS_BASE_ZONE_FREE;
+    c.zone_state.gc_dest_zone_idx = 0;
+    c.foreground_zone_grant = true;
+    c.foreground_grant_zone_idx = 1;
+    assert(zns_base_allocate_block(&c, &pba) == 0 && pba == 0);
+    assert(c.zone_state.active_zone_idx == 1);
+    assert(c.zone_state.gc_dest_zone_idx == 0);
+    assert(c.zone_state.zones[0].state == ZNS_BASE_ZONE_GC_DEST);
+    assert(c.zone_state.zones[2].state == ZNS_BASE_ZONE_FREE);
     /* GC-owned stale zone remains untouched when another zone is selected. */
     c.zone_state.zones[0].state = ZNS_BASE_ZONE_GC_VICTIM;
     c.zone_state.zones[1].state = ZNS_BASE_ZONE_FREE;

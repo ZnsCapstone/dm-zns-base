@@ -38,6 +38,17 @@ class GCPressurePolicyTests(unittest.TestCase):
         self.assertIn('fallback_victim->gc_skip_run = 0;', worker)
         self.assertIn('foreground_waiting', worker)
 
+    def test_foreground_measures_every_candidate_before_relocation(self):
+        worker = function_body('static void zns_base_gc_work(')
+        measure = 'victim measured victim=%u reclaimable=%u foreground_waiting=1'
+        fallback = 'victim fallback victim=%u reclaimable=%u'
+        move = 'phase=move begin victim=%u slots=%u reclaimable=%u'
+        self.assertIn(measure, worker)
+        self.assertIn(fallback, worker)
+        self.assertIn(move, worker)
+        self.assertIn('reclaimable_blocks > fallback_reclaimable', worker)
+        self.assertLess(worker.index(measure), worker.index(move))
+
     def test_gc_destination_counts_as_one_reserve_and_reset_grant_yields(self):
         reserve = function_body('static unsigned int zns_base_foreground_reserve_locked(')
         self.assertIn('c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE', reserve)
@@ -54,7 +65,12 @@ class GCPressurePolicyTests(unittest.TestCase):
         reset = function_body('static int zns_base_reset_victim(')
         self.assertIn('c->foreground_zone_grant = true;', reset)
         self.assertIn('gc_destination->state == ZNS_BASE_ZONE_GC_DEST', reset)
+        self.assertIn('free_zones >= GC_RESERVE_ZONES', reset)
+        self.assertIn('c->foreground_grant_zone_idx = granted_zone_idx;', reset)
+        self.assertIn('mode=%s', reset)
         activate = function_body('static int zns_base_activate_next_zone(')
+        self.assertIn('i = c->foreground_grant_zone_idx;', activate)
+        self.assertIn('zone->state != ZNS_BASE_ZONE_FREE', activate)
         self.assertIn('zone->state = ZNS_BASE_ZONE_ACTIVE;', activate)
         self.assertIn('c->zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;', activate)
         self.assertIn('c->foreground_zone_grant = false;', activate)

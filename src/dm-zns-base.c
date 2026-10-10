@@ -588,11 +588,12 @@ struct zns_base_c {
 	u64 gc_moved_blocks;
 	u64 discarded_blocks;
 	unsigned int foreground_waiters;
-	/* A successful reset may hand the current GC destination to a blocked
-	 * writer while preserving the reset victim as GC reserve.  Keep this grant
-	 * until activation so admission cannot change between the wait completing
-	 * and zns_base_activate_next_zone(). */
+	/* A successful reset reserves one specific zone for a blocked writer.  When
+	 * another FREE zone can still back a GC destination, prefer the empty reset
+	 * victim; otherwise hand off the current GC destination and preserve the
+	 * victim as reserve.  Keep the choice stable until activation. */
 	bool foreground_zone_grant;
+	unsigned int foreground_grant_zone_idx;
 
 	mempool_t *io_pool;
 	/* quiescing rejects new upper bios while already-issued data completions
@@ -2174,6 +2175,33 @@ static void zns_base_gc_work(struct work_struct *work)
 				       gc_clean_zone_cooldown_ms);
 			zns_base_release_victim(c, victim);
 			continue;
+		}
+		/* valid_blocks is only an upper bound before exact validation.  Under
+		 * foreground pressure, accepting the first zone above the minimum
+		 * threshold can copy almost an entire zone while a much staler FULL zone
+		 * is available.  Validate every candidate once in this run and relocate
+		 * only the one with the largest measured reclaimable extent. */
+		if (!force_fallback) {
+			bool foreground_waiting;
+
+			spin_lock(&c->lock);
+			foreground_waiting = c->foreground_waiters != 0;
+			if (foreground_waiting)
+				victim->gc_skip_run = c->gc_runs;
+			spin_unlock(&c->lock);
+			if (foreground_waiting) {
+				if (!fallback_victim ||
+				    reclaimable_blocks > fallback_reclaimable) {
+					fallback_victim = victim;
+					fallback_reclaimable = reclaimable_blocks;
+				}
+				if (gc_diagnostics)
+					DMINFO("gc-diag: victim measured victim=%u reclaimable=%u foreground_waiting=1",
+					       (unsigned int)(victim - c->zone_state.zones),
+					       reclaimable_blocks);
+				zns_base_release_victim(c, victim);
+				continue;
+			}
 		}
 		if (gc_min_reclaim_percent && !force_fallback &&
 		    (u64)reclaimable_blocks * 100 <
@@ -3979,6 +4007,7 @@ static int zns_base_reset_victim(struct zns_base_c *c,
 	struct zns_base_zone *gc_destination = NULL;
 	bool granted_foreground = false;
 	unsigned int granted_zone_idx = ZNS_BASE_NO_ZONE;
+	unsigned int free_zones;
 	sector_t destination_end;
   	int ret;
 
@@ -4025,31 +4054,43 @@ static int zns_base_reset_victim(struct zns_base_c *c,
 	victim->gc_skip_until = 0;
   	victim->state = ZNS_BASE_ZONE_FREE;
 	c->gc_reset_count++;
+	free_zones = zns_base_count_free_zones(c);
 	if (c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE) {
 		gc_destination = &c->zone_state.zones[
 			c->zone_state.gc_dest_zone_idx];
 		destination_end = gc_destination->start_sector +
 			gc_destination->capacity_sectors;
 	}
-	/* Promote the partially filled relocation stream to foreground ACTIVE
-	 * instead of consuming the newly reset FREE victim.  This preserves one
-	 * physical zone for the next GC destination and prevents the free=0,
-	 * no-destination ENOSPC loop. */
-	if (c->foreground_waiters && !c->foreground_zone_grant &&
-	    gc_destination &&
-	    gc_destination->state == ZNS_BASE_ZONE_GC_DEST &&
-	    gc_destination->write_pointer + SECTORS_PER_BLOCK <= destination_end) {
-		c->foreground_zone_grant = true;
-		granted_foreground = true;
-		granted_zone_idx = c->zone_state.gc_dest_zone_idx;
+	/* Prefer the freshly reset, completely empty victim when at least one other
+	 * FREE zone remains available to rotate a partially filled GC destination.
+	 * This gives foreground a full-zone runway instead of a nearly exhausted
+	 * relocation stream.  With only one FREE zone, retain the old safe handoff:
+	 * promote GC_DEST and keep the reset victim as the next relocation reserve. */
+	if (c->foreground_waiters && !c->foreground_zone_grant) {
+		if (free_zones >= GC_RESERVE_ZONES) {
+			granted_zone_idx = victim - c->zone_state.zones;
+		} else if (gc_destination &&
+			   gc_destination->state == ZNS_BASE_ZONE_GC_DEST &&
+			   gc_destination->write_pointer + SECTORS_PER_BLOCK <=
+				destination_end) {
+			granted_zone_idx = c->zone_state.gc_dest_zone_idx;
+		}
+		if (granted_zone_idx != ZNS_BASE_NO_ZONE) {
+			c->foreground_zone_grant = true;
+			c->foreground_grant_zone_idx = granted_zone_idx;
+			granted_foreground = true;
+		}
 	}
 
   	spin_unlock(&c->lock);
 
 	if (granted_foreground && gc_diagnostics)
-		DMINFO("gc-diag: foreground-zone-grant victim=%u gc_dest=%u",
+		DMINFO("gc-diag: foreground-zone-grant victim=%u zone=%u mode=%s free=%u",
 		       (unsigned int)(victim - c->zone_state.zones),
-		       granted_zone_idx);
+		       granted_zone_idx,
+		       granted_zone_idx == (unsigned int)(victim -
+			c->zone_state.zones) ? "reset" : "gc-dest",
+		       free_zones);
   	wake_up_all(&c->gc_waitq);
   	return 0;
 }
@@ -4075,27 +4116,33 @@ static int zns_base_activate_next_zone(struct zns_base_c *c)
 	    zns_base_foreground_reserve_locked(c))
   		return -EAGAIN;
 
-	/* A reset grant transfers the still-open GC destination to foreground and
-	 * deliberately leaves the reset victim FREE for the next relocation round.
-	 * No GC worker can mutate the destination while the persistent grant is set. */
+	/* A reset grant names the exact zone selected under the GC lock.  It may be
+	 * either a fresh reset victim (preferred when another FREE reserve remains)
+	 * or GC_DEST (the low-space fallback). */
 	if (c->foreground_zone_grant) {
-		i = c->zone_state.gc_dest_zone_idx;
+		i = c->foreground_grant_zone_idx;
 		if (i == ZNS_BASE_NO_ZONE || i >= c->zone_state.nr_zones)
 			return -EIO;
 		zone = &c->zone_state.zones[i];
-		if (zone->state != ZNS_BASE_ZONE_GC_DEST)
+		if (zone->state != ZNS_BASE_ZONE_FREE &&
+		    zone->state != ZNS_BASE_ZONE_GC_DEST)
 			return -EIO;
 		zone_end = zone->start_sector + zone->capacity_sectors;
 		if (zone->write_pointer + SECTORS_PER_BLOCK > zone_end) {
-			zone->state = ZNS_BASE_ZONE_FULL;
-			c->zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;
+			if (zone->state == ZNS_BASE_ZONE_GC_DEST) {
+				zone->state = ZNS_BASE_ZONE_FULL;
+				c->zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;
+			}
 			c->foreground_zone_grant = false;
+			c->foreground_grant_zone_idx = ZNS_BASE_NO_ZONE;
 			return -EAGAIN;
 		}
+		if (zone->state == ZNS_BASE_ZONE_GC_DEST)
+			c->zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;
 		zone->state = ZNS_BASE_ZONE_ACTIVE;
 		c->zone_state.active_zone_idx = i;
-		c->zone_state.gc_dest_zone_idx = ZNS_BASE_NO_ZONE;
 		c->foreground_zone_grant = false;
+		c->foreground_grant_zone_idx = ZNS_BASE_NO_ZONE;
 		return 0;
 	}
 
@@ -7341,6 +7388,7 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	c->gc_last_error = 0;
 	c->foreground_waiters = 0;
 	c->foreground_zone_grant = false;
+	c->foreground_grant_zone_idx = ZNS_BASE_NO_ZONE;
 	c->quiescing = false;
 	c -> stopping = false;
 
@@ -7636,6 +7684,7 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	unsigned int data_write_inflight;
 	unsigned int foreground_waiters;
 	unsigned int foreground_zone_grant;
+	unsigned int foreground_grant_zone;
 	size_t mapping_reserved_slots;
 	unsigned int active_data_zone;
 	struct zns_base_data_write *queued_write;
@@ -7727,6 +7776,8 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	data_write_inflight = c->data_write_inflight;
 	foreground_waiters = c->foreground_waiters;
 	foreground_zone_grant = c->foreground_zone_grant;
+	foreground_grant_zone = c->foreground_zone_grant ?
+		c->foreground_grant_zone_idx : ZNS_BASE_NO_ZONE;
 	list_for_each_entry(queued_write, &c->data_write_queue, node) {
 		data_write_queued++;
 		data_write_queued_blocks += queued_write->mapping_count;
@@ -7744,10 +7795,10 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		(unsigned long long)gc_moved_blocks,
 		(unsigned long long)discarded_blocks,
 		gc_error, gc_last_error);
-	DMEMIT("data_write_inflight=%u data_write_queued=%u data_write_queued_blocks=%u data_write_error=%d mapping_reserved_slots=%zu foreground_waiters=%u foreground_zone_grant=%u active_data_zone=%u active_data_wp=%llu ",
+	DMEMIT("data_write_inflight=%u data_write_queued=%u data_write_queued_blocks=%u data_write_error=%d mapping_reserved_slots=%zu foreground_waiters=%u foreground_zone_grant=%u foreground_grant_zone=%u active_data_zone=%u active_data_wp=%llu ",
 		data_write_inflight, data_write_queued, data_write_queued_blocks,
 		data_write_error, mapping_reserved_slots, foreground_waiters,
-		foreground_zone_grant, active_data_zone,
+		foreground_zone_grant, foreground_grant_zone, active_data_zone,
 		(unsigned long long)active_data_wp);
 	DMEMIT("wal_zone=%u wal_generation=%llu wal_used_blocks=%llu wal_capacity_blocks=%llu wal_staged_records=%u wal_error=%d ",
 		wal_zone_idx, (unsigned long long)wal_generation,

@@ -22,12 +22,16 @@ record.
   logical block.  It is updated under `c->lock`, restored from the checkpoint,
   and advanced by WAL replay.  GC conditional publish compares this exact
   version instead of doing a sleeping SSTable lookup per relocated record.
-- A successful reset observed by `foreground_waiters` creates a persistent
-  `foreground_zone_grant`.  GC yields immediately, and the writer promotes the
-  still-open GC destination to ACTIVE instead of consuming the reset victim.
-  The reset victim therefore remains FREE for the next relocation round.  The
-  grant is consumed only during activation, so admission stays stable after
-  the waiter count is decremented.
+- A successful reset observed by `foreground_waiters` creates a persistent,
+  zone-specific `foreground_zone_grant`.  If another FREE zone remains for GC
+  destination rotation, the writer receives the completely empty reset victim
+  and therefore a full-zone runway.  Under tighter space pressure it promotes
+  the still-open GC destination and preserves the reset victim as reserve.
+  The grant is consumed only during activation, so admission stays stable.
+- While a foreground writer is waiting, GC validates every FULL candidate and
+  relocates the one with the greatest measured reclaimable extent.  It no
+  longer accepts the first candidate that merely clears the minimum threshold;
+  this avoids copying an almost-live zone when a much staler victim exists.
 - `gc_min_reclaim_percent` defaults to 10.  Background GC defers victims below
   that reclaim ratio.  Under foreground pressure it scans all candidates and
   retries the best sub-threshold victim if no better victim exists.
@@ -45,7 +49,7 @@ foreground-wins conditional publication remain in place.
 ## Diagnostics
 
 `dmsetup status` now includes `foreground_waiters` and
-`foreground_zone_grant`.  With
+`foreground_zone_grant` and `foreground_grant_zone`.  With
 `gc_diagnostics=1`, policy decisions also emit `victim deferred` and
 `victim fallback` records.  Existing `phase=move`, `move-cost`,
 `foreground-space-wait`, WAL, and reset diagnostics remain available.
