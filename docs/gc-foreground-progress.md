@@ -28,13 +28,20 @@ record.
   and therefore a full-zone runway.  Under tighter space pressure it promotes
   the still-open GC destination and preserves the reset victim as reserve.
   The grant is consumed only during activation, so admission stays stable.
-- While a foreground writer is waiting, GC validates every FULL candidate and
-  relocates the one with the greatest measured reclaimable extent.  It no
-  longer accepts the first candidate that merely clears the minimum threshold;
-  this avoids copying an almost-live zone when a much staler victim exists.
+- `valid_blocks` is maintained as a conservative live-block count, so
+  `nr_blocks - valid_blocks` is a continuously available reclaimable hint.
+  Foreground emergency GC ranks FULL zones by this hint, exactly validates only
+  the best candidate, and relocates it immediately.  It no longer puts a full
+  multi-zone validation pass on the blocked writer's critical path.
+- The foreground rollover admission floor is the greater of the hard GC
+  reserve and `gc_low_watermark`.  With the defaults, a writer begins waiting
+  at three FREE zones instead of consuming inventory down to the final reserve.
+  A zone-specific reset grant still bypasses the floor, so emergency progress
+  does not depend on reaching the background high watermark.
 - `gc_min_reclaim_percent` defaults to 10.  Background GC defers victims below
-  that reclaim ratio.  Under foreground pressure it scans all candidates and
-  retries the best sub-threshold victim if no better victim exists.
+  that reclaim ratio.  Foreground emergency GC bypasses this quality threshold
+  after validating its single ranked candidate because bounded latency takes
+  priority once a writer is blocked.
 - `gc_clean_zone_cooldown_ms` defaults to 30000.  A completely live zone is not
   repeatedly scanned by background GC during this interval.  An exact mapping
   invalidation clears the cooldown, and foreground pressure ignores it.
@@ -51,7 +58,7 @@ foreground-wins conditional publication remain in place.
 `dmsetup status` now includes `foreground_waiters` and
 `foreground_zone_grant` and `foreground_grant_zone`.  With
 `gc_diagnostics=1`, policy decisions also emit `victim deferred` and
-`victim fallback` records.  Existing `phase=move`, `move-cost`,
+`victim emergency` records.  Existing `phase=move`, `move-cost`,
 `foreground-space-wait`, WAL, and reset diagnostics remain available.
 
 ## Validation

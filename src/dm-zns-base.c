@@ -132,7 +132,7 @@ MODULE_PARM_DESC(data_zone_capacity_mib,
 static unsigned int gc_low_watermark = GC_DEFAULT_LOW_WATERMARK;
 module_param(gc_low_watermark, uint, 0444);
 MODULE_PARM_DESC(gc_low_watermark,
-	"free data-zone count at or below which background GC is scheduled");
+	"free data-zone floor that schedules GC and paces foreground zone rollover");
 
 static unsigned int gc_target_free_zones = GC_DEFAULT_TARGET_FREE_ZONES;
 module_param(gc_target_free_zones, uint, 0444);
@@ -671,6 +671,8 @@ static int zns_base_gc_move_blocks(struct zns_base_c *c,
 static int zns_base_reset_victim(struct zns_base_c *c, struct zns_base_zone *victim);
 static unsigned int zns_base_count_free_zones(struct zns_base_c *c);
 static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c);
+static unsigned int zns_base_foreground_admission_floor_locked(
+	struct zns_base_c *c);
 static int zns_base_select_victim(struct zns_base_c *c, struct zns_base_zone **victim_out);
 static int zns_base_gc_validate_victim(struct zns_base_c *c,
 		struct zns_base_zone *victim, unsigned int *stale_blocks,
@@ -2054,14 +2056,13 @@ static void zns_base_gc_work(struct work_struct *work)
 {
   	struct zns_base_c *c;
 	struct zns_base_zone *victim = NULL;
-	struct zns_base_zone *fallback_victim = NULL;
 	unsigned int slot = 0;
 	unsigned int reclaimable_blocks;
-	unsigned int fallback_reclaimable = 0;
+	unsigned int estimated_reclaimable;
 	unsigned long phase_started, next_report;
 	struct zns_base_gc_read_buffer read_buffer = { 0 };
 	const char *phase = "select";
-	bool force_fallback = false;
+	bool foreground_emergency;
   	int ret;
 
 	c = container_of(work, struct zns_base_c, gc_work);
@@ -2095,8 +2096,9 @@ static void zns_base_gc_work(struct work_struct *work)
 		    c->foreground_zone_grant ||
 		    (c->foreground_waiters &&
 		     zns_base_count_free_zones(c) >
-			zns_base_foreground_reserve_locked(c)) ||
-		    zns_base_count_free_zones(c) >=
+			zns_base_foreground_admission_floor_locked(c)) ||
+		    (!c->foreground_waiters &&
+		     zns_base_count_free_zones(c) >=
 		    gc_target_free_zones) {
   			spin_unlock(&c->lock);
   			break;
@@ -2114,27 +2116,11 @@ static void zns_base_gc_work(struct work_struct *work)
 		read_buffer.write_blocks = 0;
 		read_buffer.lookup_ns = read_buffer.reserve_ns = 0;
 		read_buffer.read_ns = read_buffer.write_ns = read_buffer.wal_ns = 0;
+		spin_lock(&c->lock);
+		foreground_emergency = c->foreground_waiters != 0;
+		spin_unlock(&c->lock);
 		ret = zns_base_select_victim(c, &victim);
 		if (ret == -ENOENT) {
-			/* Under real foreground pressure, retry the best sub-threshold
-			 * candidate after all FULL zones have been measured. */
-			if (fallback_victim) {
-				spin_lock(&c->lock);
-				if (fallback_victim->state == ZNS_BASE_ZONE_FULL) {
-					fallback_victim->gc_skip_run = 0;
-					force_fallback = true;
-					spin_unlock(&c->lock);
-					if (gc_diagnostics)
-						DMINFO("gc-diag: victim fallback victim=%u reclaimable=%u",
-						       (unsigned int)(fallback_victim -
-							c->zone_state.zones),
-						       fallback_reclaimable);
-					continue;
-				}
-				spin_unlock(&c->lock);
-				fallback_victim = NULL;
-				fallback_reclaimable = 0;
-			}
 			/* No useful FULL victim is not corruption.  A proactive GC can
 			 * legitimately run while the current ACTIVE zone still has room.
 			 * End this round without poisoning every later foreground write;
@@ -2145,6 +2131,7 @@ static void zns_base_gc_work(struct work_struct *work)
 		}
 		if (ret)
 			break;
+		estimated_reclaimable = victim->nr_blocks - victim->valid_blocks;
 
 		/* valid_blocks is deliberately conservative after a foreground write
 		 * misses in RAM.  Resolve the candidate exactly before spending a GC
@@ -2163,6 +2150,13 @@ static void zns_base_gc_work(struct work_struct *work)
 			zns_base_release_victim(c, victim);
 			break;
 		}
+		/* A writer may have reached the admission floor while background
+		 * validation was in progress.  Switch this victim to emergency policy
+		 * immediately instead of paying for another selection round. */
+		spin_lock(&c->lock);
+		foreground_emergency = foreground_emergency ||
+			c->foreground_waiters != 0;
+		spin_unlock(&c->lock);
 		if (!reclaimable_blocks) {
 			spin_lock(&c->lock);
 			victim->gc_skip_run = c->gc_runs;
@@ -2176,56 +2170,30 @@ static void zns_base_gc_work(struct work_struct *work)
 			zns_base_release_victim(c, victim);
 			continue;
 		}
-		/* valid_blocks is only an upper bound before exact validation.  Under
-		 * foreground pressure, accepting the first zone above the minimum
-		 * threshold can copy almost an entire zone while a much staler FULL zone
-		 * is available.  Validate every candidate once in this run and relocate
-		 * only the one with the largest measured reclaimable extent. */
-		if (!force_fallback) {
-			bool foreground_waiting;
-
-			spin_lock(&c->lock);
-			foreground_waiting = c->foreground_waiters != 0;
-			if (foreground_waiting)
-				victim->gc_skip_run = c->gc_runs;
-			spin_unlock(&c->lock);
-			if (foreground_waiting) {
-				if (!fallback_victim ||
-				    reclaimable_blocks > fallback_reclaimable) {
-					fallback_victim = victim;
-					fallback_reclaimable = reclaimable_blocks;
-				}
-				if (gc_diagnostics)
-					DMINFO("gc-diag: victim measured victim=%u reclaimable=%u foreground_waiting=1",
-					       (unsigned int)(victim - c->zone_state.zones),
-					       reclaimable_blocks);
-				zns_base_release_victim(c, victim);
-				continue;
-			}
-		}
-		if (gc_min_reclaim_percent && !force_fallback &&
+		/* valid_blocks is a conservative live-block count and therefore a safe
+		 * reclaimable lower-bound.  zns_base_select_victim() already ranks FULL
+		 * zones by that continuously maintained hint.  Once a writer is blocked,
+		 * validate that single best candidate and move it immediately: scanning
+		 * every FULL zone here put 9--13 seconds of catalog work directly on the
+		 * foreground critical path.  Background GC retains the quality threshold
+		 * and may search for another candidate. */
+		if (foreground_emergency && gc_diagnostics)
+			DMINFO("gc-diag: victim emergency victim=%u estimated_reclaimable=%u exact_reclaimable=%u",
+			       (unsigned int)(victim - c->zone_state.zones),
+			       estimated_reclaimable,
+			       reclaimable_blocks);
+		if (gc_min_reclaim_percent && !foreground_emergency &&
 		    (u64)reclaimable_blocks * 100 <
 			(u64)victim->nr_blocks * gc_min_reclaim_percent) {
-			bool foreground_waiting;
-
 			spin_lock(&c->lock);
-			foreground_waiting = c->foreground_waiters != 0;
 			victim->gc_skip_run = c->gc_runs;
-			if (!foreground_waiting)
-				victim->gc_skip_until = jiffies +
-					msecs_to_jiffies(gc_clean_zone_cooldown_ms);
+			victim->gc_skip_until = jiffies +
+				msecs_to_jiffies(gc_clean_zone_cooldown_ms);
 			spin_unlock(&c->lock);
-			if (foreground_waiting &&
-			    (!fallback_victim ||
-			     reclaimable_blocks > fallback_reclaimable)) {
-				fallback_victim = victim;
-				fallback_reclaimable = reclaimable_blocks;
-			}
 			if (gc_diagnostics)
-				DMINFO("gc-diag: victim deferred victim=%u reclaimable=%u threshold_pct=%u foreground_waiting=%u",
+				DMINFO("gc-diag: victim deferred victim=%u reclaimable=%u threshold_pct=%u foreground_waiting=0",
 				       (unsigned int)(victim - c->zone_state.zones),
-				       reclaimable_blocks, gc_min_reclaim_percent,
-				       foreground_waiting);
+				       reclaimable_blocks, gc_min_reclaim_percent);
 			zns_base_release_victim(c, victim);
 			continue;
 		}
@@ -2329,9 +2297,6 @@ static void zns_base_gc_work(struct work_struct *work)
 		/* Re-evaluate pressure after every successful reset.  In particular,
 		 * never retain a newly freed victim merely to chase the background high
 		 * watermark while an upper write is already waiting. */
-		fallback_victim = NULL;
-		fallback_reclaimable = 0;
-		force_fallback = false;
   	}
 
 	if (ret)
@@ -2994,6 +2959,22 @@ static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c)
 	return reserve;
 }
 
+/* Keep foreground allocation ahead of the hard relocation reserve.  The low
+ * watermark is normally three zones while the hard reserve is two, so a zone
+ * rollover begins waiting while GC still has working room instead of after
+ * free space has collapsed to zero or one.  A reset grant bypasses this floor
+ * for exactly the zone chosen by GC, preserving the deadlock-free emergency
+ * handoff.  Caller holds c->lock. */
+static unsigned int zns_base_foreground_admission_floor_locked(
+	struct zns_base_c *c)
+{
+	unsigned int reserve = zns_base_foreground_reserve_locked(c);
+
+	if (c->quiescing || c->foreground_zone_grant)
+		return reserve;
+	return max(reserve, gc_low_watermark);
+}
+
 static bool zns_base_gc_space_ready(struct zns_base_c *c)
 {
   	bool ready;
@@ -3003,7 +2984,7 @@ static bool zns_base_gc_space_ready(struct zns_base_c *c)
 	ready = c->stopping ||
 		c->gc_error ||
 		zns_base_count_free_zones(c) >
-			zns_base_foreground_reserve_locked(c) ||
+			zns_base_foreground_admission_floor_locked(c) ||
 		(!c->gc_running && !c->gc_scheduled);
 
   	spin_unlock(&c->lock);
@@ -3036,7 +3017,7 @@ static int zns_base_wait_for_gc_space(struct zns_base_c *c)
   		}
 
 		if (zns_base_count_free_zones(c) >
-		    zns_base_foreground_reserve_locked(c)) {
+		    zns_base_foreground_admission_floor_locked(c)) {
 			ret = 0;
 			goto out_unlock;
 		}
@@ -3055,7 +3036,7 @@ static int zns_base_wait_for_gc_space(struct zns_base_c *c)
 		if (gc_diagnostics && !attempted_gc) {
 			spin_lock(&c->lock);
 			free_zones = zns_base_count_free_zones(c);
-			reserve = zns_base_foreground_reserve_locked(c);
+			reserve = zns_base_foreground_admission_floor_locked(c);
 			spin_unlock(&c->lock);
 			DMINFO("gc-diag: phase=foreground-space-wait begin free=%u reserve=%u",
 			       free_zones, reserve);
@@ -4113,7 +4094,7 @@ static int zns_base_activate_next_zone(struct zns_base_c *c)
 	sector_t zone_end;
 
 	if (zns_base_count_free_zones(c) <=
-	    zns_base_foreground_reserve_locked(c))
+	    zns_base_foreground_admission_floor_locked(c))
   		return -EAGAIN;
 
 	/* A reset grant names the exact zone selected under the GC lock.  It may be

@@ -85,8 +85,12 @@ struct zns_base_zone {
 - `slots`: zone 내부 4 KiB slot마다 `logical_block`, `valid`, `pending`을 둔 reverse map
 - `valid_blocks`: GC victim 선정의 기준이며, overwrite된 이전 PBA는 invalid 처리됩니다.
 
-DATA zone은 `GC_RESERVE_ZONES=2`를 남겨둡니다. free zone이 low watermark 이하가
-되면 GC가 실행되어, 일반 write가 모든 free zone을 소모해 GC가 멈추는 상황을 피합니다.
+DATA zone은 `GC_RESERVE_ZONES=2`를 hard reserve로 남겨둡니다. free zone이 low
+watermark 이하가 되면 GC를 실행하는 동시에 다음 foreground zone rollover를
+일시 정지합니다. GC가 reset한 zone을 명시적으로 grant하면 이 admission floor를
+우회해 진행하므로, 일반 write가 reserve를 먼저 소모하거나 high watermark를
+기다리며 교착되는 상황을 피합니다. Foreground emergency GC는 `valid_blocks` 기반
+reclaimable 힌트로 후보를 고르고 해당 후보 하나만 정확 검증합니다.
 
 ---
 

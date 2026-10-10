@@ -37,6 +37,7 @@ struct zns_base_c {
              unsigned int nr_zones, active_zone_idx, gc_dest_zone_idx; } zone_state;
     unsigned int reserve;
     int data_write_error;
+    bool quiescing;
     bool foreground_zone_grant;
     unsigned int foreground_grant_zone_idx;
 };
@@ -50,6 +51,14 @@ static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c) {
     if (c->foreground_zone_grant)
         return 0;
     return c->reserve;
+}
+static unsigned int gc_low_watermark = 1;
+static unsigned int zns_base_foreground_admission_floor_locked(
+    struct zns_base_c *c) {
+    unsigned int reserve = zns_base_foreground_reserve_locked(c);
+    if (c->quiescing || c->foreground_zone_grant)
+        return reserve;
+    return reserve > gc_low_watermark ? reserve : gc_low_watermark;
 }
 '''
         cases = r'''

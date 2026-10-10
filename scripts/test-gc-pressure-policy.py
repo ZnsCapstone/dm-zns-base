@@ -31,23 +31,36 @@ class GCPressurePolicyTests(unittest.TestCase):
         invalidate = function_body('static bool zns_base_invalidate_entry_slot_locked(')
         self.assertIn('zone->gc_skip_until = 0;', invalidate)
 
-    def test_low_reclaim_scans_for_best_emergency_fallback(self):
+    def test_low_reclaim_threshold_is_background_only(self):
         worker = function_body('static void zns_base_gc_work(')
         self.assertIn('gc_min_reclaim_percent', worker)
-        self.assertIn('fallback_reclaimable', worker)
-        self.assertIn('fallback_victim->gc_skip_run = 0;', worker)
-        self.assertIn('foreground_waiting', worker)
+        self.assertIn('!foreground_emergency', worker)
+        self.assertIn('victim emergency', worker)
 
-    def test_foreground_measures_every_candidate_before_relocation(self):
+    def test_foreground_validates_only_ranked_emergency_candidate(self):
         worker = function_body('static void zns_base_gc_work(')
-        measure = 'victim measured victim=%u reclaimable=%u foreground_waiting=1'
-        fallback = 'victim fallback victim=%u reclaimable=%u'
+        emergency = 'victim emergency victim=%u estimated_reclaimable=%u exact_reclaimable=%u'
         move = 'phase=move begin victim=%u slots=%u reclaimable=%u'
-        self.assertIn(measure, worker)
-        self.assertIn(fallback, worker)
+        self.assertIn(emergency, worker)
         self.assertIn(move, worker)
-        self.assertIn('reclaimable_blocks > fallback_reclaimable', worker)
-        self.assertLess(worker.index(measure), worker.index(move))
+        self.assertNotIn('victim measured', worker)
+        self.assertNotIn('fallback_victim', worker)
+        self.assertLess(worker.index(emergency), worker.index(move))
+
+    def test_foreground_rollover_uses_low_watermark_admission_floor(self):
+        floor = function_body(
+            'static unsigned int zns_base_foreground_admission_floor_locked(')
+        self.assertIn('max(reserve, gc_low_watermark)', floor)
+        self.assertIn('c->foreground_zone_grant', floor)
+        ready = function_body('static bool zns_base_gc_space_ready(')
+        wait = function_body('static int zns_base_wait_for_gc_space(')
+        activate = function_body('static int zns_base_activate_next_zone(')
+        worker = function_body('static void zns_base_gc_work(')
+        self.assertIn('zns_base_foreground_admission_floor_locked(c)', ready)
+        self.assertIn('zns_base_foreground_admission_floor_locked(c)', wait)
+        self.assertIn('zns_base_foreground_admission_floor_locked(c)', activate)
+        self.assertIn('zns_base_foreground_admission_floor_locked(c)', worker)
+        self.assertIn('!c->foreground_waiters &&', worker)
 
     def test_gc_destination_counts_as_one_reserve_and_reset_grant_yields(self):
         reserve = function_body('static unsigned int zns_base_foreground_reserve_locked(')
