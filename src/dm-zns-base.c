@@ -2099,7 +2099,7 @@ static void zns_base_gc_work(struct work_struct *work)
 			zns_base_foreground_admission_floor_locked(c)) ||
 		    (!c->foreground_waiters &&
 		     zns_base_count_free_zones(c) >=
-		    gc_target_free_zones) {
+		     gc_target_free_zones)) {
   			spin_unlock(&c->lock);
   			break;
   		}
