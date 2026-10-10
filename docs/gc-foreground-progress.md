@@ -39,10 +39,12 @@ record.
   the low watermark can relocate an almost entirely live zone before ongoing
   overwrites have created enough reclaimable space.  A zone-specific reset
   grant still bypasses the hard reserve for deadlock-free emergency progress.
-- `gc_min_reclaim_percent` defaults to 10.  Background GC defers victims below
+- `gc_min_reclaim_percent` defaults to 20.  Background GC defers victims below
   that reclaim ratio.  Foreground emergency GC bypasses this quality threshold
   after validating its single ranked candidate because bounded latency takes
-  priority once a writer is blocked.
+  priority once a writer is blocked.  The higher background threshold avoids
+  relocating up to 90% of a zone merely to reclaim 10%, reducing steady-state
+  write amplification while free-zone headroom still exists.
 - `gc_clean_zone_cooldown_ms` defaults to 30000.  A completely live zone is not
   repeatedly scanned by background GC during this interval.  An exact mapping
   invalidation clears the cooldown, and foreground pressure ignores it.

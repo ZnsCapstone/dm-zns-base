@@ -21,6 +21,11 @@ def function_body(signature: str) -> str:
 
 
 class GCPressurePolicyTests(unittest.TestCase):
+    def test_background_gc_requires_twenty_percent_reclaim_by_default(self):
+        self.assertIn('static unsigned int gc_min_reclaim_percent = 20;', SOURCE)
+        worker = function_body('static void zns_base_gc_work(')
+        self.assertIn('(u64)victim->nr_blocks * gc_min_reclaim_percent', worker)
+
     def test_clean_zone_cooldown_is_cross_run_and_invalidated_early(self):
         self.assertIn('static unsigned int gc_clean_zone_cooldown_ms = 30000;', SOURCE)
         select = function_body('static int zns_base_select_victim(')
@@ -37,10 +42,15 @@ class GCPressurePolicyTests(unittest.TestCase):
         self.assertIn('!foreground_emergency', worker)
         self.assertIn('victim emergency', worker)
 
+    def test_move_diagnostics_report_gc_write_amplification_inputs(self):
+        worker = function_body('static void zns_base_gc_work(')
+        self.assertIn('live=%u reclaimable=%u reclaim_pct=%u', worker)
+        self.assertIn('victim->nr_blocks - reclaimable_blocks', worker)
+
     def test_foreground_validates_only_ranked_emergency_candidate(self):
         worker = function_body('static void zns_base_gc_work(')
         emergency = 'victim emergency victim=%u estimated_reclaimable=%u exact_reclaimable=%u'
-        move = 'phase=move begin victim=%u slots=%u reclaimable=%u'
+        move = 'phase=move begin victim=%u slots=%u live=%u reclaimable=%u reclaim_pct=%u'
         self.assertIn(emergency, worker)
         self.assertIn(move, worker)
         self.assertNotIn('victim measured', worker)

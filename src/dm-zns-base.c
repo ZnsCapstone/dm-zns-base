@@ -142,7 +142,7 @@ MODULE_PARM_DESC(gc_target_free_zones,
 /* Avoid spending a relocation zone on nearly-clean victims while other FULL
  * zones may offer materially more stale space.  Under foreground pressure the
  * best candidate found in the current scan is still used as a fallback. */
-static unsigned int gc_min_reclaim_percent = 10;
+static unsigned int gc_min_reclaim_percent = 20;
 module_param(gc_min_reclaim_percent, uint, 0444);
 MODULE_PARM_DESC(gc_min_reclaim_percent,
 	"prefer victims with at least this percentage reclaimable (0 disables)");
@@ -2200,9 +2200,13 @@ static void zns_base_gc_work(struct work_struct *work)
 		phase_started = jiffies;
 		next_report = phase_started + 5 * HZ;
 		if (gc_diagnostics)
-			DMINFO("gc-diag: phase=move begin victim=%u slots=%u reclaimable=%u",
+			DMINFO("gc-diag: phase=move begin victim=%u slots=%u live=%u reclaimable=%u reclaim_pct=%u",
 			       (unsigned int)(victim - c->zone_state.zones),
-			       victim->nr_blocks, reclaimable_blocks);
+			       victim->nr_blocks,
+			       victim->nr_blocks - reclaimable_blocks,
+			       reclaimable_blocks,
+			       (unsigned int)div_u64((u64)reclaimable_blocks * 100,
+						     victim->nr_blocks));
 		/* Validation already removed every stale reverse-map slot.  An entirely
 		 * reclaimable victim therefore needs no relocation destination at all.
 		 * This case is especially important at free=0: asking the batched mover
