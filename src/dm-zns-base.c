@@ -2198,7 +2198,14 @@ static void zns_base_gc_work(struct work_struct *work)
 			DMINFO("gc-diag: phase=move begin victim=%u slots=%u reclaimable=%u",
 			       (unsigned int)(victim - c->zone_state.zones),
 			       victim->nr_blocks, reclaimable_blocks);
-		for (slot = 0; slot < victim->nr_blocks;) {
+		/* Validation already removed every stale reverse-map slot.  An entirely
+		 * reclaimable victim therefore needs no relocation destination at all.
+		 * This case is especially important at free=0: asking the batched mover
+		 * for a destination first would return -ENOSPC forever even though this
+		 * victim itself can be reset immediately and break the space deadlock. */
+		if (reclaimable_blocks == victim->nr_blocks)
+			slot = victim->nr_blocks;
+		for (; slot < victim->nr_blocks;) {
 			unsigned int consumed = 1;
 
 			if (gc_diagnostics && time_after_eq(jiffies, next_report)) {
@@ -2917,19 +2924,18 @@ static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c)
 {
 	unsigned int reserve = GC_RESERVE_ZONES;
 
-	/* During teardown there is no future GC round to reserve for.  Under live
-	 * foreground pressure an existing GC destination is itself sufficient
-	 * reserve after the current victim has been reset; let the writer consume
-	 * that newly FREE victim instead of forcing a second long relocation. */
+	/* During teardown there is no future GC round to reserve for. */
 	if (c->quiescing)
 		return 0;
 	/* Keep admission stable across wait_for_gc_space() returning and the
 	 * subsequent activate_next_zone() call.  Making this depend on the transient
-	 * waiter count creates an EAGAIN retry loop when free=1 and a GC destination
-	 * already exists.  The destination itself is the complete relocation
-	 * reserve, so the remaining FREE zone is safe for foreground activation. */
+	 * waiter count creates an EAGAIN retry loop.  An existing destination counts
+	 * as one of the reserved zones, but it may fill while relocating the current
+	 * victim.  Keep the other reserve zone FREE so GC can rotate its destination;
+	 * otherwise foreground can consume the last FREE zone and strand GC at
+	 * free=0 with -ENOSPC. */
 	if (c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE)
-		return 0;
+		return GC_RESERVE_ZONES ? GC_RESERVE_ZONES - 1 : 0;
 	return reserve;
 }
 
