@@ -147,6 +147,20 @@ module_param(gc_min_reclaim_percent, uint, 0444);
 MODULE_PARM_DESC(gc_min_reclaim_percent,
 	"prefer victims with at least this percentage reclaimable (0 disables)");
 
+/* Preserve a high-quality background policy while there is runway in the
+ * current ACTIVE zone, then relax it before foreground allocation reaches the
+ * hard reserve.  This avoids both 10%-reclaim write amplification and the
+ * starvation observed with a fixed 20% threshold. */
+static unsigned int gc_pressure_reclaim_percent = 10;
+module_param(gc_pressure_reclaim_percent, uint, 0444);
+MODULE_PARM_DESC(gc_pressure_reclaim_percent,
+	"reclaim threshold when active-zone runway becomes limited");
+
+static unsigned int gc_pressure_active_percent = 25;
+module_param(gc_pressure_active_percent, uint, 0444);
+MODULE_PARM_DESC(gc_pressure_active_percent,
+	"enter pressure GC after this percentage of the active data zone is used");
+
 /* A FULL zone proven completely live cannot create free capacity.  Remember
  * that result across GC work invocations instead of rescanning it every few
  * seconds; an exact reverse-map invalidation clears the cooldown early. */
@@ -671,7 +685,9 @@ static int zns_base_gc_move_blocks(struct zns_base_c *c,
 static int zns_base_reset_victim(struct zns_base_c *c, struct zns_base_zone *victim);
 static unsigned int zns_base_count_free_zones(struct zns_base_c *c);
 static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c);
-static int zns_base_select_victim(struct zns_base_c *c, struct zns_base_zone **victim_out);
+static bool zns_base_gc_pressure_mode_locked(struct zns_base_c *c);
+static int zns_base_select_victim(struct zns_base_c *c, bool urgent,
+		struct zns_base_zone **victim_out);
 static int zns_base_gc_validate_victim(struct zns_base_c *c,
 		struct zns_base_zone *victim, unsigned int *stale_blocks,
 		struct zns_base_gc_read_buffer *read_buffer);
@@ -2057,10 +2073,12 @@ static void zns_base_gc_work(struct work_struct *work)
 	unsigned int slot = 0;
 	unsigned int reclaimable_blocks;
 	unsigned int estimated_reclaimable;
+	unsigned int reclaim_threshold;
 	unsigned long phase_started, next_report;
 	struct zns_base_gc_read_buffer read_buffer = { 0 };
 	const char *phase = "select";
 	bool foreground_emergency;
+	bool background_pressure;
   	int ret;
 
 	c = container_of(work, struct zns_base_c, gc_work);
@@ -2116,8 +2134,15 @@ static void zns_base_gc_work(struct work_struct *work)
 		read_buffer.read_ns = read_buffer.write_ns = read_buffer.wal_ns = 0;
 		spin_lock(&c->lock);
 		foreground_emergency = c->foreground_waiters != 0;
+		background_pressure = !foreground_emergency &&
+			zns_base_gc_pressure_mode_locked(c);
+		reclaim_threshold = background_pressure ?
+			min(gc_min_reclaim_percent,
+			    gc_pressure_reclaim_percent) :
+			gc_min_reclaim_percent;
 		spin_unlock(&c->lock);
-		ret = zns_base_select_victim(c, &victim);
+		ret = zns_base_select_victim(c,
+			foreground_emergency || background_pressure, &victim);
 		if (ret == -ENOENT) {
 			/* No useful FULL victim is not corruption.  A proactive GC can
 			 * legitimately run while the current ACTIVE zone still has room.
@@ -2154,6 +2179,12 @@ static void zns_base_gc_work(struct work_struct *work)
 		spin_lock(&c->lock);
 		foreground_emergency = foreground_emergency ||
 			c->foreground_waiters != 0;
+		background_pressure = !foreground_emergency &&
+			zns_base_gc_pressure_mode_locked(c);
+		reclaim_threshold = background_pressure ?
+			min(gc_min_reclaim_percent,
+			    gc_pressure_reclaim_percent) :
+			gc_min_reclaim_percent;
 		spin_unlock(&c->lock);
 		if (!reclaimable_blocks) {
 			spin_lock(&c->lock);
@@ -2180,18 +2211,19 @@ static void zns_base_gc_work(struct work_struct *work)
 			       (unsigned int)(victim - c->zone_state.zones),
 			       estimated_reclaimable,
 			       reclaimable_blocks);
-		if (gc_min_reclaim_percent && !foreground_emergency &&
+		if (reclaim_threshold && !foreground_emergency &&
 		    (u64)reclaimable_blocks * 100 <
-			(u64)victim->nr_blocks * gc_min_reclaim_percent) {
+			(u64)victim->nr_blocks * reclaim_threshold) {
 			spin_lock(&c->lock);
 			victim->gc_skip_run = c->gc_runs;
 			victim->gc_skip_until = jiffies +
 				msecs_to_jiffies(gc_clean_zone_cooldown_ms);
 			spin_unlock(&c->lock);
 			if (gc_diagnostics)
-				DMINFO("gc-diag: victim deferred victim=%u reclaimable=%u threshold_pct=%u foreground_waiting=0",
+				DMINFO("gc-diag: victim deferred victim=%u reclaimable=%u threshold_pct=%u pressure=%u foreground_waiting=0",
 				       (unsigned int)(victim - c->zone_state.zones),
-				       reclaimable_blocks, gc_min_reclaim_percent);
+				       reclaimable_blocks, reclaim_threshold,
+				       background_pressure);
 			zns_base_release_victim(c, victim);
 			continue;
 		}
@@ -2200,13 +2232,14 @@ static void zns_base_gc_work(struct work_struct *work)
 		phase_started = jiffies;
 		next_report = phase_started + 5 * HZ;
 		if (gc_diagnostics)
-			DMINFO("gc-diag: phase=move begin victim=%u slots=%u live=%u reclaimable=%u reclaim_pct=%u",
+			DMINFO("gc-diag: phase=move begin victim=%u slots=%u live=%u reclaimable=%u reclaim_pct=%u threshold_pct=%u pressure=%u",
 			       (unsigned int)(victim - c->zone_state.zones),
 			       victim->nr_blocks,
 			       victim->nr_blocks - reclaimable_blocks,
 			       reclaimable_blocks,
 			       (unsigned int)div_u64((u64)reclaimable_blocks * 100,
-						     victim->nr_blocks));
+						     victim->nr_blocks),
+			       reclaim_threshold, background_pressure);
 		/* Validation already removed every stale reverse-map slot.  An entirely
 		 * reclaimable victim therefore needs no relocation destination at all.
 		 * This case is especially important at free=0: asking the batched mover
@@ -2961,6 +2994,34 @@ static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c)
 	return reserve;
 }
 
+/* Caller holds c->lock.  The quality threshold is relaxed only when free-zone
+ * headroom is within one zone of the hard reserve and the current ACTIVE zone
+ * has consumed enough of its runway.  If rollover already happened, treat the
+ * state as pressure immediately so GC can restore progress. */
+static bool zns_base_gc_pressure_mode_locked(struct zns_base_c *c)
+{
+	struct zns_base_zone *active;
+	sector_t used_sectors;
+	unsigned int active_idx = c->zone_state.active_zone_idx;
+
+	if (zns_base_count_free_zones(c) >
+	    zns_base_foreground_reserve_locked(c) + 1)
+		return false;
+	if (active_idx < ZNS_BASE_METADATA_ZONES ||
+	    active_idx >= c->zone_state.nr_zones)
+		return true;
+
+	active = &c->zone_state.zones[active_idx];
+	if (active->state != ZNS_BASE_ZONE_ACTIVE)
+		return true;
+	if (active->write_pointer < active->start_sector)
+		return true;
+
+	used_sectors = active->write_pointer - active->start_sector;
+	return (u64)used_sectors * 100 >=
+		(u64)active->capacity_sectors * gc_pressure_active_percent;
+}
+
 static bool zns_base_gc_space_ready(struct zns_base_c *c)
 {
   	bool ready;
@@ -3081,8 +3142,8 @@ static void zns_base_schedule_gc(struct zns_base_c *c)
   		queue_work(c->gc_wq, &c->gc_work);
 }
 
-static int zns_base_select_victim(struct zns_base_c *c,
-  				  struct zns_base_zone **victim_out)
+static int zns_base_select_victim(struct zns_base_c *c, bool urgent,
+				  struct zns_base_zone **victim_out)
 {
   	struct zns_base_zone *victim = NULL;
   	struct zns_base_zone *zone;
@@ -3110,10 +3171,10 @@ static int zns_base_select_victim(struct zns_base_c *c,
 		 * candidates for the exact validation pass. */
 		if (zone->gc_skip_run == c->gc_runs)
 			continue;
-		/* Cooldown avoids repeated background scans.  It must never hide the
-		 * only usable victim from a writer that is already out of space. */
-		if (!c->foreground_waiters &&
-		    time_before(jiffies, zone->gc_skip_until))
+		/* Cooldown avoids repeated high-headroom background scans.  Pressure
+		 * mode must reconsider the best hint before ACTIVE rollover; foreground
+		 * emergency uses the same urgent selection rule. */
+		if (!urgent && time_before(jiffies, zone->gc_skip_until))
 			continue;
 
   		if (!victim ||
@@ -7236,6 +7297,14 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 	if (gc_min_reclaim_percent > 100) {
 		ti->error = "invalid gc_min_reclaim_percent";
+		return -EINVAL;
+	}
+	if (gc_pressure_reclaim_percent > 100) {
+		ti->error = "invalid gc_pressure_reclaim_percent";
+		return -EINVAL;
+	}
+	if (gc_pressure_active_percent > 100) {
+		ti->error = "invalid gc_pressure_active_percent";
 		return -EINVAL;
 	}
 

@@ -24,13 +24,24 @@ class GCPressurePolicyTests(unittest.TestCase):
     def test_background_gc_requires_twenty_percent_reclaim_by_default(self):
         self.assertIn('static unsigned int gc_min_reclaim_percent = 20;', SOURCE)
         worker = function_body('static void zns_base_gc_work(')
-        self.assertIn('(u64)victim->nr_blocks * gc_min_reclaim_percent', worker)
+        self.assertIn('(u64)victim->nr_blocks * reclaim_threshold', worker)
+
+    def test_pressure_gc_relaxes_threshold_before_active_rollover(self):
+        self.assertIn('static unsigned int gc_pressure_reclaim_percent = 10;', SOURCE)
+        self.assertIn('static unsigned int gc_pressure_active_percent = 25;', SOURCE)
+        pressure = function_body('static bool zns_base_gc_pressure_mode_locked(')
+        self.assertIn('zns_base_foreground_reserve_locked(c) + 1', pressure)
+        self.assertIn('active->capacity_sectors * gc_pressure_active_percent', pressure)
+        worker = function_body('static void zns_base_gc_work(')
+        self.assertIn('min(gc_min_reclaim_percent,', worker)
+        self.assertIn('gc_pressure_reclaim_percent', worker)
+        self.assertIn('foreground_emergency || background_pressure', worker)
 
     def test_clean_zone_cooldown_is_cross_run_and_invalidated_early(self):
         self.assertIn('static unsigned int gc_clean_zone_cooldown_ms = 30000;', SOURCE)
         select = function_body('static int zns_base_select_victim(')
         self.assertIn('time_before(jiffies, zone->gc_skip_until)', select)
-        self.assertIn('!c->foreground_waiters', select)
+        self.assertIn('if (!urgent &&', select)
         validate = function_body('static void zns_base_gc_work(')
         self.assertIn('msecs_to_jiffies(gc_clean_zone_cooldown_ms)', validate)
         invalidate = function_body('static bool zns_base_invalidate_entry_slot_locked(')
@@ -44,13 +55,13 @@ class GCPressurePolicyTests(unittest.TestCase):
 
     def test_move_diagnostics_report_gc_write_amplification_inputs(self):
         worker = function_body('static void zns_base_gc_work(')
-        self.assertIn('live=%u reclaimable=%u reclaim_pct=%u', worker)
+        self.assertIn('live=%u reclaimable=%u reclaim_pct=%u threshold_pct=%u pressure=%u', worker)
         self.assertIn('victim->nr_blocks - reclaimable_blocks', worker)
 
     def test_foreground_validates_only_ranked_emergency_candidate(self):
         worker = function_body('static void zns_base_gc_work(')
         emergency = 'victim emergency victim=%u estimated_reclaimable=%u exact_reclaimable=%u'
-        move = 'phase=move begin victim=%u slots=%u live=%u reclaimable=%u reclaim_pct=%u'
+        move = 'phase=move begin victim=%u slots=%u live=%u reclaimable=%u reclaim_pct=%u threshold_pct=%u pressure=%u'
         self.assertIn(emergency, worker)
         self.assertIn(move, worker)
         self.assertNotIn('victim measured', worker)
