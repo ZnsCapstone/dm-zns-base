@@ -28,6 +28,19 @@ def function(name):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_blocking_wal_has_independent_bio_submission_queue(self):
+        # 구조 회귀 검사이며 실제 커널 스케줄링 검증을 대신하지 않는다.
+        submit = function("submit_bio_deferred")
+        self.assertIn("queue_work(zns_bio_wq, &dw->work)", submit)
+        self.assertNotIn("queue_work(zns_wq,", submit)
+        self.assertIn("zone_dispatch_wait_turn", function("wal_page_append_sync"))
+        init = function("zns_base_init")
+        self.assertIn('alloc_workqueue("dm_zns_base_bio"', init)
+        self.assertEqual(init.count("destroy_workqueue(zns_bio_wq)"), 6)
+        teardown = function("zns_base_exit")
+        self.assertGreater(teardown.index("destroy_workqueue(zns_bio_wq)"),
+                           teardown.index("destroy_workqueue(zns_wq)"))
+
     def test_gc_preserves_foreground_active_tail(self):
         worker = function("gc_work_fn")
         self.assertNotRegex(worker,
