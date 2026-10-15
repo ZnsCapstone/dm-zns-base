@@ -23,6 +23,7 @@ int skiplist_init(struct skiplist *sl)
 	sl->head->level = SKIPLIST_MAX_LEVEL;  /* head 자신의 forward[] 크기 (고정값) */
 	sl->level = 1;   /* "지금 실제로 쓰이는" 최고 층수. 데이터가 없으니 최소값 1부터 */
 	sl->count = 0;   /* 엔트리 개수. memtable flush 트리거 판단에 쓰임 */
+	sl->allocated_bytes = sizeof(*sl) + ksize(sl->head);
 	return 0;
 }
 
@@ -133,6 +134,7 @@ int skiplist_upsert(struct skiplist *sl, u64 lba, u64 phys, u64 *old_phys_out)
 	}
 
 	sl->count++;  /* 실제로 새 엔트리가 늘어난 경우에만 증가 (갱신 경로는 여기 안 옴) */
+	sl->allocated_bytes += ksize(n);
 	return 0;     // 신규 삽입됨
 }
 
