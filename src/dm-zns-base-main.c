@@ -19,6 +19,7 @@
 #include <linux/crc32.h>
 #include <linux/jiffies.h>
 #include <linux/math64.h>
+#include <linux/ktime.h>
 
 #include "skiplist.h"
 
@@ -29,6 +30,9 @@ static unsigned int gc_diag_budget;
 module_param(gc_diag_budget, uint, 0444);
 MODULE_PARM_DESC(gc_diag_budget, "maximum live>used mapping audits per module load (0 disables)");
 static atomic_t gc_diag_events = ATOMIC_INIT(0);
+static bool metrics_enabled;
+module_param(metrics_enabled, bool, 0444);
+MODULE_PARM_DESC(metrics_enabled, "enable optional evaluation counters exposed in dmsetup status");
 
 /* bio 완료 콜백에서 다음 bio를 이어붙일 땐 반드시 이 워크큐로 미뤄 process
  * context에서 제출한다 — submit_bio()는 논블로킹이 아니라 atomic context에서
@@ -183,6 +187,18 @@ struct append_waiter {
 
 struct zns_base_c {
 	struct dm_dev *dev;
+	atomic64_t metric_logical_write_bytes;
+	atomic64_t metric_logical_read_bytes;
+	atomic64_t metric_write_bytes[ZONE_TAG_COUNT];
+	atomic64_t metric_gc_runs, metric_gc_ns, metric_gc_reclaims;
+	atomic64_t metric_gc_moved_bytes;
+	atomic64_t metric_compaction_runs, metric_compaction_ns;
+	atomic64_t metric_compaction_input_bytes, metric_compaction_output_bytes;
+	atomic64_t metric_gc_scratch_bytes, metric_compaction_scratch_bytes;
+	atomic64_t metric_foreground_wait_ns, metric_foreground_wait_count;
+	atomic64_t metric_flush_started_ns, metric_flush_runs, metric_flush_ns;
+	atomic64_t metric_flush_write_bytes;
+	u64 metric_mapping_peak_bytes; /* protected by c->lock */
 
 	sector_t 		nr_sectors;
 	struct zone_pool *zp;
@@ -246,6 +262,7 @@ struct pending_write_bio {
 	struct bio *bio;
 	sector_t lba;
 	sector_t nr;
+	u64 metric_queued_ns;
 };
 
 struct memtable_flush_work {
@@ -639,6 +656,9 @@ static void dispatch_fire_submit_bio(void *arg)
 /* zone_dispatch_gate의 가장 흔한 쓰임 — "차례가 되면 이 bio를 제출". */
 static void zone_dispatch_write(struct zns_base_c *c, sector_t phys, sector_t nr, struct bio *bio)
 {
+	if (metrics_enabled)
+		atomic64_add((u64)nr * 512, &c->metric_write_bytes[
+			READ_ONCE(c->zp->zone_tag[zone_of(c->zp, phys)])]);
 	if (zone_dispatch_gate(c, phys, nr, dispatch_fire_submit_bio, bio)) {
 		DMERR("zone dispatch: out of memory queuing write (zone %u, phys %llu) — failing this write",
 		      zone_of(c->zp, phys), (unsigned long long)phys);
@@ -675,6 +695,9 @@ static int zone_append_write(struct zns_base_c *c, unsigned int zid, struct bio 
 
 	spin_lock_irq(&c->lock);
 	if (c->zp->append_ready[zid]) {
+		if (metrics_enabled)
+			atomic64_add(bio->bi_iter.bi_size,
+				&c->metric_write_bytes[c->zp->zone_tag[zid]]);
 		spin_unlock_irq(&c->lock);
 		submit_bio_deferred(bio);
 		return 0;
@@ -685,6 +708,9 @@ static int zone_append_write(struct zns_base_c *c, unsigned int zid, struct bio 
 		return -ENOMEM;
 	}
 	w->bio = bio;
+	if (metrics_enabled)
+		atomic64_add(bio->bi_iter.bi_size,
+			&c->metric_write_bytes[c->zp->zone_tag[zid]]);
 	list_add_tail(&w->link, &c->zp->append_waiters[zid]);
 	spin_unlock_irq(&c->lock);
 	return 0;
@@ -818,6 +844,9 @@ static int sstable_io_sync(struct zns_base_c *c, unsigned int op,
 			rem -= len;
 			page_done += len;
 		}
+		if (metrics_enabled && (op & REQ_OP_MASK) == REQ_OP_WRITE)
+			atomic64_add(chunk, &c->metric_write_bytes[
+				READ_ONCE(c->zp->zone_tag[zone_of(c->zp, cur)])]);
 		ret = submit_bio_wait(bio);
 		bio_put(bio);
 		if (ret)
@@ -1636,6 +1665,8 @@ static int wal_page_append_sync(struct zns_base_c *c, sector_t reserved_phys,
 		return -EIO;
 	}
 	zone_dispatch_wait_turn(c, reserved_phys, nr_sectors);
+	if (metrics_enabled)
+		atomic64_add((u64)nr_sectors * 512, &c->metric_write_bytes[ZONE_TAG_WAL]);
 	ret = submit_bio_wait(bio);
 	bio_put(bio);
 	return ret;
@@ -1845,6 +1876,9 @@ static void flush_chain_end(struct zns_base_c *c)
 {
 	bool advanced = false;
 	bool need_gc;
+	u64 started = metrics_enabled ? atomic64_xchg(&c->metric_flush_started_ns, 0) : 0;
+	if (started)
+		atomic64_add(ktime_get_ns() - started, &c->metric_flush_ns);
 
 	spin_lock_irq(&c->lock);
 	if (--c->wal_ckpt_inflight == 0 && !c->checkpoint_failed &&
@@ -2062,6 +2096,8 @@ static void submit_sstable_write_async(struct zns_io_ctx *ctx)
 
 	bio->bi_end_io = sstable_write_chunk_done;
 	bio->bi_private = ctx;
+	if (metrics_enabled)
+		atomic64_add(chunk_bytes, &c->metric_flush_write_bytes);
 	zone_dispatch_write(c, chunk_phys, chunk_sectors, bio);
 }
 
@@ -2160,6 +2196,10 @@ static void flush_memtable_async(struct zns_base_c *c, struct skiplist *old_memt
 		release_frozen_memtable(c, old_memtable, false);
 		flush_chain_end(c);
 		return;
+	}
+	if (metrics_enabled) {
+		atomic64_set(&c->metric_flush_started_ns, ktime_get_ns());
+		atomic64_inc(&c->metric_flush_runs);
 	}
 
 	/* 512(헤더 1섹터) + 레코드들(16B*count)을 섹터 단위로 올림 */
@@ -2657,6 +2697,7 @@ static void compaction_work_fn(struct work_struct *work)
 	bool retry_gc = false;
 	u64 out_seq_no = 0;
 	u64 merged_min_lba = 0, merged_max_lba = 0;
+	u64 metric_started = 0;
 
 	spin_lock_irq(&c->lock);
 	if (c->nr_sstables < k) {
@@ -2680,6 +2721,10 @@ static void compaction_work_fn(struct work_struct *work)
 	}
 	memcpy(snapshot, c->sstables, snap_count * sizeof(*snapshot));
 	spin_unlock_irq(&c->lock);
+	if (metrics_enabled) {
+		metric_started = ktime_get_ns();
+		atomic64_inc(&c->metric_compaction_runs);
+	}
 
 	/* 가장 오래된(seq_no 최소) k개를 victim으로 — 정렬 후 앞 k개 */
 	sort(snapshot, snap_count, sizeof(*snapshot), sstable_info_cmp_seq_asc, NULL);
@@ -2710,6 +2755,9 @@ static void compaction_work_fn(struct work_struct *work)
 	}
 
 	merged_count = merge_sstable_sources(srcs, k, merged, discarded, &discarded_count);
+	if (metrics_enabled)
+		atomic64_add(total_input_records * sizeof(struct sstable_record),
+			&c->metric_compaction_input_bytes);
 	apply_discarded_invalid_counts(c, discarded, discarded_count);
 
 	if (merged_count == 0) {
@@ -2730,6 +2778,14 @@ static void compaction_work_fn(struct work_struct *work)
 	if (!out_buf) {
 		DMERR("compaction: out of memory serializing merged SSTable, aborting this run");
 		goto out_free_sources;
+	}
+	if (metrics_enabled) {
+		u64 scratch = (u64)snap_cap * sizeof(*snapshot) + (u64)k * sizeof(*srcs) +
+			round_up(total_input_records * sizeof(*merged), 512) +
+			max_t(u64, total_input_records, 1) * sizeof(*discarded) + alloc_bytes;
+		for (i = 0; i < k; i++)
+			scratch += round_up(snapshot[i].record_count * sizeof(struct sstable_record), 512);
+		atomic64_set(&c->metric_compaction_scratch_bytes, scratch);
 	}
 
 	/* 압축 결과는 새 논리 쓰기가 아니다. next_seq_no를 붙이면
@@ -2840,6 +2896,8 @@ static void compaction_work_fn(struct work_struct *work)
 			/* flush 경로(async)와 같은 SSTABLE 태그 zone을 두고 경쟁할 수
 			 * 있으므로 순서 게이트를 반드시 거친다 */
 			zone_dispatch_wait_turn(c, hbio->bi_iter.bi_sector, 1);
+			if (metrics_enabled)
+				atomic64_add(512, &c->metric_write_bytes[ZONE_TAG_SSTABLE]);
 			ret = submit_bio_wait(hbio);
 			bio_put(hbio);
 			kfree(zhdr);
@@ -2865,6 +2923,8 @@ compaction_header_failed:
 	}
 
 	/* 여기서부터 커밋 — 새 SSTable은 이제 완전히 durable함 */
+	if (metrics_enabled)
+		atomic64_add((u64)nr_sectors * 512, &c->metric_compaction_output_bytes);
 	{
 		unsigned int *zones_to_check = kmalloc_array(k, sizeof(unsigned int), GFP_KERNEL);
 		unsigned int nr_zones_to_check = 0;
@@ -2928,6 +2988,9 @@ out_free_sources:
 	kvfree(discarded);
 out_free_snapshot:
 	kvfree(snapshot);
+	if (metric_started)
+		atomic64_add(ktime_get_ns() - metric_started, &c->metric_compaction_ns);
+	atomic64_set(&c->metric_compaction_scratch_bytes, 0);
 	if (rotation_pending_owned) {
 		spin_lock_irq(&c->lock);
 		c->sstable_rotation_pending = false;
@@ -4004,6 +4067,10 @@ static enum gc_reclaim_result gc_reclaim_one_victim(struct zns_base_c *c,
 	if (!ok)
 		goto out_free_snapshot;
 	cycle->latest = live_map;
+	if (metrics_enabled)
+		atomic64_set(&c->metric_gc_scratch_bytes,
+			(u64)live_map.capacity * sizeof(*live_map.entries) +
+			(u64)snap_count * sizeof(*snapshot));
 	cycle->sstables = snapshot;
 	cycle->nr_sstables = snap_count;
 	cycle->built = true;
@@ -4018,6 +4085,10 @@ refresh_current:
 		int refresh_ret = gc_refresh_live_map(c, &live_map);
 
 		cycle->latest = live_map; /* resize may have replaced its allocation */
+		if (metrics_enabled)
+			atomic64_set(&c->metric_gc_scratch_bytes,
+				(u64)live_map.capacity * sizeof(*live_map.entries) +
+				(u64)snap_count * sizeof(*snapshot));
 		if (refresh_ret) {
 			DMERR("gc: live-map refresh failed (err=%d), no reset", refresh_ret);
 			goto out_free_snapshot;
@@ -4228,6 +4299,11 @@ refresh_current:
 		       jiffies_to_msecs(jiffies - relocation_started),
 		       jiffies_to_msecs(jiffies - victim_started));
 		reclaimed = true;
+		if (metrics_enabled) {
+			atomic64_inc(&c->metric_gc_reclaims);
+			atomic64_add((u64)nr_relocated * BLOCK_SECTORS * 512,
+				&c->metric_gc_moved_bytes);
+		}
 	}
 
 out_free_snapshot:
@@ -4426,6 +4502,10 @@ static void pending_write_work_fn(struct work_struct *work)
 		if (stopping) {
 			pending->bio->bi_status = BLK_STS_IOERR;
 			bio_endio(pending->bio);
+			if (pending->metric_queued_ns) {
+				atomic64_add(ktime_get_ns() - pending->metric_queued_ns, &c->metric_foreground_wait_ns);
+				atomic64_inc(&c->metric_foreground_wait_count);
+			}
 			kfree(pending);
 			continue;
 		}
@@ -4435,6 +4515,10 @@ static void pending_write_work_fn(struct work_struct *work)
 			mod_delayed_work(zns_wq, &c->pending_write_work,
 					 msecs_to_jiffies(20));
 			return;
+		}
+		if (pending->metric_queued_ns) {
+			atomic64_add(ktime_get_ns() - pending->metric_queued_ns, &c->metric_foreground_wait_ns);
+			atomic64_inc(&c->metric_foreground_wait_count);
 		}
 
 		spin_lock_irq(&c->lock);
@@ -4462,6 +4546,7 @@ static void gc_work_fn(struct work_struct *work)
 	unsigned int no_progress;
 	bool log_no_progress_state = false;
 	bool foreground_waiting;
+	u64 metric_started = 0;
 
 	if (READ_ONCE(c->metadata_failed) || READ_ONCE(c->stopping) ||
 	    READ_ONCE(c->sstable_rotation_pending) ||
@@ -4495,6 +4580,11 @@ static void gc_work_fn(struct work_struct *work)
 		DMINFO("gc: deferred while checkpoint/flush is in flight (inflight=%u, free_zones=%u)",
 		       ckpt_inflight, free_at_start);
 		return;
+	}
+	if (metrics_enabled) {
+		metric_started = ktime_get_ns();
+		atomic64_inc(&c->metric_gc_runs);
+		DMINFO("metrics: gc begin monotonic_ns=%llu", metric_started);
 	}
 	DMINFO("gc: worker started (free_zones=%u, start=%u, stop=%u, reserve=%u)",
 	       free_at_start, gc_low_watermark, gc_stop_watermark(),
@@ -4549,6 +4639,11 @@ static void gc_work_fn(struct work_struct *work)
 	kvfree(cycle.excluded);
 
 out_finish:
+	if (metric_started) {
+		atomic64_add(ktime_get_ns() - metric_started, &c->metric_gc_ns);
+		DMINFO("metrics: gc end monotonic_ns=%llu reclaimed=%u", ktime_get_ns(), reclaimed);
+	}
+	atomic64_set(&c->metric_gc_scratch_bytes, 0);
 	spin_lock_irq(&c->lock);
 	if (reclaimed)
 		c->gc_no_progress = 0;
@@ -4987,6 +5082,8 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		int ret;
 		struct pending_write_bio *pending;
 		bool backlog;
+		if (metrics_enabled)
+			atomic64_add((u64)nr * 512, &c->metric_logical_write_bytes);
 
 		/* 매핑/WAL/GC의 최소 단위는 4KB다. 부분 write를 그대로
 		 * append하면 read-modify-write 없이 나머지 섹터를 잃게 되므로
@@ -5016,6 +5113,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		pending->bio = bio;
 		pending->lba = block_lba;
 		pending->nr = nr;
+		pending->metric_queued_ns = metrics_enabled ? ktime_get_ns() : 0;
 		INIT_LIST_HEAD(&pending->link);
 		spin_lock_irq(&c->lock);
 		list_add_tail(&pending->link, &c->pending_write_bios);
@@ -5064,6 +5162,8 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		unsigned int nr_sst, actual_nr, nmatch, i;
 		struct sstable_info *candidates;
 		struct sstable_read_ctx *rctx;
+		if (metrics_enabled)
+			atomic64_add((u64)nr * 512, &c->metric_logical_read_bytes);
 
 		spin_lock_irq(&c->lock);
 		found = mapping_get(c, block_lba, &phys);
@@ -5168,6 +5268,39 @@ static void zns_base_status(struct dm_target *ti, status_type_t type, unsigned i
 	unsigned int sz =0;
 
 	if (type == STATUSTYPE_INFO) {
+		if (metrics_enabled) {
+			u64 bytes;
+			spin_lock_irq(&c->lock);
+			bytes = (c->memtable ? c->memtable->allocated_bytes : 0) +
+				(c->frozen_memtable ? c->frozen_memtable->allocated_bytes : 0) +
+				(u64)c->sstables_cap * sizeof(*c->sstables);
+			c->metric_mapping_peak_bytes = max(c->metric_mapping_peak_bytes, bytes);
+			DMEMIT("metrics=1 mapping_resident_bytes=%llu mapping_sampled_peak_bytes=%llu ",
+			       bytes, c->metric_mapping_peak_bytes);
+			DMEMIT("free_zones=%u memtable_entries=%u frozen_entries=%u sstable_count=%u ",
+			       gc_count_free_zones(c->zp), c->memtable ? c->memtable->count : 0,
+			       c->frozen_memtable ? c->frozen_memtable->count : 0, c->nr_sstables);
+			spin_unlock_irq(&c->lock);
+			DMEMIT("logical_write_bytes=%lld user_write_bytes=%lld gc_write_bytes=%lld wal_write_bytes=%lld sstable_write_bytes=%lld gc_runs=%lld gc_ns=%lld gc_reclaims=%lld gc_moved_bytes=%lld compaction_runs=%lld compaction_ns=%lld compaction_input_bytes=%lld compaction_output_bytes=%lld ",
+			       atomic64_read(&c->metric_logical_write_bytes),
+			       atomic64_read(&c->metric_write_bytes[ZONE_TAG_USER_DATA]),
+			       atomic64_read(&c->metric_write_bytes[ZONE_TAG_GC_DATA]),
+			       atomic64_read(&c->metric_write_bytes[ZONE_TAG_WAL]),
+			       atomic64_read(&c->metric_write_bytes[ZONE_TAG_SSTABLE]),
+			       atomic64_read(&c->metric_gc_runs), atomic64_read(&c->metric_gc_ns),
+			       atomic64_read(&c->metric_gc_reclaims), atomic64_read(&c->metric_gc_moved_bytes),
+			       atomic64_read(&c->metric_compaction_runs), atomic64_read(&c->metric_compaction_ns),
+			       atomic64_read(&c->metric_compaction_input_bytes), atomic64_read(&c->metric_compaction_output_bytes));
+			DMEMIT("logical_read_bytes=%lld ", atomic64_read(&c->metric_logical_read_bytes));
+			DMEMIT("gc_scratch_requested_bytes=%lld compaction_scratch_requested_bytes=%lld foreground_wait_ns=%lld foreground_wait_count=%lld ",
+			       atomic64_read(&c->metric_gc_scratch_bytes),
+			       atomic64_read(&c->metric_compaction_scratch_bytes),
+			       atomic64_read(&c->metric_foreground_wait_ns),
+			       atomic64_read(&c->metric_foreground_wait_count));
+			DMEMIT("flush_runs=%lld flush_ns=%lld flush_write_bytes=%lld ",
+			       atomic64_read(&c->metric_flush_runs), atomic64_read(&c->metric_flush_ns),
+			       atomic64_read(&c->metric_flush_write_bytes));
+		}
 		DMEMIT("zones=%u zone_sectors=%llu active[user_data]=%u wp:",
 		       c->zp->nr_zones, (unsigned long long)c->zp->zone_sectors,
 		       c->zp->active_zone[ZONE_TAG_USER_DATA]);

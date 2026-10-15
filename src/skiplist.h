@@ -18,6 +18,7 @@ struct skiplist {
 	struct skiplist_node *head;  // sentinel, forward[]는 항상 SKIPLIST_MAX_LEVEL 크기
 	unsigned int level;          // 지금까지 실제 쓰인 최대 층수
 	unsigned int count;          // 엔트리 개수 (flush 트리거 판단에 씀)
+	u64 allocated_bytes; /* container + actual slab allocations; caller's lock */
 };
 
 /* sl은 호출자가 kzalloc으로 미리 할당해서 넘김. head sentinel만 여기서 준비 */
