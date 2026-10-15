@@ -34,6 +34,9 @@ static atomic_t gc_diag_events = ATOMIC_INIT(0);
  * context에서 제출한다 — submit_bio()는 논블로킹이 아니라 atomic context에서
  * 부르면 죽을 수 있음(admission control이 내부에서 schedule()을 부를 수 있음). */
 static struct workqueue_struct *zns_wq;
+/* WAL worker가 dispatch 차례를 기다리는 동안에도 선행 I/O는 제출되어야 한다.
+ * 동기 대기 worker와 bio 제출을 같은 단일 실행 큐에 넣지 않는다. */
+static struct workqueue_struct *zns_bio_wq;
 
 /* compaction 전용 워크큐 — bio 제출과 큐를 분리해 서로 지연을 안 주게 함 */
 static struct workqueue_struct *zns_compaction_wq;
@@ -79,7 +82,7 @@ static void submit_bio_deferred(struct bio *bio)
 	}
 	INIT_WORK(&dw->work, deferred_bio_submit_fn);
 	dw->bio = bio;
-	queue_work(zns_wq, &dw->work);
+	queue_work(zns_bio_wq, &dw->work);
 }
 
 enum zone_tag {
@@ -5248,6 +5251,11 @@ static int __init zns_base_init(void)
 {
 	int ret;
 
+	zns_bio_wq = alloc_workqueue("dm_zns_base_bio",
+				    WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+	if (!zns_bio_wq)
+		return -ENOMEM;
+
 	/* WQ_MEM_RECLAIM: 이 워크큐가 막히면 그 위 I/O가 영원히 안 풀리므로
 	 * 메모리 회수 경로에서도 최소 진행 보장 필요. WQ_UNBOUND + max_active=1:
 	 * bound 워크큐의 CPU별 풀이 순서를 뒤바꿀 가능성을 없애려던 최초
@@ -5255,6 +5263,7 @@ static int __init zns_base_init(void)
 	zns_wq = alloc_workqueue("dm_zns_base", WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
 	if (!zns_wq) {
 		DMERR("failed to allocate workqueue");
+		destroy_workqueue(zns_bio_wq);
 		return -ENOMEM;
 	}
 
@@ -5264,6 +5273,7 @@ static int __init zns_base_init(void)
 	if (!zns_compaction_wq) {
 		DMERR("failed to allocate compaction workqueue");
 		destroy_workqueue(zns_wq);
+		destroy_workqueue(zns_bio_wq);
 		return -ENOMEM;
 	}
 
@@ -5273,6 +5283,7 @@ static int __init zns_base_init(void)
 		DMERR("failed to allocate gc workqueue");
 		destroy_workqueue(zns_compaction_wq);
 		destroy_workqueue(zns_wq);
+		destroy_workqueue(zns_bio_wq);
 		return -ENOMEM;
 	}
 
@@ -5283,6 +5294,7 @@ static int __init zns_base_init(void)
 		destroy_workqueue(zns_gc_wq);
 		destroy_workqueue(zns_compaction_wq);
 		destroy_workqueue(zns_wq);
+		destroy_workqueue(zns_bio_wq);
 		return -ENOMEM;
 	}
 
@@ -5294,6 +5306,7 @@ static int __init zns_base_init(void)
 		destroy_workqueue(zns_gc_wq);
 		destroy_workqueue(zns_compaction_wq);
 		destroy_workqueue(zns_wq);
+		destroy_workqueue(zns_bio_wq);
 		return -ENOMEM;
 	}
 
@@ -5305,6 +5318,7 @@ static int __init zns_base_init(void)
 		destroy_workqueue(zns_gc_wq);
 		destroy_workqueue(zns_compaction_wq);
 		destroy_workqueue(zns_wq);
+		destroy_workqueue(zns_bio_wq);
 	} else {
 		DMINFO("target registered");
 	}
@@ -5319,6 +5333,7 @@ static void __exit zns_base_exit(void)
 	destroy_workqueue(zns_gc_wq);
 	destroy_workqueue(zns_compaction_wq);
 	destroy_workqueue(zns_wq);
+	destroy_workqueue(zns_bio_wq);
 	DMINFO("target unregistered");
 }
 
