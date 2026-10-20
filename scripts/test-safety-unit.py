@@ -28,6 +28,31 @@ def function(name):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_wal_stage_diagnostics_cover_wait_and_completion(self):
+        worker=function('wal_batch_work_fn')
+        self.assertIn('WD_READY_NS',worker)
+        self.assertIn('WD_WORKER_NS',worker)
+        self.assertLess(worker.index('diag_complete_start ='),worker.index('wal_commit_ctx(ctx,'))
+        self.assertGreater(worker.index('WD_COMPLETE_NS'),worker.index('wal_commit_ctx(ctx,'))
+        io=function('wal_page_append_sync')
+        self.assertLess(io.index('zone_dispatch_wait_turn'),io.index('WD_DISPATCH_NS'))
+        self.assertLess(io.index('submit_bio_wait'),io.index('WD_SUBMIT_NS'))
+
+    def test_wal_diagnostics_preserve_scheduling_and_retry(self):
+        self.assertIn('static bool wal_timing_enabled;', SOURCE)
+        self.assertIn('static unsigned int wal_batch_delay_ms = 2;', SOURCE)
+        submit = function('submit_wal_async')
+        self.assertIn('mod_delayed_work', submit)
+        self.assertIn('queue_delayed_work(zns_wal_wq, &c->wal_batch_work,', submit)
+        self.assertIn('msecs_to_jiffies(wal_batch_delay_ms)', submit)
+        self.assertIn('if (full)\n\t\tmod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);', submit)
+        self.assertLess(submit.index('queue_delayed_work'), submit.index('spin_unlock_irq'))
+        worker = function('wal_batch_work_fn')
+        self.assertGreater(worker.index('WD_BATCHES'), worker.index('if (ret == -ENOSPC)'))
+        self.assertIn('wal_page_append_sync(c, wal_phys, page, wal_sectors, true)', worker)
+        commit = function('wal_commit_ctx')
+        self.assertLess(commit.index('WD_ACK_NS'), commit.index('kfree(ctx);', commit.index('WD_ACK_NS')))
+
     def test_blocking_wal_has_independent_bio_submission_queue(self):
         # 구조 회귀 검사이며 실제 커널 스케줄링 검증을 대신하지 않는다.
         submit = function("submit_bio_deferred")
@@ -36,10 +61,22 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("zone_dispatch_wait_turn", function("wal_page_append_sync"))
         init = function("zns_base_init")
         self.assertIn('alloc_workqueue("dm_zns_base_bio"', init)
-        self.assertEqual(init.count("destroy_workqueue(zns_bio_wq)"), 6)
+        self.assertEqual(init.count("destroy_workqueue(zns_bio_wq)"), 7)
         teardown = function("zns_base_exit")
         self.assertGreater(teardown.index("destroy_workqueue(zns_bio_wq)"),
                            teardown.index("destroy_workqueue(zns_wq)"))
+
+    def test_wal_uses_dedicated_serial_queue_on_all_paths(self):
+        self.assertNotRegex(SOURCE, r'(?:mod|queue)_delayed_work\(zns_wq,\s*&c->wal_batch_work')
+        init = function('zns_base_init')
+        self.assertIn('alloc_workqueue("dm_zns_base_wal",\n\t\t\t\t     WQ_UNBOUND | WQ_MEM_RECLAIM, 1)', init)
+        # 이후 초기화 실패 4개와 target 등록 실패에서 모두 회수한다.
+        self.assertEqual(init.count('destroy_workqueue(zns_wal_wq)'), 5)
+        self.assertIn('destroy_workqueue(zns_wal_wq)', function('zns_base_exit'))
+        worker = function('wal_batch_work_fn')
+        self.assertIn('mod_delayed_work(zns_wal_wq, &c->wal_batch_work,', worker)
+        self.assertLess(worker.index('wal_page_append_sync(c,'),
+                        worker.index('wal_commit_ctx(ctx,'))
 
     def test_gc_preserves_foreground_active_tail(self):
         worker = function("gc_work_fn")

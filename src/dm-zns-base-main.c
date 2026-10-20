@@ -33,11 +33,38 @@ static atomic_t gc_diag_events = ATOMIC_INIT(0);
 static bool metrics_enabled;
 module_param(metrics_enabled, bool, 0444);
 MODULE_PARM_DESC(metrics_enabled, "enable optional evaluation counters exposed in dmsetup status");
+/* 진단 전용. 기본 경로에는 timestamp/atomic 갱신을 추가하지 않는다. */
+static bool wal_timing_enabled;
+module_param(wal_timing_enabled, bool, 0444);
+MODULE_PARM_DESC(wal_timing_enabled, "enable foreground WAL timing diagnostics (requires metrics_enabled)");
+
+enum wal_diag_counter {
+	WD_DATA_COUNT, WD_DATA_NS, WD_BATCHES, WD_RECORDS, WD_QUEUE_NS,
+	WD_IO_COUNT, WD_IO_NS, WD_IO_ERRORS, WD_COMMIT_COUNT, WD_COMMIT_NS,
+	WD_ACK_NS, WD_BATCH_1, WD_BATCH_2_8, WD_BATCH_9_32, WD_BATCH_33_PLUS,
+	WD_READY_COUNT, WD_READY_NS, WD_READY_SLOW,
+	WD_WORKER_COUNT, WD_WORKER_NS, WD_WORKER_SLOW,
+	WD_DISPATCH_COUNT, WD_DISPATCH_NS, WD_SUBMIT_COUNT, WD_SUBMIT_NS,
+	WD_COMPLETE_COUNT, WD_COMPLETE_NS, WD_COMPLETE_SLOW,
+	WD_COUNT
+};
+static const char * const wal_diag_names[WD_COUNT] = {
+	"data_count", "data_ns", "batches", "records", "queue_ns",
+	"io_count", "io_ns", "io_errors", "commit_count", "commit_ns",
+	"ack_ns", "batch_1", "batch_2_8", "batch_9_32", "batch_33_plus",
+	"ready_count", "ready_ns", "ready_slow",
+	"worker_count", "worker_ns", "worker_slow",
+	"dispatch_count", "dispatch_ns", "submit_count", "submit_ns",
+	"complete_count", "complete_ns", "complete_slow"
+};
 
 /* bio 완료 콜백에서 다음 bio를 이어붙일 땐 반드시 이 워크큐로 미뤄 process
  * context에서 제출한다 — submit_bio()는 논블로킹이 아니라 atomic context에서
  * 부르면 죽을 수 있음(admission control이 내부에서 schedule()을 부를 수 있음). */
 static struct workqueue_struct *zns_wq;
+/* WAL durable commit는 pending flush/write 재시도와 실행 슬롯을 공유하지 않는다.
+ * 배치 자체는 직렬 실행해 WAL 예약/기록/공개 순서를 유지한다. */
+static struct workqueue_struct *zns_wal_wq;
 /* WAL worker가 dispatch 차례를 기다리는 동안에도 선행 I/O는 제출되어야 한다.
  * 동기 대기 worker와 bio 제출을 같은 단일 실행 큐에 넣지 않는다. */
 static struct workqueue_struct *zns_bio_wq;
@@ -196,11 +223,13 @@ struct zns_base_c {
 	atomic64_t metric_compaction_input_bytes, metric_compaction_output_bytes;
 	atomic64_t metric_gc_scratch_bytes, metric_compaction_scratch_bytes;
 	atomic64_t metric_foreground_wait_ns, metric_foreground_wait_count;
+	atomic64_t wal_diag[WD_COUNT];
+	u64 diag_wal_ready_ns; /* c->lock: idle/backlog ready -> next worker entry */
 	atomic64_t metric_flush_started_ns, metric_flush_runs, metric_flush_ns;
 	atomic64_t metric_flush_write_bytes;
 	u64 metric_mapping_peak_bytes; /* protected by c->lock */
 
-	sector_t 		nr_sectors;
+	sector_t nr_sectors;
 	struct zone_pool *zp;
 	struct skiplist *memtable;  	// LBA -> phys 매핑 (M1의 map[] flat array를 대체)
 	/* One flush at a time; reads must see this until its SSTable is published. */
@@ -209,7 +238,7 @@ struct zns_base_c {
 	bool checkpoint_failed;
 	bool metadata_failed;
 	u64 read_view_epoch;
-	u64              next_seq_no;   // 다음 flush에 붙일 SSTable 세대 번호
+	u64 next_seq_no;   // 다음 flush에 붙일 SSTable 세대 번호
 
 	struct sstable_info *sstables;  // 살아있는 SSTable 색인 (append-only, krealloc으로 증가)
 	unsigned int nr_sstables;
@@ -358,12 +387,16 @@ struct zns_io_ctx {
 	struct zns_base_c *c;
 
 	/* 헤더 체인 공용 */
-	struct pending_header headers[2];  /* 최대 2개(데이터/WAL/SSTable 태그 zone 중 이번에 새로 배정된 것들) */
+	/* 현재 각 단계는 새 DATA/WAL/SSTable zone 중 하나의 헤더만 등록한다.
+	 * 2칸은 데이터/WAL 헤더를 한 번에 등록하던 이전 쓰기 경로의 크기다.
+	 */
+	struct pending_header headers[2];
 	int nr_headers;
 	int header_idx;
 	void *hdr_buf;              /* submit_header_async가 할당, header_write_done이 해제 */
 	void (*on_headers_done)(struct zns_io_ctx *ctx);
 	struct list_head wal_link;
+	u64 diag_data_start_ns, diag_wal_queued_ns;
 
 	/* WAL 레코드 쓰기 공용 — WRITE 경로에선 PUT, flush 경로 뒷단에선
 	 * CHECKPOINT를 쓸 때 재사용 */
@@ -1451,12 +1484,23 @@ static void submit_wal_async(struct zns_io_ctx *ctx)
 	bool full;
 
 	INIT_LIST_HEAD(&ctx->wal_link);
+	if (metrics_enabled && wal_timing_enabled)
+		ctx->diag_wal_queued_ns = ktime_get_ns();
 	spin_lock_irq(&c->lock);
+	if (ctx->diag_wal_queued_ns && !c->wal_batch_busy &&
+	    !c->wal_pending_count && !c->diag_wal_ready_ns)
+		c->diag_wal_ready_ns = ctx->diag_wal_queued_ns;
 	list_add_tail(&ctx->wal_link, &c->wal_pending);
 	full = ++c->wal_pending_count >= wal_batch_max_records;
+	/* 최초 예약의 deadline을 유지한다. 매 요청마다 mod하면 연속 도착이
+	 * 설정한 최대 배치 지연을 계속 연장한다. full 배치만 즉시 당긴다.
+	 * lock 안에서 예약해 enqueue와 worker drain 사이의 순서도 보존한다. */
+	if (full)
+		mod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);
+	else
+		queue_delayed_work(zns_wal_wq, &c->wal_batch_work,
+				   msecs_to_jiffies(wal_batch_delay_ms));
 	spin_unlock_irq(&c->lock);
-	mod_delayed_work(zns_wq, &c->wal_batch_work,
-			 full ? 0 : msecs_to_jiffies(wal_batch_delay_ms));
 }
 
 /* ctx->headers[ctx->header_idx]의 zone 태그 헤더를 비동기로 제출.
@@ -1531,6 +1575,8 @@ static void submit_data_append_async(struct zns_io_ctx *ctx)
 {
 	struct bio *bio = ctx->orig_bio;
 	unsigned int zid = zone_of(ctx->c->zp, ctx->reserved_phys);
+	if (metrics_enabled && wal_timing_enabled)
+		ctx->diag_data_start_ns = ktime_get_ns();
 
 	ctx->orig_sector = bio->bi_iter.bi_sector;
 	ctx->orig_opf = bio->bi_opf;
@@ -1574,6 +1620,11 @@ static void data_append_done(struct bio *bio)
 		return;
 	}
 	ctx->phys = bio->bi_iter.bi_sector;
+	if (ctx->diag_data_start_ns) {
+		atomic64_inc(&c->wal_diag[WD_DATA_COUNT]);
+		atomic64_add(ktime_get_ns() - ctx->diag_data_start_ns,
+			     &c->wal_diag[WD_DATA_NS]);
+	}
 	bio->bi_end_io = ctx->orig_end_io;
 	bio->bi_private = ctx->orig_private;
 	bio->bi_iter.bi_sector = ctx->orig_sector;
@@ -1597,6 +1648,7 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 	bool is_discard = ctx->is_discard;
 	u64 discard_blocks = ctx->discard_blocks;
 	u64 discard_i;
+	u64 diag_commit_start = 0;
 	int ret;
 
 	if (wal_status) {
@@ -1609,6 +1661,9 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 		return;
 	}
 
+	/* commit 처리 구간: lock 대기, mapping 공개, dispatch 회계 포함. */
+	if (ctx->diag_wal_queued_ns)
+		diag_commit_start = ktime_get_ns();
 	spin_lock_irq(&c->lock);
 	ret = 0;
 	if (is_discard) {
@@ -1629,6 +1684,12 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 	 * 처리해야 dispatch_wp==wp가 곧 "모든 매핑 공개 완료"를 뜻한다. */
 	if (reserved_nr)
 		zone_dispatch_cancel(c, reserved_phys, reserved_nr);
+	if (diag_commit_start && !ret) {
+		u64 now = ktime_get_ns();
+		atomic64_inc(&c->wal_diag[WD_COMMIT_COUNT]);
+		atomic64_add(now - diag_commit_start, &c->wal_diag[WD_COMMIT_NS]);
+		atomic64_add(now - ctx->diag_wal_queued_ns, &c->wal_diag[WD_ACK_NS]);
+	}
 	kfree(ctx);
 
 	if (ret) {
@@ -1650,6 +1711,7 @@ static int wal_page_append_sync(struct zns_base_c *c, sector_t reserved_phys,
 				void *buf, sector_t nr_sectors, bool fua)
 {
 	struct bio *bio = bio_alloc(GFP_KERNEL, 1);
+	u64 started;
 	int ret;
 
 	if (!bio)
@@ -1664,10 +1726,20 @@ static int wal_page_append_sync(struct zns_base_c *c, sector_t reserved_phys,
 		zone_dispatch_cancel(c, reserved_phys, nr_sectors);
 		return -EIO;
 	}
+	started = metrics_enabled && wal_timing_enabled ? ktime_get_ns() : 0;
 	zone_dispatch_wait_turn(c, reserved_phys, nr_sectors);
+	if (started) {
+		atomic64_inc(&c->wal_diag[WD_DISPATCH_COUNT]);
+		atomic64_add(ktime_get_ns() - started, &c->wal_diag[WD_DISPATCH_NS]);
+	}
 	if (metrics_enabled)
 		atomic64_add((u64)nr_sectors * 512, &c->metric_write_bytes[ZONE_TAG_WAL]);
+	started = metrics_enabled && wal_timing_enabled ? ktime_get_ns() : 0;
 	ret = submit_bio_wait(bio);
+	if (started) {
+		atomic64_inc(&c->wal_diag[WD_SUBMIT_COUNT]);
+		atomic64_add(ktime_get_ns() - started, &c->wal_diag[WD_SUBMIT_NS]);
+	}
 	bio_put(bio);
 	return ret;
 }
@@ -1704,6 +1776,9 @@ static void wal_batch_work_fn(struct work_struct *work)
 	sector_t wal_sectors;
 	int ret;
 	bool more;
+	u64 diag_io_start;
+	u64 diag_worker_start = metrics_enabled && wal_timing_enabled ? ktime_get_ns() : 0;
+	u64 diag_complete_start;
 
 	page = (struct wal_page *)get_zeroed_page(GFP_KERNEL);
 	if (!page)
@@ -1713,6 +1788,16 @@ static void wal_batch_work_fn(struct work_struct *work)
 
 	spin_lock_irq(&c->lock);
 	c->wal_batch_busy = true;
+	/* 이전 배치 처리 중 backlog 대기는 제외한다. 설정 timer, workqueue,
+	 * CPU scheduling, 입구 page 할당/lock 대기를 포함하므로 순수 scheduler 지연은 아니다. */
+	if (diag_worker_start && c->diag_wal_ready_ns) {
+		u64 elapsed = ktime_get_ns() - c->diag_wal_ready_ns;
+		atomic64_inc(&c->wal_diag[WD_READY_COUNT]);
+		atomic64_add(elapsed, &c->wal_diag[WD_READY_NS]);
+		if (elapsed >= 20000000ULL)
+			atomic64_inc(&c->wal_diag[WD_READY_SLOW]);
+		c->diag_wal_ready_ns = 0;
+	}
 	while (!list_empty(&c->wal_pending) && count < wal_batch_max_records) {
 		ctx = list_first_entry(&c->wal_pending, struct zns_io_ctx, wal_link);
 		list_move_tail(&ctx->wal_link, &batch);
@@ -1753,7 +1838,7 @@ static void wal_batch_work_fn(struct work_struct *work)
 		if (!stopping) {
 			free_page((unsigned long)page);
 			queue_work(zns_gc_wq, &c->gc_work);
-			mod_delayed_work(zns_wq, &c->wal_batch_work,
+			mod_delayed_work(zns_wal_wq, &c->wal_batch_work,
 					 msecs_to_jiffies(100));
 			return;
 		}
@@ -1763,6 +1848,16 @@ static void wal_batch_work_fn(struct work_struct *work)
 	if (ret)
 		goto complete;
 
+	if (metrics_enabled && wal_timing_enabled) {
+		u64 now = ktime_get_ns();
+		unsigned int bucket = count == 1 ? WD_BATCH_1 :
+			count <= 8 ? WD_BATCH_2_8 : count <= 32 ? WD_BATCH_9_32 : WD_BATCH_33_PLUS;
+		atomic64_inc(&c->wal_diag[WD_BATCHES]);
+		atomic64_add(count, &c->wal_diag[WD_RECORDS]);
+		atomic64_inc(&c->wal_diag[bucket]);
+		list_for_each_entry(ctx, &batch, wal_link)
+			atomic64_add(now - ctx->diag_wal_queued_ns, &c->wal_diag[WD_QUEUE_NS]);
+	}
 	count = 0;
 	list_for_each_entry(ctx, &batch, wal_link) {
 		struct wal_record *rec = wal_sectors == 1 ?
@@ -1804,7 +1899,14 @@ static void wal_batch_work_fn(struct work_struct *work)
 			zone_append_header_done(c, new_zone, 0);
 	}
 	if (!ret) {
+		diag_io_start = metrics_enabled && wal_timing_enabled ? ktime_get_ns() : 0;
 		ret = wal_page_append_sync(c, wal_phys, page, wal_sectors, true);
+		if (diag_io_start) {
+			atomic64_inc(&c->wal_diag[WD_IO_COUNT]);
+			atomic64_add(ktime_get_ns() - diag_io_start, &c->wal_diag[WD_IO_NS]);
+			if (ret)
+				atomic64_inc(&c->wal_diag[WD_IO_ERRORS]);
+		}
 		if (ret)
 			DMERR("foreground WAL append failed: err=%d zone=%u reserved=%llu+%llu records=%u new_zone=%d",
 			      ret, zone_of(c->zp, wal_phys),
@@ -1813,11 +1915,19 @@ static void wal_batch_work_fn(struct work_struct *work)
 	}
 
 complete:
+	diag_complete_start = diag_worker_start ? ktime_get_ns() : 0;
 	list_for_each_entry_safe(ctx, tmp, &batch, wal_link) {
 		bool last = list_is_last(&ctx->wal_link, &batch);
 
 		list_del_init(&ctx->wal_link);
 		wal_commit_ctx(ctx, ret ? BLK_STS_IOERR : 0, last);
+	}
+	if (diag_complete_start) {
+		u64 elapsed = ktime_get_ns() - diag_complete_start;
+		atomic64_inc(&c->wal_diag[WD_COMPLETE_COUNT]);
+		atomic64_add(elapsed, &c->wal_diag[WD_COMPLETE_NS]);
+		if (elapsed >= 20000000ULL)
+			atomic64_inc(&c->wal_diag[WD_COMPLETE_SLOW]);
 	}
 out:
 	if (page)
@@ -1825,9 +1935,18 @@ out:
 	spin_lock_irq(&c->lock);
 	c->wal_batch_busy = false;
 	more = !list_empty(&c->wal_pending);
+	if (diag_worker_start) {
+		u64 now = ktime_get_ns();
+		atomic64_inc(&c->wal_diag[WD_WORKER_COUNT]);
+		atomic64_add(now - diag_worker_start, &c->wal_diag[WD_WORKER_NS]);
+		if (now - diag_worker_start >= 20000000ULL)
+			atomic64_inc(&c->wal_diag[WD_WORKER_SLOW]);
+		if (more)
+			c->diag_wal_ready_ns = now;
+	}
 	spin_unlock_irq(&c->lock);
 	if (more)
-		mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
+		mod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);
 	else
 		mod_delayed_work(zns_wq, &c->pending_flush_work, 0);
 }
@@ -1835,8 +1954,8 @@ out:
 /* flush bio를 DM core에 반복 반환하면 대형-zone GC 동안 재큐잉이 수만 번
  * 누적되어 상위 파일시스템에 IOERR로 끝날 수 있다. 매핑 PUT의 WAL이 전부
  * durable해진 뒤에만 하위 장치로 제출하되, 그동안 bio 소유권은 타깃이
- * 유지한다. 이 worker는 기다리지 않고 재예약하므로 WAL worker와 같은
- * 단일 zns_wq에서도 순환 대기가 생기지 않는다. */
+ * 유지한다. 이 worker는 기다리지 않고 재예약하며 WAL 전용 큐의
+ * 실행 슬롯을 점유하지 않는다. */
 static void pending_flush_work_fn(struct work_struct *work)
 {
 	struct zns_base_c *c = container_of(to_delayed_work(work),
@@ -1854,7 +1973,7 @@ static void pending_flush_work_fn(struct work_struct *work)
 	spin_unlock_irq(&c->lock);
 
 	if (wal_busy) {
-		mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
+		mod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);
 		mod_delayed_work(zns_wq, &c->pending_flush_work,
 				 msecs_to_jiffies(20));
 		return;
@@ -4670,7 +4789,7 @@ out_finish:
 	/* WAL 공간 부족으로 보류된 foreground bio가 있으면 100ms 타이머를
 	 * 기다리지 않고 방금 회수한 공간을 즉시 사용하게 한다. */
 	if (reclaimed && READ_ONCE(c->wal_pending_count))
-		mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
+		mod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);
 	if (reclaimed)
 		mod_delayed_work(zns_wq, &c->pending_write_work, 0);
 }
@@ -4729,7 +4848,7 @@ static void wal_reclaim_work_fn(struct work_struct *work)
 		       victim, (unsigned long long)durable);
 		if (rotation_completed) {
 			DMINFO("WAL rotation: old generation reclaimed; foreground resumed");
-			mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
+			mod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);
 			mod_delayed_work(zns_wq, &c->pending_write_work, 0);
 		}
 	}
@@ -5047,7 +5166,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 		if (wal_busy) {
 			pending = kmalloc(sizeof(*pending), GFP_NOWAIT);
 			if (!pending) {
-				mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
+				mod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);
 				return DM_MAPIO_REQUEUE;
 			}
 			pending->bio = bio;
@@ -5055,7 +5174,7 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 			spin_lock_irq(&c->lock);
 			list_add_tail(&pending->link, &c->pending_flush_bios);
 			spin_unlock_irq(&c->lock);
-			mod_delayed_work(zns_wq, &c->wal_batch_work, 0);
+			mod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);
 			mod_delayed_work(zns_wq, &c->pending_flush_work,
 					 msecs_to_jiffies(20));
 			return DM_MAPIO_SUBMITTED;
@@ -5270,6 +5389,13 @@ static void zns_base_status(struct dm_target *ti, status_type_t type, unsigned i
 	if (type == STATUSTYPE_INFO) {
 		if (metrics_enabled) {
 			u64 bytes;
+			if (wal_timing_enabled) {
+				DMEMIT("wal_diag=1 wal_delay_ms=%u wal_max_records=%u ",
+				       wal_batch_delay_ms, wal_batch_max_records);
+				for (i = 0; i < WD_COUNT; i++)
+					DMEMIT("wal_diag_%s=%lld ", wal_diag_names[i],
+					       atomic64_read(&c->wal_diag[i]));
+			}
 			spin_lock_irq(&c->lock);
 			bytes = (c->memtable ? c->memtable->allocated_bytes : 0) +
 				(c->frozen_memtable ? c->frozen_memtable->allocated_bytes : 0) +
@@ -5399,12 +5525,20 @@ static int __init zns_base_init(void)
 		destroy_workqueue(zns_bio_wq);
 		return -ENOMEM;
 	}
+	zns_wal_wq = alloc_workqueue("dm_zns_base_wal",
+				     WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+	if (!zns_wal_wq) {
+		destroy_workqueue(zns_wq);
+		destroy_workqueue(zns_bio_wq);
+		return -ENOMEM;
+	}
 
 	/* compaction은 bio 제출 경로가 아니라 WQ_MEM_RECLAIM 불필요 —
 	 * max_active=1로 device당 compaction이 겹쳐 돌지 않게 제한 */
 	zns_compaction_wq = alloc_workqueue("dm_zns_base_compaction", 0, 1);
 	if (!zns_compaction_wq) {
 		DMERR("failed to allocate compaction workqueue");
+		destroy_workqueue(zns_wal_wq);
 		destroy_workqueue(zns_wq);
 		destroy_workqueue(zns_bio_wq);
 		return -ENOMEM;
@@ -5414,6 +5548,7 @@ static int __init zns_base_init(void)
 	zns_gc_wq = alloc_workqueue("dm_zns_base_gc", 0, 1);
 	if (!zns_gc_wq) {
 		DMERR("failed to allocate gc workqueue");
+		destroy_workqueue(zns_wal_wq);
 		destroy_workqueue(zns_compaction_wq);
 		destroy_workqueue(zns_wq);
 		destroy_workqueue(zns_bio_wq);
@@ -5424,6 +5559,7 @@ static int __init zns_base_init(void)
 	zns_wal_reclaim_wq = alloc_workqueue("dm_zns_base_wal_reclaim", 0, 1);
 	if (!zns_wal_reclaim_wq) {
 		DMERR("failed to allocate wal reclaim workqueue");
+		destroy_workqueue(zns_wal_wq);
 		destroy_workqueue(zns_gc_wq);
 		destroy_workqueue(zns_compaction_wq);
 		destroy_workqueue(zns_wq);
@@ -5435,6 +5571,7 @@ static int __init zns_base_init(void)
 				       WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
 	if (!zns_flush_wq) {
 		DMERR("failed to allocate flush workqueue");
+		destroy_workqueue(zns_wal_wq);
 		destroy_workqueue(zns_wal_reclaim_wq);
 		destroy_workqueue(zns_gc_wq);
 		destroy_workqueue(zns_compaction_wq);
@@ -5446,6 +5583,7 @@ static int __init zns_base_init(void)
 	ret = dm_register_target(&zns_base_target);
 	if (ret < 0) {
 		DMERR("target registration failed: %d", ret);
+		destroy_workqueue(zns_wal_wq);
 		destroy_workqueue(zns_flush_wq);
 		destroy_workqueue(zns_wal_reclaim_wq);
 		destroy_workqueue(zns_gc_wq);
@@ -5461,6 +5599,7 @@ static int __init zns_base_init(void)
 static void __exit zns_base_exit(void)
 {
 	dm_unregister_target(&zns_base_target);
+	destroy_workqueue(zns_wal_wq);
 	destroy_workqueue(zns_flush_wq);
 	destroy_workqueue(zns_wal_reclaim_wq);
 	destroy_workqueue(zns_gc_wq);
