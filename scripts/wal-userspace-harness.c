@@ -17,6 +17,8 @@ struct zns_io_ctx {
     u64 diag_wal_queued_ns;
 };
 static bool metrics_enabled, wal_timing_enabled;
+/* 기존 timer 테스트는 기본 durable 정책만 검증한다. writeback은 별도 harness. */
+static bool wal_try_buffer_write(struct zns_io_ctx *ctx) { (void)ctx; return false; }
 static unsigned int wal_batch_max_records = 127, wal_batch_delay_ms;
 static int zns_wal_wq;
 static u64 now_ns, due_ns = UINT64_MAX, arrival[256];

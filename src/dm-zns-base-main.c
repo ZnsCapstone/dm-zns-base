@@ -171,6 +171,12 @@ static unsigned int wal_batch_delay_ms = 2;
 module_param(wal_batch_delay_ms, uint, 0444);
 MODULE_PARM_DESC(wal_batch_delay_ms, "maximum foreground WAL group-commit delay in ms");
 
+/* 실험 전용. Kepler 380daed의 volatile overlay/durability boundary 설계를
+ * 참고한 독립 구현. 기본값은 기존의 모든 쓰기 durable 완료 정책이다. */
+static bool wal_writeback;
+module_param(wal_writeback, bool, 0444);
+MODULE_PARM_DESC(wal_writeback, "experimental volatile WAL overlay; persist on barriers/group full (default off)");
+
 /* 회귀 테스트에서 WAL 공간 부족 경로를 결정적으로 재현하기 위한 fault
  * injection. 0(기본값)이면 실제 동작에는 아무 영향이 없다. */
 static unsigned int wal_batch_alloc_failures;
@@ -251,7 +257,13 @@ struct zns_base_c {
 	struct delayed_work wal_batch_work;
 	struct list_head wal_pending;
 	unsigned int wal_pending_count;
+	unsigned int wal_pending_buffered_count;
+	unsigned int wal_buffered_count; /* pending + worker가 보유한 조기 완료 PUT */
+	u64 wal_buffered_acks;
+	u64 wal_buffered_commits;
+	u64 wal_buffered_errors;
 	bool wal_batch_busy;
+	bool wal_batch_has_waiters;
 	struct delayed_work pending_flush_work;
 	struct list_head pending_flush_bios;
 	struct delayed_work pending_write_work;
@@ -1438,6 +1450,7 @@ schedule_memtable_flush_locked(struct zns_base_c *c, bool force)
 	sector_t flushed_split_off;
 
 	if (c->gc_active || c->sstable_rotation_pending ||
+	    (wal_writeback && (c->wal_batch_busy || !list_empty(&c->wal_pending))) ||
 	    c->wal_ckpt_inflight || c->metadata_failed ||
 	    (!force && c->wal_rotation_pending) ||
 	    c->stopping || (!force && c->memtable->count < flush_threshold) ||
@@ -1476,12 +1489,67 @@ schedule_memtable_flush_locked(struct zns_base_c *c, bool force)
 	return flush_work;
 }
 
+/* 데이터 append가 끝난 일반 PUT만 조기 완료한다. lock 안에서 매핑과 WAL
+ * 소유권을 함께 공개한다. worker가 ctx를 해제할 수 있으므로 unlock 뒤에는
+ * ctx를 참조하지 않는다. orig_bio==NULL은 WAL만 소유하는 buffered ctx다.
+ * GC/회전/메타데이터 압력에서는 기존 durable 완료 경로로 되돌아간다. */
+static bool wal_try_buffer_write(struct zns_io_ctx *ctx)
+{
+	struct zns_base_c *c = ctx->c;
+	struct bio *orig = ctx->orig_bio;
+	sector_t phys = ctx->reserved_phys;
+	sector_t nr = ctx->reserved_nr;
+	bool kick;
+
+	if (!wal_writeback || ctx->is_discard ||
+	    (orig->bi_opf & (REQ_FUA | REQ_PREFLUSH)))
+		return false;
+	spin_lock_irq(&c->lock);
+	if (c->metadata_failed || c->stopping || c->gc_active ||
+	    c->wal_rotation_pending || c->sstable_rotation_pending ||
+	    c->wal_ckpt_inflight || (c->wal_batch_busy && c->wal_batch_has_waiters) ||
+	    !list_empty(&c->pending_flush_bios) ||
+	    c->wal_pending_count != c->wal_pending_buffered_count ||
+	    c->wal_pending_count >= wal_batch_max_records ||
+	    c->wal_buffered_count >= 2 * wal_batch_max_records ||
+	    c->memtable->count >= flush_threshold ||
+	    gc_count_free_zones(c->zp) <= gc_low_watermark + 2) {
+		spin_unlock_irq(&c->lock);
+		return false;
+	}
+	if (mapping_put(c, ctx->lba, ctx->phys)) {
+		spin_unlock_irq(&c->lock);
+		return false; /* 기존 경로에서 삽입 오류를 처리한다. */
+	}
+	ctx->orig_bio = NULL;
+	INIT_LIST_HEAD(&ctx->wal_link);
+	if (metrics_enabled && wal_timing_enabled)
+		ctx->diag_wal_queued_ns = ktime_get_ns();
+	list_add_tail(&ctx->wal_link, &c->wal_pending);
+	c->wal_pending_count++;
+	c->wal_pending_buffered_count++;
+	c->wal_buffered_count++;
+	c->wal_buffered_acks++;
+	kick = c->wal_pending_count >= wal_batch_max_records ||
+		c->memtable->count >= flush_threshold;
+	if (kick)
+		mod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);
+	spin_unlock_irq(&c->lock);
+	zone_dispatch_cancel(c, phys, nr);
+	foreground_write_done(c);
+	bio_endio(orig);
+	return true;
+}
+
 /* WAL PUT 레코드(512B, 앞 32B만 유효) 비동기 제출. process/atomic context
  * 양쪽에서 불리므로 GFP_ATOMIC 필수(GFP_NOIO도 sleep 가능해 안전하지 않음). */
 static void submit_wal_async(struct zns_io_ctx *ctx)
 {
 	struct zns_base_c *c = ctx->c;
 	bool full;
+
+	if (wal_try_buffer_write(ctx))
+		return;
 
 	INIT_LIST_HEAD(&ctx->wal_link);
 	if (metrics_enabled && wal_timing_enabled)
@@ -1633,8 +1701,30 @@ static void data_append_done(struct bio *bio)
 	submit_wal_async(ctx);
 }
 
-/* data Zone Append 완료 후 제출한 WAL의 완료 콜백. WAL이 durable해진
- * 시점에 매핑을 공개하고 원본 bio를 완료한다. */
+/* ctx에 원본 bio가 없으면 이미 완료한 volatile PUT이다. 매핑은 건드리지
+ * 않고 WAL 소유권만 해제한다. 일반 쓰기의 지연 오류는 이후 barrier로 알린다. */
+static bool wal_complete_buffered(struct zns_io_ctx *ctx, blk_status_t status)
+{
+	struct zns_base_c *c = ctx->c;
+
+	if (ctx->orig_bio)
+		return false;
+	spin_lock_irq(&c->lock);
+	c->wal_buffered_count--;
+	if (status) {
+		c->wal_buffered_errors++;
+		c->metadata_failed = true;
+		c->checkpoint_failed = true;
+	} else {
+		c->wal_buffered_commits++;
+	}
+	spin_unlock_irq(&c->lock);
+	kfree(ctx);
+	return true;
+}
+
+/* 기본 정책과 durable 요청은 WAL 완료 뒤에만 매핑/원본 bio를 공개한다.
+ * buffered PUT은 아래 helper에서 재공개 없이 WAL 소유권만 정리한다. */
 static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 			   bool allow_flush)
 {
@@ -1650,6 +1740,9 @@ static void wal_commit_ctx(struct zns_io_ctx *ctx, blk_status_t wal_status,
 	u64 discard_i;
 	u64 diag_commit_start = 0;
 	int ret;
+
+	if (wal_complete_buffered(ctx, wal_status))
+		return;
 
 	if (wal_status) {
 		if (reserved_nr)
@@ -1776,6 +1869,8 @@ static void wal_batch_work_fn(struct work_struct *work)
 	sector_t wal_sectors;
 	int ret;
 	bool more;
+	struct memtable_flush_work *deferred_flush = NULL;
+	bool should_gc;
 	u64 diag_io_start;
 	u64 diag_worker_start = metrics_enabled && wal_timing_enabled ? ktime_get_ns() : 0;
 	u64 diag_complete_start;
@@ -1788,6 +1883,7 @@ static void wal_batch_work_fn(struct work_struct *work)
 
 	spin_lock_irq(&c->lock);
 	c->wal_batch_busy = true;
+	c->wal_batch_has_waiters = false;
 	/* 이전 배치 처리 중 backlog 대기는 제외한다. 설정 timer, workqueue,
 	 * CPU scheduling, 입구 page 할당/lock 대기를 포함하므로 순수 scheduler 지연은 아니다. */
 	if (diag_worker_start && c->diag_wal_ready_ns) {
@@ -1802,10 +1898,16 @@ static void wal_batch_work_fn(struct work_struct *work)
 		ctx = list_first_entry(&c->wal_pending, struct zns_io_ctx, wal_link);
 		list_move_tail(&ctx->wal_link, &batch);
 		c->wal_pending_count--;
+		if (!ctx->orig_bio)
+			c->wal_pending_buffered_count--;
+		else
+			c->wal_batch_has_waiters = true;
 		count++;
 	}
 	more = !list_empty(&c->wal_pending);
 	wal_sectors = count == 1 ? 1 : WAL_PAGE_SECTORS;
+	if (wal_writeback && c->metadata_failed)
+		ret = -EIO;
 	if (!ret && count) {
 		if (!foreground_wal_allowed(c, wal_sectors)) {
 			ret = -ENOSPC;
@@ -1828,10 +1930,14 @@ static void wal_batch_work_fn(struct work_struct *work)
 		 * 실패시키면 ext4가 손상 상태로 전환된다. pending 앞쪽에 원래
 		 * 순서대로 되돌리고 GC가 공간을 만든 뒤 다시 시도한다. */
 		spin_lock_irq(&c->lock);
-		stopping = c->stopping;
+		/* volatile overlay가 있으면 GC를 먼저 실행해 이전 복구 경로를
+		 * 지울 수 없다. 공간 고갈은 실험 경로에서 fail-closed한다. */
+		stopping = c->stopping || (wal_writeback && c->wal_buffered_count);
 		if (!stopping) {
 			list_splice_init(&batch, &c->wal_pending);
 			c->wal_pending_count += count;
+			/* buffered ENOSPC는 위에서 fail-closed하므로 이 경로는
+			 * 원본 bio를 보유한 기존 durable waiter만 되돌린다. */
 			c->wal_batch_busy = false;
 		}
 		spin_unlock_irq(&c->lock);
@@ -1900,7 +2006,14 @@ static void wal_batch_work_fn(struct work_struct *work)
 	}
 	if (!ret) {
 		diag_io_start = metrics_enabled && wal_timing_enabled ? ktime_get_ns() : 0;
-		ret = wal_page_append_sync(c, wal_phys, page, wal_sectors, true);
+		/* FUA는 이전 데이터 쓰기를 flush하지 않는다. 데이터/header가
+		 * 영속화된 다음에만 복구 가능한 WAL 포인터를 게시한다. */
+		if (wal_writeback)
+			ret = blkdev_issue_flush(c->dev->bdev);
+		if (!ret)
+			ret = wal_page_append_sync(c, wal_phys, page, wal_sectors, true);
+		else
+			zone_dispatch_cancel(c, wal_phys, wal_sectors);
 		if (diag_io_start) {
 			atomic64_inc(&c->wal_diag[WD_IO_COUNT]);
 			atomic64_add(ktime_get_ns() - diag_io_start, &c->wal_diag[WD_IO_NS]);
@@ -1915,6 +2028,12 @@ static void wal_batch_work_fn(struct work_struct *work)
 	}
 
 complete:
+	if (ret && wal_writeback) {
+		spin_lock_irq(&c->lock);
+		c->metadata_failed = true;
+		c->checkpoint_failed = true;
+		spin_unlock_irq(&c->lock);
+	}
 	diag_complete_start = diag_worker_start ? ktime_get_ns() : 0;
 	list_for_each_entry_safe(ctx, tmp, &batch, wal_link) {
 		bool last = list_is_last(&ctx->wal_link, &batch);
@@ -1934,7 +2053,21 @@ out:
 		free_page((unsigned long)page);
 	spin_lock_irq(&c->lock);
 	c->wal_batch_busy = false;
+	c->wal_batch_has_waiters = false;
 	more = !list_empty(&c->wal_pending);
+	if (wal_writeback && !more)
+		deferred_flush = schedule_memtable_flush_locked(c, false);
+	should_gc = wal_writeback && !c->metadata_failed &&
+		gc_count_free_zones(c->zp) <= gc_low_watermark;
+	/* 다음 volatile 그룹은 full/명시적 요청/내부 경계까지 대기한다.
+	 * 한 그룹을 기록했다는 이유로 뒤의 partial 그룹을 강제하지 않는다. */
+	if (wal_writeback && more &&
+	    c->wal_pending_count == c->wal_pending_buffered_count &&
+	    c->wal_pending_count < wal_batch_max_records &&
+	    list_empty(&c->pending_flush_bios) && !c->wal_rotation_pending &&
+	    !c->stopping && !c->metadata_failed && !should_gc &&
+	    c->memtable->count < flush_threshold)
+		more = false;
 	if (diag_worker_start) {
 		u64 now = ktime_get_ns();
 		atomic64_inc(&c->wal_diag[WD_WORKER_COUNT]);
@@ -1945,6 +2078,11 @@ out:
 			c->diag_wal_ready_ns = now;
 	}
 	spin_unlock_irq(&c->lock);
+	wake_up_all(&c->flush_waitq);
+	if (deferred_flush)
+		queue_work(zns_flush_wq, &deferred_flush->work);
+	if (should_gc)
+		queue_work(zns_gc_wq, &c->gc_work);
 	if (more)
 		mod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);
 	else
@@ -1963,16 +2101,25 @@ static void pending_flush_work_fn(struct work_struct *work)
 	LIST_HEAD(ready);
 	struct pending_flush_bio *pending, *tmp;
 	bool wal_busy;
+	bool failed;
 
 	spin_lock_irq(&c->lock);
+	failed = c->metadata_failed;
+	/* 이 worker는 WAL 완료 뒤에도 호출된다. 실제 barrier가 없는데
+	 * foreground가 있다는 이유만으로 partial volatile 그룹을 밀면
+	 * 요청 기반 경계가 사라지고 매 배치 FUA 정책으로 되돌아간다. */
+	if (wal_writeback && list_empty(&c->pending_flush_bios)) {
+		spin_unlock_irq(&c->lock);
+		return;
+	}
 	wal_busy = c->wal_batch_busy || !list_empty(&c->wal_pending) ||
 		!list_empty(&c->pending_write_bios) ||
 		atomic_read(&c->foreground_writes) > 0;
-	if (!wal_busy)
+	if (!wal_busy || failed)
 		list_splice_init(&c->pending_flush_bios, &ready);
 	spin_unlock_irq(&c->lock);
 
-	if (wal_busy) {
+	if (wal_busy && !failed) {
 		mod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);
 		mod_delayed_work(zns_wq, &c->pending_flush_work,
 				 msecs_to_jiffies(20));
@@ -1981,8 +2128,13 @@ static void pending_flush_work_fn(struct work_struct *work)
 
 	list_for_each_entry_safe(pending, tmp, &ready, link) {
 		list_del(&pending->link);
-		bio_set_dev(pending->bio, c->dev->bdev);
-		submit_bio_deferred(pending->bio);
+		if (failed) {
+			pending->bio->bi_status = BLK_STS_IOERR;
+			bio_endio(pending->bio);
+		} else {
+			bio_set_dev(pending->bio, c->dev->bdev);
+			submit_bio_deferred(pending->bio);
+		}
 		kfree(pending);
 	}
 }
@@ -2135,7 +2287,8 @@ static void submit_checkpoint_async(struct zns_io_ctx *ctx)
 	bio_set_dev(bio, c->dev->bdev);
 	bio->bi_iter.bi_sector =
 		(zone_of(c->zp, ctx->wal_phys) * c->zp->zone_sectors);
-	bio->bi_opf = REQ_OP_ZONE_APPEND;
+	bio->bi_opf = REQ_OP_ZONE_APPEND |
+		(wal_writeback ? REQ_PREFLUSH | REQ_FUA : 0);
 	page = virt_to_page(rec);
 	bio_add_page(bio, page, 512, offset_in_page(rec));
 	bio->bi_end_io = checkpoint_write_done;
@@ -3036,6 +3189,8 @@ compaction_header_failed:
 	 * 큰 SSTable은 sstable_io_sync가 ≤1MB bio로 쪼개 순차 제출한다(한 bio에 다 담으면 nr_vecs 초과로 BUG). */
 	zone_dispatch_wait_turn(c, new_phys, nr_sectors);
 	ret = sstable_io_sync(c, REQ_OP_WRITE, new_phys, out_buf, nr_sectors);
+	if (!ret && wal_writeback)
+		ret = blkdev_issue_flush(c->dev->bdev);
 	if (ret) {
 		DMERR("compaction: merged SSTable write failed (err=%d), aborting this run — old SSTables remain valid", ret);
 		goto out_free_out_buf;
@@ -3710,6 +3865,8 @@ static void wal_rotate_work_fn(struct work_struct *work)
 		atomic_read(&c->foreground_writes) == 0;
 	if (!drained) {
 		spin_unlock_irq(&c->lock);
+		if (wal_writeback)
+			mod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);
 		mod_delayed_work(zns_gc_wq, &c->wal_rotate_work,
 				 msecs_to_jiffies(20));
 		return;
@@ -4684,6 +4841,11 @@ static void gc_work_fn(struct work_struct *work)
 	}
 	free_at_start = gc_count_free_zones(c->zp);
 	ckpt_inflight = c->wal_ckpt_inflight;
+	if (wal_writeback && c->wal_buffered_count) {
+		spin_unlock_irq(&c->lock);
+		mod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);
+		return; /* WAL worker가 durable 완료 뒤 GC를 다시 큐잉한다. */
+	}
 	if (c->wal_ckpt_inflight > 0) {
 		deferred = true;
 	} else {
@@ -5061,6 +5223,9 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	ti->private = c;
 	ti->num_flush_bios = 1;
+	/* 하위 ZNS가 write-through여도 DM 자체의 메모리 WAL은 volatile하다.
+	 * 상위 커널이 FLUSH/FUA를 제거하지 않도록 캐시 지원을 명시한다. */
+	ti->flush_supported = wal_writeback;
 	ti->num_discard_bios = 1;
 	ti->discards_supported = true;
 	/* 읽기 bio가 pin한 zone을 완료 시 unpin하려면 per-bio에 그 zone을 실어둔다(zns_read_pin). */
@@ -5085,7 +5250,17 @@ static void zns_base_dtr(struct dm_target *ti)
 	c->stopping = true;
 	spin_unlock_irq(&c->lock);
 	wake_up_all(&c->flush_waitq);
+	if (wal_writeback)
+		mod_delayed_work(zns_wal_wq, &c->wal_batch_work, 0);
 	flush_delayed_work(&c->wal_batch_work);
+	if (wal_writeback) {
+		/* 조기 ACK한 ctx는 DM core의 원본 bio drain에 포함되지 않는다.
+		 * 한 번의 flush_work로 끝내지 말고 재예약한 모든 그룹까지 drain. */
+		wait_event(c->flush_waitq, !READ_ONCE(c->wal_batch_busy) &&
+			   !READ_ONCE(c->wal_pending_count) &&
+			   !READ_ONCE(c->wal_buffered_count));
+		cancel_delayed_work_sync(&c->wal_batch_work);
+	}
 	mod_delayed_work(zns_wq, &c->pending_write_work, 0);
 	flush_delayed_work(&c->pending_write_work);
 	flush_delayed_work(&c->pending_flush_work);
@@ -5387,6 +5562,10 @@ static void zns_base_status(struct dm_target *ti, status_type_t type, unsigned i
 	unsigned int sz =0;
 
 	if (type == STATUSTYPE_INFO) {
+		DMEMIT("wal_writeback=%u wal_buffered=%u wal_early_acks=%llu wal_early_commits=%llu wal_early_errors=%llu ",
+		       wal_writeback, READ_ONCE(c->wal_buffered_count),
+		       READ_ONCE(c->wal_buffered_acks), READ_ONCE(c->wal_buffered_commits),
+		       READ_ONCE(c->wal_buffered_errors));
 		if (metrics_enabled) {
 			u64 bytes;
 			if (wal_timing_enabled) {
