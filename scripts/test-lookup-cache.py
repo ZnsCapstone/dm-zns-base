@@ -30,6 +30,7 @@ typedef uint64_t sector_t;
 #define hash_64(value, bits) 0
 static int lock_depth, reads, fail_read;
 static unsigned char disk_value;
+static bool metrics_enabled = true;
 #define spin_lock(lock) do { assert(!lock_depth); lock_depth++; } while (0)
 #define spin_unlock(lock) do { assert(lock_depth == 1); lock_depth--; } while (0)
 #define atomic64_inc(value) (++*(value))

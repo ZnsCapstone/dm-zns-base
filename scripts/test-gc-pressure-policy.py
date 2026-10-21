@@ -21,6 +21,15 @@ def function_body(signature: str) -> str:
 
 
 class GCPressurePolicyTests(unittest.TestCase):
+    def test_gc_watermarks_are_configurable_and_compatible(self):
+        self.assertIn('static unsigned int gc_reserved_zones =', SOURCE)
+        self.assertIn('module_param(gc_reserved_zones, uint, 0444);', SOURCE)
+        self.assertIn('static unsigned int gc_high_watermark =', SOURCE)
+        self.assertIn('module_param(gc_high_watermark, uint, 0444);', SOURCE)
+        self.assertIn(
+            'module_param_named(gc_target_free_zones, gc_high_watermark, uint, 0444);',
+            SOURCE)
+
     def test_background_gc_requires_twenty_percent_reclaim_by_default(self):
         self.assertIn('static unsigned int gc_min_reclaim_percent = 20;', SOURCE)
         worker = function_body('static void zns_base_gc_work(')
@@ -83,7 +92,7 @@ class GCPressurePolicyTests(unittest.TestCase):
         self.assertIn('c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE', reserve)
         self.assertNotIn('if (c->foreground_waiters)', reserve)
         self.assertIn('if (c->foreground_zone_grant)', reserve)
-        self.assertIn('GC_RESERVE_ZONES - 1', reserve)
+        self.assertIn('gc_reserved_zones - 1', reserve)
         wait = function_body('static int zns_base_wait_for_gc_space(')
         self.assertIn('c->foreground_waiters++;', wait)
         self.assertIn('c->foreground_waiters--;', wait)
@@ -94,7 +103,7 @@ class GCPressurePolicyTests(unittest.TestCase):
         reset = function_body('static int zns_base_reset_victim(')
         self.assertIn('c->foreground_zone_grant = true;', reset)
         self.assertIn('gc_destination->state == ZNS_BASE_ZONE_GC_DEST', reset)
-        self.assertIn('free_zones >= GC_RESERVE_ZONES', reset)
+        self.assertIn('free_zones >= gc_reserved_zones', reset)
         self.assertIn('c->foreground_grant_zone_idx = granted_zone_idx;', reset)
         self.assertIn('mode=%s', reset)
         activate = function_body('static int zns_base_activate_next_zone(')

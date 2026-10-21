@@ -85,7 +85,7 @@ struct zns_base_zone {
 - `slots`: zone 내부 4 KiB slot마다 `logical_block`, `valid`, `pending`을 둔 reverse map
 - `valid_blocks`: GC victim 선정의 기준이며, overwrite된 이전 PBA는 invalid 처리됩니다.
 
-DATA zone은 `GC_RESERVE_ZONES=2`를 hard reserve로 남겨둡니다. free zone이 low
+DATA zone은 기본 `gc_reserved_zones=2`를 hard reserve로 남겨둡니다. free zone이 low
 watermark 이하가 되면 background GC를 시작하지만 foreground zone rollover는
 hard reserve에 도달하기 전까지 계속 진행합니다. 따라서 overwrite가 reclaimable
 공간을 만들 시간을 확보하면서도 일반 write가 마지막 relocation reserve를 소모하지
@@ -188,6 +188,10 @@ read-modify-write 방식입니다. 읽는 동안 대상 zone의 `inflight_reads`
 > 요구할 때 즉시 기록합니다. module parameter를 바꿔도 on-disk 포맷은 동일합니다.
 > 따라서 flush/FUA가 성공한 write는 복구되며, 아직 flush되지 않은 일반 write batch는
 > writeback cache와 같이 전원 손실 시 유실될 수 있습니다.
+>
+> `strict_wal_durability=1`을 지정하면 모든 foreground write 완료를 DATA flush와 WAL
+> FUA 이후까지 미룹니다. 고정 2 ms 타이머는 사용하지 않으므로 불필요한 시간 지연은
+> 다시 도입하지 않지만, writeback 기본값보다 IOPS가 낮아질 수 있습니다.
 
 ---
 
@@ -300,6 +304,8 @@ worker가 한 번에 하나의 extent만 완료 순서대로 제출합니다. �
 - DATA zone별 `ACTIVE/FREE/FULL/GC_DEST/GC_VICTIM` 개수
 - GC 실행/zone reset/moved block 수, discard로 무효화된 block 수와 최근 오류
 - 현재 WAL zone, generation, 사용 block, staged record, WAL 오류와 group commit 시간
+- GC reserve/low/high, 진단 예산과 optional metrics 활성화 여부
+- WAL record 상한, allocation fault 잔여 횟수와 strict durability 여부
 - persistent SSTable 수, checkpoint sequence/generation, Manifest/SSTable active zone
 - DATA inflight/queue block 수와 동적 최대 batch block 수
 - MemTable 예약 수, SSTable flush block/bio 수와 시간, compaction 횟수와 소요 시간
@@ -352,11 +358,14 @@ sudo -E bash scripts/test-m3.sh
 ## 현재 한계와 다음 단계
 
 - WAL group commit은 기본 16-page boundary와 explicit durability boundary로 batch를
-  만듭니다. timer 기반 추가 지연은 없으며 일반 write는 writeback semantics를 사용합니다.
+  만듭니다. `wal_batch_max_records`가 0이 아니면 그보다 이른 record 경계에서 flush하며,
+  timer 기반 추가 지연은 없습니다. 일반 write는 기본적으로 writeback semantics를 사용합니다.
 - on-disk SSTable lookup은 binary search지만 block cache나 bloom filter가 없어 cold read의
   metadata I/O 비용이 남습니다.
 - SSTable compaction은 기본 16개 live table을 현재 packed zone 전체 단위로 병합합니다.
   임계값은 read-only module parameter `sstable_compaction_threshold`로 조정할 수 있습니다.
+  Kovalt 호환 이름 `compaction_k`도 같은 임계값을 설정하지만 oldest-K 부분 병합을 의미하지
+  않습니다. `flush_threshold`는 `memtable_capacity_entries`의 호환 이름입니다.
   level 기반 compaction과 workload-aware scheduling은 아직 없습니다.
 - partial write는 즉시 RMW합니다. dirty-block cache/write coalescing이 없습니다.
 - GC policy는 최소 `valid_blocks`를 고르는 단순 greedy입니다. copy budget, tail latency

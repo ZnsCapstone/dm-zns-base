@@ -193,8 +193,9 @@ fi
 
 echo "[*] insmod $KO_PATH"
 insmod "$KO_PATH" data_zone_capacity_mib="$module_zone_capacity_mib" \
+	gc_reserved_zones="$GC_RESERVE_ZONES" \
 	gc_low_watermark="$gc_test_watermark" \
-	gc_target_free_zones="$gc_test_target" \
+	gc_high_watermark="$gc_test_target" \
 	memtable_capacity_entries="$m3_memtable_capacity" ||
 	fail "insmod failed"
 

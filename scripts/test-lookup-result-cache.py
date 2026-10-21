@@ -31,6 +31,7 @@ struct zns_base_c { struct {
 } metadata; };
 #define ZNS_BASE_RESULT_CACHE_BITS 0
 #define hash_64(key,bits) 0 /* Deliberate collisions */
+static bool metrics_enabled = true;
 static void spin_lock(int *lock) { assert(!*lock); *lock = 1; }
 static void spin_unlock(int *lock) { assert(*lock); *lock = 0; }
 static void atomic64_inc(long *n) { ++*n; }

@@ -44,7 +44,6 @@
 #define MEMTABLE_POOL_SIZE 8
 #define IO_POOL_SIZE 128
 #define ZNS_BASE_MAX_WAL_GROUP_PAGES 64
-#define GC_RESERVE_ZONES 2
 #define ZNS_BASE_GC_READAHEAD_BLOCKS 32
 static bool gc_read_ahead = true;
 module_param(gc_read_ahead, bool, 0444);
@@ -94,8 +93,31 @@ struct zns_base_lookup_cache_entry {
 static bool gc_diagnostics = true;
 module_param(gc_diagnostics, bool, 0444);
 MODULE_PARM_DESC(gc_diagnostics, "log GC phases and progress (default enabled)");
+static unsigned int gc_diag_budget;
+module_param(gc_diag_budget, uint, 0444);
+MODULE_PARM_DESC(gc_diag_budget,
+	"maximum GC diagnostic lines per module load (0 is unlimited)");
+static atomic_t gc_diag_events = ATOMIC_INIT(0);
+
+static bool zns_base_gc_diag_enabled(void)
+{
+	unsigned int event;
+
+	if (!gc_diagnostics)
+		return false;
+	if (!gc_diag_budget)
+		return true;
+	event = atomic_inc_return(&gc_diag_events);
+	return event <= gc_diag_budget;
+}
+
+static bool metrics_enabled = true;
+module_param(metrics_enabled, bool, 0444);
+MODULE_PARM_DESC(metrics_enabled,
+	"enable optional evaluation counters exposed in dmsetup status");
+#define GC_DEFAULT_RESERVED_ZONES 2
 #define GC_DEFAULT_LOW_WATERMARK 3
-#define GC_DEFAULT_TARGET_FREE_ZONES 4
+#define GC_DEFAULT_HIGH_WATERMARK 4
 #define ZNS_BASE_NO_ZONE ((unsigned int)-1)
 #define ZNS_BASE_MANIFEST_ZONES 2
 #define ZNS_BASE_WAL_ZONES      2
@@ -129,15 +151,24 @@ MODULE_PARM_DESC(data_zone_capacity_mib,
 /* Production defaults preserve the original policy.  Read-only parameters let
  * a bounded functional test trigger one deterministic GC round without writing
  * most of a multi-GiB FEMU namespace. */
+static unsigned int gc_reserved_zones = GC_DEFAULT_RESERVED_ZONES;
+module_param(gc_reserved_zones, uint, 0444);
+MODULE_PARM_DESC(gc_reserved_zones,
+	"free data zones reserved for GC relocation");
+
 static unsigned int gc_low_watermark = GC_DEFAULT_LOW_WATERMARK;
 module_param(gc_low_watermark, uint, 0444);
 MODULE_PARM_DESC(gc_low_watermark,
 	"free data-zone count at or below which background GC is scheduled");
 
-static unsigned int gc_target_free_zones = GC_DEFAULT_TARGET_FREE_ZONES;
-module_param(gc_target_free_zones, uint, 0444);
-MODULE_PARM_DESC(gc_target_free_zones,
+static unsigned int gc_high_watermark = GC_DEFAULT_HIGH_WATERMARK;
+module_param(gc_high_watermark, uint, 0444);
+MODULE_PARM_DESC(gc_high_watermark,
 	"free data-zone count at which a background GC run stops");
+/* Backward-compatible name used by the keper1212 test scripts. */
+module_param_named(gc_target_free_zones, gc_high_watermark, uint, 0444);
+MODULE_PARM_DESC(gc_target_free_zones,
+	"deprecated alias for gc_high_watermark");
 
 /* Avoid spending a relocation zone on nearly-clean victims while other FULL
  * zones may offer materially more stale space.  Under foreground pressure the
@@ -175,6 +206,9 @@ static unsigned int memtable_capacity_entries = 65536;
 module_param(memtable_capacity_entries, uint, 0444);
 MODULE_PARM_DESC(memtable_capacity_entries,
 	"mapping entries per MemTable generation");
+module_param_named(flush_threshold, memtable_capacity_entries, uint, 0444);
+MODULE_PARM_DESC(flush_threshold,
+	"compatibility alias for memtable_capacity_entries");
 
 /* Compact less often in production so foreground writes amortize metadata
  * traffic. Tests may lower this value to exercise compaction quickly. */
@@ -182,6 +216,9 @@ static unsigned int sstable_compaction_threshold = 16;
 module_param(sstable_compaction_threshold, uint, 0444);
 MODULE_PARM_DESC(sstable_compaction_threshold,
 	"published SSTable count that triggers compaction");
+module_param_named(compaction_k, sstable_compaction_threshold, uint, 0444);
+MODULE_PARM_DESC(compaction_k,
+	"compatibility alias for full-catalog SSTable compaction threshold");
 
 /* A WAL disk page remains independently checksummed and recoverable.  This
  * setting only controls how many consecutive pages share one DATA flush and
@@ -190,6 +227,28 @@ static unsigned int wal_group_pages = 16;
 module_param(wal_group_pages, uint, 0444);
 MODULE_PARM_DESC(wal_group_pages,
 	"maximum 4 KiB WAL pages per durability group");
+
+/* Unlike Kovalt's delayed worker, this limit never adds a timer.  Zero keeps
+ * Keper's complete wal_group_pages capacity; a nonzero value forces an
+ * earlier group boundary after that many staged records. */
+static unsigned int wal_batch_max_records;
+module_param(wal_batch_max_records, uint, 0444);
+MODULE_PARM_DESC(wal_batch_max_records,
+	"maximum records per WAL durability group (0 uses full group capacity)");
+
+static unsigned int wal_batch_alloc_failures;
+module_param(wal_batch_alloc_failures, uint, 0444);
+MODULE_PARM_DESC(wal_batch_alloc_failures,
+	"number of foreground WAL commit allocations to fail for testing");
+
+/* Keep keper1212's timer-free writeback behavior by default.  Evaluation runs
+ * that need every acknowledged write to survive a crash can opt into the
+ * stricter Kovalt-style completion boundary without reintroducing a fixed WAL
+ * batching delay. */
+static bool strict_wal_durability;
+module_param(strict_wal_durability, bool, 0444);
+MODULE_PARM_DESC(strict_wal_durability,
+	"complete every foreground write only after DATA flush and WAL FUA");
 
 enum zns_base_failpoint {
 	ZNS_BASE_FAIL_NONE = 0,
@@ -800,7 +859,7 @@ static sector_t zns_base_usable_logical_sectors(struct zns_base_c *c)
   	}
 
 	/* zone_init() enforces equal DATA-zone capacities. */
-  	capacity -= (sector_t)GC_RESERVE_ZONES *
+	capacity -= (sector_t)gc_reserved_zones *
   		c->zone_state.zones[ZNS_BASE_METADATA_ZONES]
   			.capacity_sectors;
 
@@ -958,7 +1017,8 @@ static int zns_base_queue_bio(struct zns_base_c *c, struct bio *bio){
 
 	io->pending_commits = 0;
 	io->pending_data_writes = 0;
-	io->requires_durable_commit = bio->bi_opf & (REQ_FUA | REQ_PREFLUSH);
+	io->requires_durable_commit = strict_wal_durability ||
+		!!(bio->bi_opf & (REQ_FUA | REQ_PREFLUSH));
 	io->write_staging_done = false;
 	io->write_error = 0;
 	io->completed = false;
@@ -2115,7 +2175,7 @@ static void zns_base_gc_work(struct work_struct *work)
 			zns_base_foreground_reserve_locked(c)) ||
 		    (!c->foreground_waiters &&
 		     zns_base_count_free_zones(c) >=
-		     gc_target_free_zones)) {
+		     gc_high_watermark)) {
   			spin_unlock(&c->lock);
   			break;
   		}
@@ -2192,7 +2252,7 @@ static void zns_base_gc_work(struct work_struct *work)
 			victim->gc_skip_until = jiffies +
 				msecs_to_jiffies(gc_clean_zone_cooldown_ms);
 			spin_unlock(&c->lock);
-			if (gc_diagnostics)
+			if (zns_base_gc_diag_enabled())
 				DMINFO("gc-diag: victim deferred victim=%u reclaimable=0 cooldown_ms=%u",
 				       (unsigned int)(victim - c->zone_state.zones),
 				       gc_clean_zone_cooldown_ms);
@@ -2206,7 +2266,7 @@ static void zns_base_gc_work(struct work_struct *work)
 		 * every FULL zone here put 9--13 seconds of catalog work directly on the
 		 * foreground critical path.  Background GC retains the quality threshold
 		 * and may search for another candidate. */
-		if (foreground_emergency && gc_diagnostics)
+		if (foreground_emergency && zns_base_gc_diag_enabled())
 			DMINFO("gc-diag: victim emergency victim=%u estimated_reclaimable=%u exact_reclaimable=%u",
 			       (unsigned int)(victim - c->zone_state.zones),
 			       estimated_reclaimable,
@@ -2219,7 +2279,7 @@ static void zns_base_gc_work(struct work_struct *work)
 			victim->gc_skip_until = jiffies +
 				msecs_to_jiffies(gc_clean_zone_cooldown_ms);
 			spin_unlock(&c->lock);
-			if (gc_diagnostics)
+			if (zns_base_gc_diag_enabled())
 				DMINFO("gc-diag: victim deferred victim=%u reclaimable=%u threshold_pct=%u pressure=%u foreground_waiting=0",
 				       (unsigned int)(victim - c->zone_state.zones),
 				       reclaimable_blocks, reclaim_threshold,
@@ -2231,7 +2291,7 @@ static void zns_base_gc_work(struct work_struct *work)
 		phase = "move";
 		phase_started = jiffies;
 		next_report = phase_started + 5 * HZ;
-		if (gc_diagnostics)
+		if (zns_base_gc_diag_enabled())
 			DMINFO("gc-diag: phase=move begin victim=%u slots=%u live=%u reclaimable=%u reclaim_pct=%u threshold_pct=%u pressure=%u",
 			       (unsigned int)(victim - c->zone_state.zones),
 			       victim->nr_blocks,
@@ -2250,7 +2310,8 @@ static void zns_base_gc_work(struct work_struct *work)
 		for (; slot < victim->nr_blocks;) {
 			unsigned int consumed = 1;
 
-			if (gc_diagnostics && time_after_eq(jiffies, next_report)) {
+			if (time_after_eq(jiffies, next_report) &&
+			    zns_base_gc_diag_enabled()) {
 				DMINFO("gc-diag: phase=move victim=%u scanned=%u/%u elapsed_ms=%u",
 				       (unsigned int)(victim - c->zone_state.zones),
 				       slot, victim->nr_blocks,
@@ -2268,7 +2329,7 @@ static void zns_base_gc_work(struct work_struct *work)
 			slot += consumed;
   		}
 
-		if (gc_diagnostics)
+		if (zns_base_gc_diag_enabled())
 			DMINFO("gc-diag: phase=move end victim=%u scanned=%u read_ios=%llu read_hits=%llu write_ios=%llu write_blocks=%llu elapsed_ms=%u ret=%d",
 			       (unsigned int)(victim - c->zone_state.zones), slot,
 			       (unsigned long long)read_buffer.read_ios,
@@ -2276,11 +2337,11 @@ static void zns_base_gc_work(struct work_struct *work)
 			       (unsigned long long)read_buffer.write_ios,
 			       (unsigned long long)read_buffer.write_blocks,
 			       jiffies_to_msecs(jiffies - phase_started), ret);
-		if (gc_diagnostics)
+		if (zns_base_gc_diag_enabled())
 			DMINFO("gc-diag: validated-reuse victim=%u hits=%llu",
 			       (unsigned int)(victim - c->zone_state.zones),
 			       (unsigned long long)read_buffer.validated_hits);
-		if (gc_diagnostics)
+		if (zns_base_gc_diag_enabled())
 			DMINFO("gc-diag: move-cost victim=%u lookup_ms=%llu reserve_ms=%llu read_ms=%llu write_ms=%llu wal_ms=%llu",
 			       (unsigned int)(victim - c->zone_state.zones),
 			       (unsigned long long)div_u64(read_buffer.lookup_ns, NSEC_PER_MSEC),
@@ -2295,7 +2356,7 @@ static void zns_base_gc_work(struct work_struct *work)
 
 		/* Publish every staged GC move before the victim can be reset. */
 		phase = "wal-flush";
-		if (gc_diagnostics)
+		if (zns_base_gc_diag_enabled())
 			DMINFO("gc-diag: phase=wal-flush begin victim=%u move_elapsed_ms=%u",
 			       (unsigned int)(victim - c->zone_state.zones),
 			       jiffies_to_msecs(jiffies - phase_started));
@@ -2308,7 +2369,7 @@ static void zns_base_gc_work(struct work_struct *work)
 		/* Selection statistics are only a heuristic.  Audit the exact,
 		 * versioned reverse map immediately before the destructive zone reset. */
 		phase = "reset-guard";
-		if (gc_diagnostics)
+		if (zns_base_gc_diag_enabled())
 			DMINFO("gc-diag: phase=reset-guard begin victim=%u",
 			       (unsigned int)(victim - c->zone_state.zones));
 		ret = zns_base_gc_verify_reset_safe(c, victim);
@@ -2317,12 +2378,12 @@ static void zns_base_gc_work(struct work_struct *work)
 			break;
 		}
 
-		if (gc_diagnostics)
+		if (zns_base_gc_diag_enabled())
 			DMINFO("gc-diag: phase=reset begin victim=%u",
 			       (unsigned int)(victim - c->zone_state.zones));
 		phase = "reset";
 		ret = zns_base_reset_victim(c, victim);
-		if (gc_diagnostics)
+		if (zns_base_gc_diag_enabled())
 			DMINFO("gc-diag: phase=reset end victim=%u ret=%d",
 			       (unsigned int)(victim - c->zone_state.zones), ret);
   		if (ret) {
@@ -2895,7 +2956,7 @@ static int zns_base_zone_init(struct zns_base_c *c)
   	if (!nr_zones || !bdev_zone_sectors(c->dev->bdev))
   		return -EINVAL;
 
-	if (nr_zones <= ZNS_BASE_METADATA_ZONES + GC_RESERVE_ZONES)
+	if (nr_zones <= ZNS_BASE_METADATA_ZONES + gc_reserved_zones)
   		return -ENOSPC;
 
   	c->zone_state.zones = kvcalloc(nr_zones,
@@ -2967,12 +3028,12 @@ static unsigned int zns_base_count_free_zones(struct zns_base_c *c)
 }
 
 /* Caller holds c->lock.  Once GC owns a destination, that zone itself is the
- * first unit of relocation reserve.  Keeping the full two additional FREE
- * zones at that point prevents a freshly reset victim from returning to
- * foreground use and can deadlock exactly at the low watermark. */
+ * first unit of the configured relocation reserve.  Requiring the full
+ * reserve again at that point prevents a freshly reset victim from returning
+ * to foreground use and can deadlock exactly at the low watermark. */
 static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c)
 {
-	unsigned int reserve = GC_RESERVE_ZONES;
+	unsigned int reserve = gc_reserved_zones;
 
 	/* During teardown there is no future GC round to reserve for. */
 	if (c->quiescing)
@@ -2990,7 +3051,7 @@ static unsigned int zns_base_foreground_reserve_locked(struct zns_base_c *c)
 	 * otherwise foreground can consume the last FREE zone and strand GC at
 	 * free=0 with -ENOSPC. */
 	if (c->zone_state.gc_dest_zone_idx != ZNS_BASE_NO_ZONE)
-		return GC_RESERVE_ZONES ? GC_RESERVE_ZONES - 1 : 0;
+		return gc_reserved_zones ? gc_reserved_zones - 1 : 0;
 	return reserve;
 }
 
@@ -3080,7 +3141,7 @@ static int zns_base_wait_for_gc_space(struct zns_base_c *c)
 
   		spin_unlock(&c->lock);
 
-		if (gc_diagnostics && !attempted_gc) {
+		if (!attempted_gc && zns_base_gc_diag_enabled()) {
 			spin_lock(&c->lock);
 			free_zones = zns_base_count_free_zones(c);
 			reserve = zns_base_foreground_reserve_locked(c);
@@ -3097,7 +3158,7 @@ static int zns_base_wait_for_gc_space(struct zns_base_c *c)
   		 * 깨어나서 위 조건을 다시 검사한다.
   		 */
   		wait_event(c->gc_waitq, zns_base_gc_space_ready(c));
-		if (gc_diagnostics)
+		if (zns_base_gc_diag_enabled())
 			DMINFO("gc-diag: phase=foreground-space-wait wake elapsed_ms=%u",
 			       jiffies_to_msecs(jiffies - started));
   	}
@@ -3216,14 +3277,15 @@ static int zns_base_gc_validate_victim_point(struct zns_base_c *c,
 	unsigned long next_report = started + 5 * HZ;
 	int ret;
 
-	if (gc_diagnostics)
+	if (zns_base_gc_diag_enabled())
 		DMINFO("gc-diag: phase=validate begin victim=%u slots=%u",
 		       (unsigned int)(victim - c->zone_state.zones), victim->nr_blocks);
 	for (slot_idx = 0; slot_idx < victim->nr_blocks; slot_idx++) {
 		size_t logical_block;
 		u64 seq;
 
-		if (gc_diagnostics && time_after_eq(jiffies, next_report)) {
+		if (time_after_eq(jiffies, next_report) &&
+		    zns_base_gc_diag_enabled()) {
 			DMINFO("gc-diag: phase=validate victim=%u scanned=%u/%u lookups=%u elapsed_ms=%u",
 			       (unsigned int)(victim - c->zone_state.zones),
 			       slot_idx, victim->nr_blocks, lookups,
@@ -3288,7 +3350,7 @@ static int zns_base_gc_validate_victim_point(struct zns_base_c *c,
 	}
 	*reclaimable_blocks = victim->nr_blocks - victim->valid_blocks;
 	spin_unlock(&c->lock);
-	if (gc_diagnostics)
+	if (zns_base_gc_diag_enabled())
 		DMINFO("gc-diag: phase=validate end victim=%u scanned=%u lookups=%u reclaimable=%u elapsed_ms=%u",
 		       (unsigned int)(victim - c->zone_state.zones), slot_idx,
 		       lookups, *reclaimable_blocks, jiffies_to_msecs(jiffies - started));
@@ -3375,7 +3437,7 @@ static int zns_base_gc_validate_victim_bulk(struct zns_base_c *c,
 	*reclaimable_blocks = victim->nr_blocks - victim->valid_blocks;
 	spin_unlock(&c->lock);
 	ret = 0;
-	if (gc_diagnostics)
+	if (zns_base_gc_diag_enabled())
 		DMINFO("gc-diag: phase=validate end victim=%u mode=bulk tables=%u scanned=%u reclaimable=%u elapsed_ms=%u",
 		       (unsigned int)(victim - c->zone_state.zones), table_count,
 		       slot_idx, *reclaimable_blocks,
@@ -3392,7 +3454,7 @@ static int zns_base_gc_validate_victim(struct zns_base_c *c,
 	int ret;
 
 	if (gc_bulk_validation) {
-		if (gc_diagnostics)
+		if (zns_base_gc_diag_enabled())
 			DMINFO("gc-diag: phase=validate begin victim=%u slots=%u mode=bulk",
 			       (unsigned int)(victim - c->zone_state.zones),
 			       victim->nr_blocks);
@@ -4095,7 +4157,7 @@ static int zns_base_reset_victim(struct zns_base_c *c,
 	 * relocation stream.  With only one FREE zone, retain the old safe handoff:
 	 * promote GC_DEST and keep the reset victim as the next relocation reserve. */
 	if (c->foreground_waiters && !c->foreground_zone_grant) {
-		if (free_zones >= GC_RESERVE_ZONES) {
+		if (free_zones >= gc_reserved_zones) {
 			granted_zone_idx = victim - c->zone_state.zones;
 		} else if (gc_destination &&
 			   gc_destination->state == ZNS_BASE_ZONE_GC_DEST &&
@@ -4112,7 +4174,7 @@ static int zns_base_reset_victim(struct zns_base_c *c,
 
   	spin_unlock(&c->lock);
 
-	if (granted_foreground && gc_diagnostics)
+	if (granted_foreground && zns_base_gc_diag_enabled())
 		DMINFO("gc-diag: foreground-zone-grant victim=%u zone=%u mode=%s free=%u",
 		       (unsigned int)(victim - c->zone_state.zones),
 		       granted_zone_idx,
@@ -4504,6 +4566,14 @@ static struct zns_base_wal_record_disk
 		 record_index * ZNS_BASE_WAL_RECORD_SIZE);
 }
 
+static unsigned int zns_base_wal_record_limit(void)
+{
+	unsigned int capacity =
+		wal_group_pages * ZNS_BASE_WAL_RECORDS_PER_PAGE;
+
+	return wal_batch_max_records ? wal_batch_max_records : capacity;
+}
+
 static void zns_base_wal_reset_page_locked(struct zns_base_wal_state *wal)
 {
 	memset(wal->page_buffer, 0, wal->page_buffer_bytes);
@@ -4523,8 +4593,7 @@ static void zns_base_wal_reset_page_locked(struct zns_base_wal_state *wal)
   		return wal->flush_error;
 
 	/* A full durability group must be flushed before staging can resume. */
-	if (wal->record_count >=
-	    wal_group_pages * ZNS_BASE_WAL_RECORDS_PER_PAGE)
+	if (wal->record_count >= zns_base_wal_record_limit())
   		return -EAGAIN;
 
   	if (wal->record_count == 0)
@@ -4540,7 +4609,7 @@ static void zns_base_wal_reset_page_locked(struct zns_base_wal_state *wal)
 
 	*group_full =
 		wal->record_count ==
-		wal_group_pages * ZNS_BASE_WAL_RECORDS_PER_PAGE;
+		zns_base_wal_record_limit();
 
   	return 0;
 }
@@ -4561,6 +4630,23 @@ static int zns_base_wal_stage_foreground(
 
 	if (group_full)
 		*group_full = false;
+
+	/* Deterministic foreground-only fault injection, consumed under the WAL
+	 * lock so concurrent writers cannot lose or double-consume a request. */
+	if (unlikely(READ_ONCE(wal_batch_alloc_failures))) {
+		bool inject = false;
+
+		mutex_lock(&c->metadata.wal.lock);
+		if (wal_batch_alloc_failures) {
+			wal_batch_alloc_failures--;
+			inject = true;
+		}
+		mutex_unlock(&c->metadata.wal.lock);
+		if (inject) {
+			mapping_release_write_slot(c);
+			return -ENOMEM;
+		}
+	}
 
 	commit = kzalloc(sizeof(*commit), GFP_KERNEL);
 	if (!commit) {
@@ -5308,12 +5394,14 @@ static int zns_base_write_sstable_locked(struct zns_base_c *c,
 
 out_timed:
 	elapsed_ns = ktime_get_ns() - started_ns;
-	c->metadata.sstable_flush_count++;
-	c->metadata.sstable_flush_last_ns = elapsed_ns;
-	c->metadata.sstable_flush_max_ns =
-		max(c->metadata.sstable_flush_max_ns, elapsed_ns);
-	c->metadata.sstable_flush_last_blocks = blocks;
-	c->metadata.sstable_flush_last_ios = submitted_ios;
+	if (metrics_enabled) {
+		c->metadata.sstable_flush_count++;
+		c->metadata.sstable_flush_last_ns = elapsed_ns;
+		c->metadata.sstable_flush_max_ns =
+			max(c->metadata.sstable_flush_max_ns, elapsed_ns);
+		c->metadata.sstable_flush_last_blocks = blocks;
+		c->metadata.sstable_flush_last_ios = submitted_ios;
+	}
 	DMINFO("SSTable flush end: zone=%u start=%llu entries=%zu blocks=%zu ios=%u duration_ms=%llu ret=%d crc=%08x",
 	       zone_idx, (unsigned long long)start_sector, entry_count, blocks,
 	       submitted_ios,
@@ -5621,7 +5709,8 @@ static int zns_base_compact_sstables_locked(struct zns_base_c *c)
 		return -ENOMEM;
 	started_ns = ktime_get_ns();
 	c->metadata.compaction_running = true;
-	c->metadata.compaction_count++;
+	if (metrics_enabled)
+		c->metadata.compaction_count++;
 	DMINFO("compaction start: inputs=%u catalog_generation=%llu",
 	       input_count,
 	       (unsigned long long)c->metadata.checkpoint_generation);
@@ -5710,9 +5799,11 @@ out_snapshot:
 out_descriptors:
 	elapsed_ns = ktime_get_ns() - started_ns;
 	c->metadata.compaction_running = false;
-	c->metadata.compaction_last_ns = elapsed_ns;
-	c->metadata.compaction_max_ns =
-		max(c->metadata.compaction_max_ns, elapsed_ns);
+	if (metrics_enabled) {
+		c->metadata.compaction_last_ns = elapsed_ns;
+		c->metadata.compaction_max_ns =
+			max(c->metadata.compaction_max_ns, elapsed_ns);
+	}
 	DMINFO("compaction end: inputs=%u entries=%zu ret=%d duration_ms=%llu",
 	       input_count, entry_count, ret,
 	       (unsigned long long)div_u64(elapsed_ns, NSEC_PER_MSEC));
@@ -6002,7 +6093,8 @@ static int zns_base_lookup_read_block(struct zns_base_c *c, u64 epoch,
 	int ret;
 
 	if (!c->metadata.lookup_cache) {
-		atomic64_inc(&c->metadata.lookup_cache_misses);
+		if (metrics_enabled)
+			atomic64_inc(&c->metadata.lookup_cache_misses);
 		return zns_base_metadata_read_block(c, sector, buffer);
 	}
 	cached = &c->metadata.lookup_cache[
@@ -6011,11 +6103,13 @@ static int zns_base_lookup_read_block(struct zns_base_c *c, u64 epoch,
 	if (cached->valid && cached->epoch == epoch && cached->sector == sector) {
 		memcpy(buffer, cached->data, ZNS_BASE_BLOCK_SIZE);
 		spin_unlock(&c->metadata.lookup_cache_lock);
-		atomic64_inc(&c->metadata.lookup_cache_hits);
+		if (metrics_enabled)
+			atomic64_inc(&c->metadata.lookup_cache_hits);
 		return 0;
 	}
 	spin_unlock(&c->metadata.lookup_cache_lock);
-	atomic64_inc(&c->metadata.lookup_cache_misses);
+	if (metrics_enabled)
+		atomic64_inc(&c->metadata.lookup_cache_misses);
 	ret = zns_base_metadata_read_block(c, sector, buffer);
 	if (ret)
 		return ret;
@@ -6050,10 +6144,12 @@ static bool zns_base_result_cache_get(struct zns_base_c *c, u64 epoch,
 		hit = true;
 	}
 	spin_unlock(&c->metadata.lookup_cache_lock);
-	if (hit)
-		atomic64_inc(&c->metadata.result_cache_hits);
-	else
-		atomic64_inc(&c->metadata.result_cache_misses);
+	if (metrics_enabled) {
+		if (hit)
+			atomic64_inc(&c->metadata.result_cache_hits);
+		else
+			atomic64_inc(&c->metadata.result_cache_misses);
+	}
 	return hit;
 }
 
@@ -6978,12 +7074,15 @@ static int zns_base_wal_write_group_locked(struct zns_base_c *c)
 
 out_timed:
 	elapsed_ns = ktime_get_ns() - started_ns;
-	wal->group_commit_count++;
-	wal->group_commit_last_ns = elapsed_ns;
-	wal->group_commit_max_ns = max(wal->group_commit_max_ns, elapsed_ns);
-	wal->group_commit_last_pages = page_count;
-	wal->group_commit_max_pages = max(wal->group_commit_max_pages,
-		page_count);
+	if (metrics_enabled) {
+		wal->group_commit_count++;
+		wal->group_commit_last_ns = elapsed_ns;
+		wal->group_commit_max_ns = max(wal->group_commit_max_ns,
+			elapsed_ns);
+		wal->group_commit_last_pages = page_count;
+		wal->group_commit_max_pages = max(wal->group_commit_max_pages,
+			page_count);
+	}
 	if (elapsed_ns >= NSEC_PER_SEC)
 		DMWARN("WAL group commit slow: pages=%u records=%u ios=%u duration_ms=%llu ret=%d",
 		       page_count, wal->record_count, submitted_ios,
@@ -7293,6 +7392,16 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	if (!wal_group_pages ||
 	    wal_group_pages > ZNS_BASE_MAX_WAL_GROUP_PAGES) {
 		ti->error = "invalid wal_group_pages";
+		return -EINVAL;
+	}
+	if (wal_batch_max_records >
+	    wal_group_pages * ZNS_BASE_WAL_RECORDS_PER_PAGE) {
+		ti->error = "wal_batch_max_records exceeds WAL group capacity";
+		return -EINVAL;
+	}
+	if (!gc_reserved_zones || gc_low_watermark < gc_reserved_zones ||
+	    gc_high_watermark <= gc_low_watermark) {
+		ti->error = "invalid GC reserve/low/high watermarks";
 		return -EINVAL;
 	}
 	if (gc_min_reclaim_percent > 100) {
@@ -7831,6 +7940,9 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		(unsigned long long)gc_moved_blocks,
 		(unsigned long long)discarded_blocks,
 		gc_error, gc_last_error);
+	DMEMIT("gc_reserved_zones=%u gc_low_watermark=%u gc_high_watermark=%u gc_diag_budget=%u gc_diag_events=%d metrics_enabled=%u ",
+		gc_reserved_zones, gc_low_watermark, gc_high_watermark,
+		gc_diag_budget, atomic_read(&gc_diag_events), metrics_enabled);
 	DMEMIT("data_write_inflight=%u data_write_queued=%u data_write_queued_blocks=%u data_write_error=%d mapping_reserved_slots=%zu foreground_waiters=%u foreground_zone_grant=%u foreground_grant_zone=%u active_data_zone=%u active_data_wp=%llu ",
 		data_write_inflight, data_write_queued, data_write_queued_blocks,
 		data_write_error, mapping_reserved_slots, foreground_waiters,
@@ -7846,7 +7958,8 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		(unsigned long long)checkpoint_seq,
 		(unsigned long long)checkpoint_generation, manifest_active,
 		checkpoint_manifest, sstable_active, checkpoint_sstable);
-	DMEMIT(" compaction_running=%u compaction_count=%llu compaction_last_ms=%llu compaction_max_ms=%llu",
+	DMEMIT(" memtable_capacity_entries=%u sstable_compaction_threshold=%u compaction_running=%u compaction_count=%llu compaction_last_ms=%llu compaction_max_ms=%llu",
+		memtable_capacity_entries, sstable_compaction_threshold,
 		compaction_running, (unsigned long long)compaction_count,
 		(unsigned long long)div_u64(compaction_last_ns, NSEC_PER_MSEC),
 		(unsigned long long)div_u64(compaction_max_ns, NSEC_PER_MSEC));
@@ -7857,8 +7970,10 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		(unsigned long long)div_u64(sstable_flush_max_ns,
 			NSEC_PER_MSEC),
 		sstable_flush_last_blocks, sstable_flush_last_ios);
-	DMEMIT(" wal_group_pages=%u wal_group_commit_count=%llu wal_group_commit_last_ms=%llu wal_group_commit_max_ms=%llu wal_group_commit_last_pages=%u wal_group_commit_max_pages=%u data_max_batch_blocks=%u",
-		wal_group_pages, (unsigned long long)wal_group_commit_count,
+	DMEMIT(" wal_group_pages=%u wal_batch_max_records=%u wal_batch_alloc_failures=%u strict_wal_durability=%u wal_group_commit_count=%llu wal_group_commit_last_ms=%llu wal_group_commit_max_ms=%llu wal_group_commit_last_pages=%u wal_group_commit_max_pages=%u data_max_batch_blocks=%u",
+		wal_group_pages, zns_base_wal_record_limit(),
+		READ_ONCE(wal_batch_alloc_failures), strict_wal_durability,
+		(unsigned long long)wal_group_commit_count,
 		(unsigned long long)div_u64(wal_group_commit_last_ns,
 			NSEC_PER_MSEC),
 		(unsigned long long)div_u64(wal_group_commit_max_ns,

@@ -39,6 +39,11 @@ record.
   the low watermark can relocate an almost entirely live zone before ongoing
   overwrites have created enough reclaimable space.  A zone-specific reset
   grant still bypasses the hard reserve for deadlock-free emergency progress.
+- `gc_reserved_zones`, `gc_low_watermark`, and `gc_high_watermark` are
+  read-only module parameters.  Their required ordering is
+  `reserved <= low < high`; the old `gc_target_free_zones` name remains an
+  alias for `gc_high_watermark` so existing keper1212 test scripts continue to
+  work.
 - `gc_min_reclaim_percent` defaults to 20 while the current ACTIVE zone has
   runway.  When free-zone headroom is within one zone of the hard reserve and
   the ACTIVE zone is at least 25% used, `gc_pressure_reclaim_percent` lowers
@@ -61,8 +66,8 @@ foreground-wins conditional publication remain in place.
 
 ## Diagnostics
 
-`dmsetup status` now includes `foreground_waiters` and
-`foreground_zone_grant` and `foreground_grant_zone`.  With
+`dmsetup status` now includes the configured reserve/low/high watermarks,
+`foreground_waiters`, `foreground_zone_grant`, and `foreground_grant_zone`. With
 `gc_diagnostics=1`, policy decisions also emit `victim deferred` and
 `victim emergency` records.  Existing `phase=move`, `move-cost`,
 `foreground-space-wait`, WAL, and reset diagnostics remain available.
