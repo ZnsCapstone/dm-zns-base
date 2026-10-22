@@ -85,6 +85,8 @@ struct bio {
     struct zns_read_pin pin;
 };
 struct sstable_read_ctx {
+    int error;
+    bool cached_valid;
     struct zns_base_c *c;
     struct bio *orig_bio;
     u64 lba;

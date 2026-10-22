@@ -289,6 +289,12 @@ int main(void) {
     sstable_read_finish(r);
     fail_alloc = false;
     assert(bio.bi_status == BLK_STS_RESOURCE && submitted == 1 && pins == 0);
+    /* 읽기 실패는 오래된 SSTable hit/zero-fill로 변환해서는 안 된다. */
+    r = calloc(1, sizeof(*r));
+    r->c = &c; r->orig_bio = &bio; r->lba = 16;
+    r->best_found = 1; r->best_phys = 201; r->error = BLK_STS_IOERR;
+    sstable_read_finish(r);
+    assert(bio.bi_status == BLK_STS_IOERR && submitted == 1 && zeroed == 1 && pins == 0);
     puts("PASS: frozen visibility/failure, new LBA refresh/growth, allocation failure, CAS error, GC workspace/reserve");
     puts("PASS: async read frozen override, tombstone, publication restart and OOM");
     return 0;

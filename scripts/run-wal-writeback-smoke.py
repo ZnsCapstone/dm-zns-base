@@ -26,10 +26,15 @@ def main():
     parser.add_argument('--module', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--seconds', type=int, default=12, choices=range(5, 61))
+    parser.add_argument('--compare-extensions', action='store_true',
+                        help='기존 writeback ON과 추가 extent/group/cache/GC 옵션 비교')
     args = parser.parse_args()
     if not args.run:
         print(json.dumps(dict(raw=RAW, target=NAME, destructive=True,
                               policies=[0, 1], filesystems=['ext4', 'f2fs'],
+                              compare_extensions=args.compare_extensions,
+                              cells=12 if args.compare_extensions else 8,
+                              fresh_format_per_cell=True,
                               seconds=args.seconds), ensure_ascii=False))
         return
     if socket.gethostname() != 'zns-guest':
@@ -57,16 +62,24 @@ def main():
         return {k: int(v) for k, v in re.findall(r'(\w+)=(\d+)', text)}
 
     def attach(policy, threshold):
-        run(['sudo', '-n', 'insmod', str(args.module), f'wal_writeback={policy}',
+        writeback = 1 if args.compare_extensions else policy
+        enhanced = args.compare_extensions and policy == 1
+        run(['sudo', '-n', 'insmod', str(args.module), f'wal_writeback={writeback}',
              'wal_batch_delay_ms=0', 'metrics_enabled=1', 'wal_timing_enabled=1',
              f'flush_threshold={threshold}', 'gc_reserved_zones=8',
-             'gc_low_watermark=16', 'gc_high_watermark=20'])
+             'gc_low_watermark=16', 'gc_high_watermark=20',
+             f'data_append_max_blocks={64 if enhanced else 1}',
+             f'wal_group_pages={8 if enhanced else 1}',
+             f'adaptive_gc={int(enhanced)}', f'sstable_probe_cache={int(enhanced)}'])
         run(['sudo', '-n', 'dmsetup', 'create', NAME],
             input=f'0 50331648 zns-base {RAW}\n')
-        assert status('attached')['wal_writeback'] == policy
+        actual = status('attached')
+        assert actual['wal_writeback'] == writeback
+        assert actual['append_max_blocks'] == (64 if enhanced else 1)
+        assert actual['wal_group_pages'] == (8 if enhanced else 1)
         device = os.stat(DEV).st_rdev
         cache = Path(f'/sys/dev/block/{os.major(device)}:{os.minor(device)}/queue/write_cache').read_text().strip()
-        if policy and cache != 'write back':
+        if writeback and cache != 'write back':
             raise RuntimeError('DM volatile cache/barrier capability 누락')
         with (args.out/'queue-cache.jsonl').open('a') as log:
             log.write(json.dumps(dict(policy=policy, write_cache=cache))+'\n')
@@ -118,6 +131,7 @@ def main():
         save('manifest.json', dict(kernel=kernel, geometry=geometry, seconds=args.seconds,
              module_sha256=hashlib.sha256(args.module.read_bytes()).hexdigest(),
              source_sha256=hashlib.sha256(args.module.with_name('dm-zns-base-main.c').read_bytes()).hexdigest(),
+             compare_extensions=args.compare_extensions,
              scope='기능/짧은 smoke; 동일 boot, 단일 반복, crash recovery 미검증'))
         run(['sudo', '-n', 'dmesg'], name='kernel-before.log')
         if Path('/sys/module/dm_zns_base').exists():
@@ -152,33 +166,45 @@ def main():
         fio('teardown-tail-replay', DEV, ['--rw=write', '--bs=4k', '--iodepth=1',
                                          '--offset=6m', '--size=4k', '--verify=crc32c',
                                          '--verify_only=1'])
+        if args.compare_extensions:
+            before = status('extent-crc-before')
+            fio('extent-crc', DEV, ['--rw=write', '--bs=1m', '--iodepth=8',
+                                   '--offset=8m', '--size=8m', '--verify=crc32c',
+                                   '--do_verify=1', '--end_fsync=1'])
+            after = status('extent-crc-after')
+            if after['wal_diag_data_count'] - before['wal_diag_data_count'] >= 2048:
+                raise RuntimeError('실제 extent append가 발동하지 않음')
         detach()
         save('boundary-result.json', boundary)
         run(['sudo', '-n', 'mkdir', '-p', MOUNT])
+        jobs = [('write', '4k'), ('write', '1m')]
+        if args.compare_extensions:
+            jobs = [('write', '4k'), ('randwrite', '4k'), ('write', '1m')]
         for policy in [0, 1]:
             for fs in ['ext4', 'f2fs']:
-                reset()
-                attach(policy, 131072)
-                command = ['sudo', '-n', 'mkfs.ext4', '-F', '-E', 'nodiscard', DEV] if fs == 'ext4' else [
-                    'sudo', '-n', 'mkfs.f2fs', '-f', '-t', '0', DEV]
-                run(command, timeout=180, name=f'p{policy}-{fs}-mkfs.log')
-                run(['sudo', '-n', 'mount', '-t', fs, '-o', 'nodiscard', DEV, MOUNT])
-                filename = MOUNT+'/fio-smoke.bin'
-                fio(f'p{policy}-{fs}-prepare', filename, ['--rw=write', '--bs=1m', '--iodepth=32',
-                                                       '--size=256m', '--end_fsync=1'])
-                for bs in ['4k', '1m']:
-                    label = f'p{policy}-{fs}-{bs}'
+                for rw, bs in jobs:
+                    label = f'p{policy}-{fs}-{rw}-{bs}'
+                    # 조건별로 새 target/FS를 만들어 이전 쓰기의 물리 점유를 분리.
+                    reset()
+                    attach(policy, 131072)
+                    command = ['sudo', '-n', 'mkfs.ext4', '-F', '-E', 'nodiscard', DEV] if fs == 'ext4' else [
+                        'sudo', '-n', 'mkfs.f2fs', '-f', '-t', '0', DEV]
+                    run(command, timeout=180, name=label+'-mkfs.log')
+                    run(['sudo', '-n', 'mount', '-t', fs, '-o', 'nodiscard', DEV, MOUNT])
+                    filename = MOUNT+'/fio-smoke.bin'
+                    fio(label+'-prepare', filename, ['--rw=write', '--bs=1m', '--iodepth=32',
+                                                    '--size=256m', '--end_fsync=1'])
                     before = status(label+'-before')
-                    job = fio(label, filename, ['--rw=write', '--bs='+bs, '--iodepth=32',
+                    job = fio(label, filename, ['--rw='+rw, '--bs='+bs, '--iodepth=32',
                               '--size=256m', '--time_based=1', f'--runtime={args.seconds}',
                               '--end_fsync=1', '--percentile_list=95:99'])
                     after = status(label+'-after')
-                    if after.get('wal_early_errors'):
+                    if after.get('wal_early_errors') or after.get('wal_buffered'):
                         raise RuntimeError('buffered WAL 오류')
-                    results.append(dict(policy=policy, filesystem=fs, bs=bs,
+                    results.append(dict(policy=policy, filesystem=fs, rw=rw, bs=bs,
                         write=job['write'], status_before=before, status_after=after))
                     save('summary.json', results)
-                detach(mounted=True)
+                    detach(mounted=True)
         save('status.json', dict(state='completed', cells=len(results)))
     except BaseException as exc:
         save('status.json', dict(state='failed', cells=len(results), error=str(exc)))
