@@ -2,8 +2,10 @@
 
 ## 상태
 
-기준은 `exp/wal-writeback-20261021`의 `06b9d3e`다. 추가 변경은 이 실험
-브랜치에서 관리하며 `zns_dm/Kovalt03`는 변경하지 않았다.
+초기 기준은 `exp/wal-writeback-20261021`의 `06b9d3e`이며 추가 구현은
+`36dffa2`다. 사용자 요청으로 두 커밋을 `zns_dm/Kovalt03`에 fast-forward로
+반영했다. 옵션 기본값은 유지하며, 최종 브랜치에서 원래 benchmark 4 조건의
+재검증은 아직 수행하지 않았다.
 로컬 회귀 38개, Python 문법 검사, 로컬 커널용 `W=1` 빌드가 통과했다.
 연결 복구 후 guest 5.15.0-186에서 W=1 빌드와 CRC/재부착/extent 검증,
 fio short 12조건을 완료했다. 수집 커널 오류 및 WAL 오류는 0이었다.
