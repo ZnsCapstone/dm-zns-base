@@ -33,6 +33,7 @@ struct zns_io_ctx {
 };
 static bool wal_writeback, metrics_enabled, wal_timing_enabled;
 static unsigned int wal_batch_max_records=4, gc_low_watermark=4, flush_threshold=100;
+static unsigned int wal_group_capacity(void) { return wal_batch_max_records; }
 static int zns_wal_wq, acked, kicked, dispatches, foreground_done, freed, put_error;
 static u64 mapped;
 #define spin_lock_irq(x) ((void)(x))

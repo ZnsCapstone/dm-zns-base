@@ -1,5 +1,8 @@
 # 요청 기반 WAL 영속화 실험
 
+이 문서의 초기 구현은 `06b9d3e` 기준이다. 이후 추가 옵션과 검증 대기 상태는
+`keper-extensions-experiment.md`를 참고한다.
+
 ## 출처와 구현 범위
 
 참고 저장소: `ZnsCapstone/dm-zns-base`, `zns_dm/keper1212`, commit
@@ -14,7 +17,7 @@
 위는 설계와 제어 흐름을 참고한 부분이며 **함수 본문을 그대로 복사하지 않았다.**
 우리의 `zns_io_ctx`, skiplist, Zone Append, WAL page 형식 및 기존 GC를 이용해
 `wal_try_buffer_write`, `wal_complete_buffered`, WAL worker의 경계를 독립 구현했다.
-Kepler의 매핑 slot/다중 page 그룹/Manifest 구현은 이식하지 않았다.
+초기 커밋에서는 Kepler의 매핑 slot/다중 page 그룹/Manifest 구현을 이식하지 않았다.
 
 ## 활성화
 
