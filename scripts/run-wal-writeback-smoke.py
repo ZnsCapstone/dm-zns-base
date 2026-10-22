@@ -26,14 +26,10 @@ def main():
     parser.add_argument('--module', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--seconds', type=int, default=12, choices=range(5, 61))
-    parser.add_argument('--compare-extensions', action='store_true',
-                        help='기존 writeback ON과 추가 extent/group/cache/GC 옵션 비교')
     args = parser.parse_args()
     if not args.run:
         print(json.dumps(dict(raw=RAW, target=NAME, destructive=True,
-                              policies=[0, 1], filesystems=['ext4', 'f2fs'],
-                              compare_extensions=args.compare_extensions,
-                              cells=12 if args.compare_extensions else 8,
+                              filesystems=['ext4', 'f2fs'], cells=6,
                               fresh_format_per_cell=True,
                               seconds=args.seconds), ensure_ascii=False))
         return
@@ -61,28 +57,26 @@ def main():
         text = run(['sudo', '-n', 'dmsetup', 'status', NAME], name=label+'.status').stdout
         return {k: int(v) for k, v in re.findall(r'(\w+)=(\d+)', text)}
 
-    def attach(policy, threshold):
-        writeback = 1 if args.compare_extensions else policy
-        enhanced = args.compare_extensions and policy == 1
-        run(['sudo', '-n', 'insmod', str(args.module), f'wal_writeback={writeback}',
-             'wal_batch_delay_ms=0', 'metrics_enabled=1', 'wal_timing_enabled=1',
+    def attach(threshold):
+        # 정책/크기 옵션을 지정하지 않아 실제 모듈 기본 동작을 검증한다.
+        run(['sudo', '-n', 'insmod', str(args.module),
+             'metrics_enabled=1', 'wal_timing_enabled=1',
              f'flush_threshold={threshold}', 'gc_reserved_zones=8',
-             'gc_low_watermark=16', 'gc_high_watermark=20',
-             f'data_append_max_blocks={64 if enhanced else 1}',
-             f'wal_group_pages={8 if enhanced else 1}',
-             f'adaptive_gc={int(enhanced)}', f'sstable_probe_cache={int(enhanced)}'])
+             'gc_low_watermark=16', 'gc_high_watermark=20'])
         run(['sudo', '-n', 'dmsetup', 'create', NAME],
             input=f'0 50331648 zns-base {RAW}\n')
         actual = status('attached')
-        assert actual['wal_writeback'] == writeback
-        assert actual['append_max_blocks'] == (64 if enhanced else 1)
-        assert actual['wal_group_pages'] == (8 if enhanced else 1)
+        for key, expected in dict(wal_writeback=1, append_max_blocks=64,
+                                  wal_group_pages=8, adaptive_gc=1, probe_cache=1,
+                                  wal_delay_ms=0).items():
+            if actual.get(key) != expected:
+                raise RuntimeError('모듈 기본값 불일치: '+key)
         device = os.stat(DEV).st_rdev
         cache = Path(f'/sys/dev/block/{os.major(device)}:{os.minor(device)}/queue/write_cache').read_text().strip()
-        if writeback and cache != 'write back':
+        if cache != 'write back':
             raise RuntimeError('DM volatile cache/barrier capability 누락')
         with (args.out/'queue-cache.jsonl').open('a') as log:
-            log.write(json.dumps(dict(policy=policy, write_cache=cache))+'\n')
+            log.write(json.dumps(dict(write_cache=cache))+'\n')
 
     def detach(mounted=False):
         if mounted:
@@ -131,14 +125,14 @@ def main():
         save('manifest.json', dict(kernel=kernel, geometry=geometry, seconds=args.seconds,
              module_sha256=hashlib.sha256(args.module.read_bytes()).hexdigest(),
              source_sha256=hashlib.sha256(args.module.with_name('dm-zns-base-main.c').read_bytes()).hexdigest(),
-             compare_extensions=args.compare_extensions,
+             mode='production-defaults',
              scope='기능/짧은 smoke; 동일 boot, 단일 반복, crash recovery 미검증'))
         run(['sudo', '-n', 'dmesg'], name='kernel-before.log')
         if Path('/sys/module/dm_zns_base').exists():
             run(['sudo', '-n', 'rmmod', 'dm_zns_base'])
         # 작은 threshold로 실제 SSTable/checkpoint/compaction 및 remap replay 검증.
         reset()
-        attach(1, 32)
+        attach(32)
         fio('boundary-crc', DEV, ['--rw=write', '--bs=4k', '--iodepth=8', '--size=2m',
                                   '--verify=crc32c', '--do_verify=1', '--end_fsync=1'])
         run(['sudo', '-n', 'blockdev', '--flushbufs', DEV])
@@ -146,7 +140,7 @@ def main():
         if not boundary.get('wal_early_acks') or boundary['wal_buffered'] or boundary['wal_early_errors']:
             raise RuntimeError('실제 조기 완료/영속화 경계 계측 불일치')
         detach()
-        attach(1, 131072)  # raw reset 없이 WAL/SSTable 복구로 읽는다.
+        attach(131072)  # raw reset 없이 WAL/SSTable 복구로 읽는다.
         fio('replay-crc', DEV, ['--rw=write', '--bs=4k', '--iodepth=8', '--size=2m',
                                '--verify=crc32c', '--verify_only=1'])
         # 명시적 fsync 없이 남은 partial 그룹도 정상 target 제거 때 drain.
@@ -159,52 +153,47 @@ def main():
                                   '--do_verify=0', '--end_fsync=0'])
         save('teardown-before.json', status('teardown-before'))
         detach()
-        attach(1, 131072)
+        attach(131072)
         fio('teardown-replay', DEV, ['--rw=write', '--bs=4k', '--iodepth=8',
                                     '--offset=4m', '--size=1m', '--verify=crc32c',
                                     '--verify_only=1'])
         fio('teardown-tail-replay', DEV, ['--rw=write', '--bs=4k', '--iodepth=1',
                                          '--offset=6m', '--size=4k', '--verify=crc32c',
                                          '--verify_only=1'])
-        if args.compare_extensions:
-            before = status('extent-crc-before')
-            fio('extent-crc', DEV, ['--rw=write', '--bs=1m', '--iodepth=8',
-                                   '--offset=8m', '--size=8m', '--verify=crc32c',
-                                   '--do_verify=1', '--end_fsync=1'])
-            after = status('extent-crc-after')
-            if after['wal_diag_data_count'] - before['wal_diag_data_count'] >= 2048:
-                raise RuntimeError('실제 extent append가 발동하지 않음')
+        before = status('extent-crc-before')
+        fio('extent-crc', DEV, ['--rw=write', '--bs=1m', '--iodepth=8',
+                               '--offset=8m', '--size=8m', '--verify=crc32c',
+                               '--do_verify=1', '--end_fsync=1'])
+        after = status('extent-crc-after')
+        if after['wal_diag_data_count'] - before['wal_diag_data_count'] >= 2048:
+            raise RuntimeError('실제 extent append가 발동하지 않음')
         detach()
         save('boundary-result.json', boundary)
         run(['sudo', '-n', 'mkdir', '-p', MOUNT])
-        jobs = [('write', '4k'), ('write', '1m')]
-        if args.compare_extensions:
-            jobs = [('write', '4k'), ('randwrite', '4k'), ('write', '1m')]
-        for policy in [0, 1]:
-            for fs in ['ext4', 'f2fs']:
-                for rw, bs in jobs:
-                    label = f'p{policy}-{fs}-{rw}-{bs}'
-                    # 조건별로 새 target/FS를 만들어 이전 쓰기의 물리 점유를 분리.
-                    reset()
-                    attach(policy, 131072)
-                    command = ['sudo', '-n', 'mkfs.ext4', '-F', '-E', 'nodiscard', DEV] if fs == 'ext4' else [
-                        'sudo', '-n', 'mkfs.f2fs', '-f', '-t', '0', DEV]
-                    run(command, timeout=180, name=label+'-mkfs.log')
-                    run(['sudo', '-n', 'mount', '-t', fs, '-o', 'nodiscard', DEV, MOUNT])
-                    filename = MOUNT+'/fio-smoke.bin'
-                    fio(label+'-prepare', filename, ['--rw=write', '--bs=1m', '--iodepth=32',
-                                                    '--size=256m', '--end_fsync=1'])
-                    before = status(label+'-before')
-                    job = fio(label, filename, ['--rw='+rw, '--bs='+bs, '--iodepth=32',
-                              '--size=256m', '--time_based=1', f'--runtime={args.seconds}',
-                              '--end_fsync=1', '--percentile_list=95:99'])
-                    after = status(label+'-after')
-                    if after.get('wal_early_errors') or after.get('wal_buffered'):
-                        raise RuntimeError('buffered WAL 오류')
-                    results.append(dict(policy=policy, filesystem=fs, rw=rw, bs=bs,
-                        write=job['write'], status_before=before, status_after=after))
-                    save('summary.json', results)
-                    detach(mounted=True)
+        jobs = [('write', '4k'), ('randwrite', '4k'), ('write', '1m')]
+        for fs in ['ext4', 'f2fs']:
+            for rw, bs in jobs:
+                label = f'{fs}-{rw}-{bs}'
+                reset()
+                attach(131072)
+                command = ['sudo', '-n', 'mkfs.ext4', '-F', '-E', 'nodiscard', DEV] if fs == 'ext4' else [
+                    'sudo', '-n', 'mkfs.f2fs', '-f', '-t', '0', DEV]
+                run(command, timeout=180, name=label+'-mkfs.log')
+                run(['sudo', '-n', 'mount', '-t', fs, '-o', 'nodiscard', DEV, MOUNT])
+                filename = MOUNT+'/fio-smoke.bin'
+                fio(label+'-prepare', filename, ['--rw=write', '--bs=1m', '--iodepth=32',
+                                                '--size=256m', '--end_fsync=1'])
+                before = status(label+'-before')
+                job = fio(label, filename, ['--rw='+rw, '--bs='+bs, '--iodepth=32',
+                          '--size=256m', '--time_based=1', f'--runtime={args.seconds}',
+                          '--end_fsync=1', '--percentile_list=95:99'])
+                after = status(label+'-after')
+                if after.get('wal_early_errors') or after.get('wal_buffered'):
+                    raise RuntimeError('buffered WAL 오류')
+                results.append(dict(filesystem=fs, rw=rw, bs=bs,
+                    write=job['write'], status_before=before, status_after=after))
+                save('summary.json', results)
+                detach(mounted=True)
         save('status.json', dict(state='completed', cells=len(results)))
     except BaseException as exc:
         save('status.json', dict(state='failed', cells=len(results), error=str(exc)))

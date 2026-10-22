@@ -12,7 +12,7 @@ Device Mapper 타깃**.
 
 | 영역 | 구현 내용 |
 |---|---|
-| 쓰기·복구 | 4KiB 매핑, 데이터 Zone Append 후 반환 주소를 WAL에 기록하고 매핑 공개·원본 bio 완료 |
+| 쓰기·복구 | 4KiB 매핑, 최대 256KiB data Append, 요청 기반 WAL 영속화와 FLUSH/FUA 경계 |
 | 매핑 | active/frozen memtable 조회, SSTable flush·checkpoint·k-way compaction, WAL replay |
 | GC 안전성 | 최신 live-map 재확인, relocation 매핑 CAS, read pin, reset 전 참조·workspace 검사 |
 | reserve 경계 진행성 | 조건부 seed 차용, GC_DATA tail 단독 소유권 이관, 회수 뒤 foreground 양보 |
@@ -22,8 +22,8 @@ Device Mapper 타깃**.
 | 선택 계측 | `metrics_enabled=1`로 쓰기량·GC·flush·compaction·foreground 대기·매핑 메모리 조회 |
 
 계측과 기능 구현의 존재가 모든 부하의 성능·크래시 정합성 검증 완료를 뜻하지는 않는다.
-최근 변경은 `fix: WAL 대기와 bio 제출의 워크큐 분리`와
-`feat: DM 비용과 매핑 메모리 선택 계측 추가`다. 결과 비교 시 브랜치명뿐 아니라
+최근 변경으로 요청 기반 WAL 영속화·다중 page 그룹·압력별 GC를 기본 동작으로
+통합하고 구형 OFF/ON 선택기를 제거했다. 결과 비교 시 브랜치명뿐 아니라
 사용한 commit, dirty diff, 모듈 SHA-256과 부하기·runner 버전을 함께 기록한다.
 
 > **프로젝트 개요 · 셋업 · Quickstart · 마일스톤 → [docs/project-overview.md](docs/project-overview.md)**
@@ -186,7 +186,9 @@ CHECKPOINT는 memtable 스왑 시점의 WAL 스트림 위치를 `(split_gen, spl
 | `gc_high_watermark` | 5 | free zone이 이 이상 확보되면 GC 종료(hysteresis) |
 | `gc_reserved_zones` | 2 | GC 이주·WAL 전용 예비 zone (데드락 방지) |
 | `wal_batch_max_records` | 127 | 4KiB WAL page의 최대 PUT 수 |
-| `wal_batch_delay_ms` | 2 | foreground WAL group-commit 지연 설정(ms) |
+| `wal_batch_delay_ms` | 0 | durable waiter의 WAL group-commit 지연 상한(ms) |
+| `data_append_max_blocks` | 64 | data Append 최대 4KiB 블록 수; 장치 한도로 추가 제한 |
+| `wal_group_pages` | 8 | 영속화 그룹의 최대 4KiB WAL page 수 (1..16) |
 | `metrics_enabled` | 0 | 선택 계측 활성화; 기본 OFF |
 | `gc_diag_budget` | 0 | live-map 이상 진단 출력 예산; 성능 평가에서는 기본 OFF |
 
@@ -195,6 +197,12 @@ reserve는 별도 고정 파티션이 아니며 workspace와 메타데이터 회
 제한적 차용 경로가 있다. fault injection용 `wal_batch_alloc_failures`는 기본 0으로
 유지한다.
 
+요청 기반 WAL 영속화, 압력별 20/10% GC 선택, 조회 내 SSTable sector 재사용은
+기본 동작이다. 이전 실험 선택기 `wal_writeback`, `adaptive_gc`,
+`sstable_probe_cache`는 제거했으므로 기존 insmod 명령에서 이 인자를 빼야 한다.
+일반 쓰기의 ACK는 전원 장애 내구성을 뜻하지 않으며, 파일시스템의 FLUSH/FUA가
+영속화 경계다. 정상 제거는 남은 volatile WAL을 drain한다.
+
 ---
 
 ## 동작 흐름
@@ -202,8 +210,9 @@ reserve는 별도 고정 파티션이 아니며 workspace와 메타데이터 회
 ### 쓰기 경로 (write path)
 
 `.map()`은 **동기적으로 호출되지만 즉시 `DM_MAPIO_SUBMITTED`를 반환**하고, 이후는
-비동기 worker·콜백으로 진행된다. 현재 순서는 **data append → 반환 주소 WAL
-commit → 매핑 공개 → 원본 bio 완료**다. 공간 부족 시 pending FIFO에서 재시도한다.
+비동기 worker·콜백으로 진행된다. 일반 쓰기는 data Append 후 매핑/메모리 WAL에
+반영하고 조기 완료한다. FUA/PREFLUSH 또는 GC·메타데이터·공간 압력에서는
+WAL 영속화 뒤 완료한다. 공간 부족 시 pending FIFO에서 재시도한다.
 
 ```mermaid
 sequenceDiagram
@@ -216,11 +225,16 @@ sequenceDiagram
     MAP->>MAP: pending FIFO → 데이터 공간 배정
     MAP-->>FS: DM_MAPIO_SUBMITTED (즉시 반환)
     MAP->>DATA: (새 zone 헤더 완료 후) Zone Append
-    DATA->>WAL: 실제 반환 주소의 PUT을 batch에 추가
-    WAL->>CB: WAL durable 완료 콜백
-    CB->>CB: mapping_put(lba, actual_phys)
-    Note over CB: count ≥ flush_threshold?<br/>→ memtable 스왑 + flush_memtable_async (fire-and-forget)
-    CB->>FS: bio_endio (원본 완료)
+    DATA->>WAL: 실제 반환 주소의 PUT을 group에 추가
+    alt 일반 쓰기이고 안전 guard 통과
+        WAL->>CB: 매핑 공개 + volatile WAL 보유
+        CB->>FS: bio_endio (영속화 보장은 아님)
+        Note over WAL: 그룹 포화 / barrier / 내부 경계에서 data FLUSH → WAL FUA
+    else FUA 또는 GC/메타데이터/공간 압력
+        WAL->>CB: data FLUSH → WAL durable 완료
+        CB->>CB: 매핑 공개
+        CB->>FS: bio_endio
+    end
 ```
 
 데이터 append 후 WAL commit 전의 crash에서는 매핑되지 않은 orphan이 남을 수 있다.

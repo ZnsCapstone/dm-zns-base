@@ -31,7 +31,7 @@ struct zns_io_ctx {
     bool is_discard;
     struct list_head wal_link;
 };
-static bool wal_writeback, metrics_enabled, wal_timing_enabled;
+static bool metrics_enabled, wal_timing_enabled;
 static unsigned int wal_batch_max_records=4, gc_low_watermark=4, flush_threshold=100;
 static unsigned int wal_group_capacity(void) { return wal_batch_max_records; }
 static int zns_wal_wq, acked, kicked, dispatches, foreground_done, freed, put_error;
@@ -64,8 +64,7 @@ int main(void) {
     struct skiplist mt={0}; struct zone_pool zp={20}; struct bio bio={0};
     struct zns_base_c c={.memtable=&mt,.zp=&zp};
     struct zns_io_ctx *x=ctx_new(&c,&bio,10), *y;
-    /* 기본 정책/명시적 영속화 요청은 절대 조기 ACK하지 않는다. */
-    assert(!wal_try_buffer_write(x)); wal_writeback=true;
+    /* 명시적 영속화 요청은 기본 경로에서도 절대 조기 ACK하지 않는다. */
     bio.bi_opf=REQ_FUA; assert(!wal_try_buffer_write(x));
     bio.bi_opf=REQ_PREFLUSH; assert(!wal_try_buffer_write(x)); bio.bi_opf=0;
     c.gc_active=true; assert(!wal_try_buffer_write(x)); c.gc_active=false;
