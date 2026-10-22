@@ -4,14 +4,18 @@
 
 초기 기준은 `exp/wal-writeback-20261021`의 `06b9d3e`이며 추가 구현은
 `36dffa2`다. 사용자 요청으로 두 커밋을 `zns_dm/Kovalt03`에 fast-forward로
-반영했다. 옵션 기본값은 유지하며, 최종 브랜치에서 원래 benchmark 4 조건의
-재검증은 아직 수행하지 않았다.
-로컬 회귀 38개, Python 문법 검사, 로컬 커널용 `W=1` 빌드가 통과했다.
+반영했다. 후속 benchmark4에서 EXT4/F2FS 각 1시간의 실행 유효성·정합성을
+통과했다. 달성률은 각각 81.9%/92.6%여서 90% 부하 기준은 F2FS만 충족했다.
+이후 검증한 설정을 기본 동작으로 전환하고 구형 ON/OFF 선택기를 제거했다.
+이 정리 버전은 별도 옵션 없는 CRC/복구 및 short 6조건으로 재검증했다.
+긴 benchmark4 결과는 전환 전 바이너리의 결과와 구분한다.
+기본값/선택기 제거 회귀를 포함해 로컬 39개, Python 문법 검사와 로컬 커널용
+`W=1` 빌드가 통과했다.
 연결 복구 후 guest 5.15.0-186에서 W=1 빌드와 CRC/재부착/extent 검증,
 fio short 12조건을 완료했다. 수집 커널 오류 및 WAL 오류는 0이었다.
 guest module SHA-256:
 `455b0f073cd1b5af0304e7a31547346645bd9f7867495262b3e974e33b843c13`.
-기본 옵션은 변경하지 않았으며 전원 장애 검증/최종 통합 완료를 뜻하지 않는다.
+위 모듈은 기본 동작 전환 전 옵션을 명시한 바이너리다. 전원 장애 검증을 뜻하지 않는다.
 기존 `wal-writeback-review-20261021/final-v4` 결과는 이전 버전이며 이번 변경의
 성능 증거로 사용하지 않는다.
 
@@ -36,16 +40,20 @@ guest module SHA-256:
 
 ## 옵션과 안전 경계
 
-기본값은 기존 크기/정책이다.
+현재는 요청 기반 영속화/압력별 GC/조회 sector 재사용이 상시 동작한다.
 
-| 옵션 | 기본 | 추가 기능 비교값 |
+| 설정 | 현재 기본 | 이전 비교 실험값 |
 |---|---:|---:|
-| `wal_writeback` | 0 | 양쪽 모두 1 |
-| `wal_batch_delay_ms` | 2 | 양쪽 모두 0 |
-| `data_append_max_blocks` | 1 | 64 (최대 256KiB, 실제 장치 한도로 추가 제한) |
-| `wal_group_pages` | 1 | 8 (최대 허용 16, writeback 필요) |
-| `sstable_probe_cache` | 0 | 1 |
-| `adaptive_gc` | 0 | 1 |
+| 요청 기반 영속화 | 상시 | `wal_writeback=1` |
+| `wal_batch_delay_ms` | 0 | 0 |
+| `data_append_max_blocks` | 64 | 64 (최대 256KiB, 장치 한도로 추가 제한) |
+| `wal_group_pages` | 8 | 8 (최대 허용 16) |
+| 조회 내 sector 재사용 | 상시 | `sstable_probe_cache=1` |
+| 압력별 GC 선택 | 상시 | `adaptive_gc=1` |
+
+과거 선택기 3개는 모듈 인자로 더 이상 받지 않는다. 크기/지연 및 장애 주입
+파라미터는 장치별 조절·회귀 검증 용도로 유지한다. FUA와 GC 압력의 durable
+완료 경로는 중복 코드가 아닌 정합성 보호이므로 삭제하지 않는다.
 
 - 큰 쓰기는 장치의 max-zone-append/max-I/O와 4KiB 경계를 따른다. 읽기와
   부분 쓰기는 기존 4KiB 경로다. 물리 zone 경계는 기존 allocator가 보장한다.
@@ -80,10 +88,17 @@ guest module SHA-256:
 
 ## 로컬 검증
 
+기본 경로 전환 뒤 guest W=1 빌드, CRC/FLUSH/재부착/정상 제거 tail 복구와
+extent CRC 및 기본 short 6조건을 완료했다. 수집 커널 오류는 0이고 정상 제거됐다.
+guest 모듈 SHA-256은
+`4461d1aca025eafd912f7eec113289a11e4063d7ef14942f55f4a64dd37d4b0d`.
+기본값은 정책·크기 인자 없이 적재해 검사했으며, smoke 전용 reserve8/16/20과
+낮은 flush threshold를 사용했다. 원래 benchmark4의 재실행이나 전원 장애 시험은 아니다.
+
 ```bash
 python3 scripts/test-safety-unit.py       # 21개; 읽기 오류의 stale/zero 반환 방지도 포함
 python3 scripts/test-wal-userspace.py     # 5개
-python3 scripts/test-wal-writeback.py     # 7개
+python3 scripts/test-wal-writeback.py     # 8개
 python3 scripts/test-keper-extensions.py  # 5개
 make -C src W=1
 ```
@@ -94,14 +109,14 @@ guest 자체 빌드한 새 모듈로만 다음을 실행한다. 고정된 team4 
 초기화하는 스크립트이므로 다른 장치/기존 실험이 있으면 실행하지 않는다.
 
 ```bash
-python3 run-wal-writeback-smoke.py --run --compare-extensions \
+python3 scripts/run-wal-writeback-smoke.py --run \
   --module /home/zns/keper-extensions-20261021/module-src/dm-zns-base.ko \
   --out /home/zns/kafka_python_result/results/final/keper-extensions-short-20261021 \
   --seconds 20
 ```
 
-`policy=0`은 기존 writeback ON, `policy=1`은 writeback ON+추가 옵션이다.
-EXT4/F2FS × 순차 4KiB/랜덤 4KiB/순차 1MiB × 2정책 = 12조건이며,
+구형 OFF/ON A/B 루프는 제거했다. 정책/크기 인자를 생략하고 실제 모듈 기본값과
+write-back cache 광고를 확인한다. EXT4/F2FS × 순차4KiB/랜덤4KiB/순차1MiB = 6조건이며,
 각 조건마다 zone reset/mkfs/256MiB 파일 준비를 새로 한다. QD32/direct/libaio,
 종료 fsync, discard OFF, 같은 VM boot의 단일 반복이다.
 
@@ -121,6 +136,6 @@ EXT4/F2FS × 순차 4KiB/랜덤 4KiB/순차 1MiB × 2정책 = 12조건이며,
 
 추가 버전 EXT4 10,000 ops/s는 dmsetup status 조회의 3초 timeout으로
 중단됐다. 이 조건을 성공 결과로 취급하지 않으며 timeout의 원인은 미해결이다.
-Native F2FS 및 DM F2FS의 동일 장기 조건은 아직 완료하지 않았다.
+Native F2FS 및 DM F2FS의 동일 장기 GC 비교 조건은 아직 완료하지 않았다.
 상세 원본은 별도 benchmark 결과 저장소에 보존하며 이 문서는 구현 검증 범위만
 기록한다. 실제 FEMU 장애 주입/전원 차단 및 독립 반복 검증은 남아 있다.

@@ -19,13 +19,13 @@
 `wal_try_buffer_write`, `wal_complete_buffered`, WAL worker의 경계를 독립 구현했다.
 초기 커밋에서는 Kepler의 매핑 slot/다중 page 그룹/Manifest 구현을 이식하지 않았다.
 
-## 활성화
+## 현재 기본 동작
 
-기본값 `wal_writeback=0`은 기존 durable 완료 정책이다.
-실험 모듈 적재 시에만 `wal_writeback=1 wal_batch_delay_ms=0`을 지정한다.
+초기 비교 실험의 `wal_writeback` 선택기는 제거했다. 요청 기반 영속화가
+상시 동작하며 별도 활성화 옵션은 필요 없다. WAL 대기는 기본 0ms다.
 일반 WRITE는 data append 완료 뒤 매핑/메모리 WAL에 반영하고 조기 완료한다.
-pending 버퍼는 `wal_batch_max_records`(기본 127개) 이하이며,
-기록 중 그룹까지 포함한 volatile PUT은 최대 두 그룹(254개)으로 제한한다.
+pending 버퍼는 `wal_batch_max_records × wal_group_pages`(기본 127×8=1,016개)
+이하이며, 기록 중 그룹까지 포함한 volatile PUT은 최대 두 그룹(2,032개)이다.
 
 영속화 경계는 그룹 포화, FLUSH/FUA/PREFLUSH, memtable 임계값,
 GC 진입, WAL 회전 및 정상 target 제거다. 그룹 기록은 data/header FLUSH 후
@@ -48,7 +48,7 @@ WAL FUA 순서다. FUA만으로 이전 data가 영속화됐다고 가정하지 �
   실패시킨다. volatile 기록이 있을 때 WAL ENOSPC를 GC로 우회하지 않는다.
 
 이는 실제 write-back 캐시다. barrier 없는 일반 쓰기는 전원 장애 시 유실될 수
-있다. 기본 정책과 다른 영속성 계약이므로 일반 쓰기의 IOPS 증가를 동일한
+있다. 과거 per-write durable 정책과 다른 영속성 계약이므로 IOPS 증가를 동일한
 per-write durability 성능 향상으로 해석하면 안 된다.
 
 ## 로컬 검증
@@ -77,7 +77,7 @@ FEMU smoke는 별도 결과 디렉터리에 commit/source/module SHA와 원본�
 호스트/다른 팀/루트 디스크에 사용하는 스크립트가 아니다.
 
 ```bash
-python3 run-wal-writeback-smoke.py --run \
+python3 scripts/run-wal-writeback-smoke.py --run \
   --module /별도/게스트빌드/dm-zns-base.ko \
   --out /home/zns/kafka_python_result/results/final/새로운-결과폴더 \
   --seconds 12
@@ -85,9 +85,9 @@ python3 run-wal-writeback-smoke.py --run \
 
 - 작은 threshold에서 CRC write/read, FLUSH, target 재부착 후 CRC 읽기.
 - 명시적 fsync 없이 4KiB tail을 남긴 뒤 정상 제거·재부착 후 CRC 읽기.
-- 동일 모듈의 OFF/ON × EXT4/F2FS × 순차 4KiB/1MiB, 총 8개 short 조건.
+- 기본 동작의 EXT4/F2FS × 순차4KiB/랜덤4KiB/순차1MiB, 총 6개 short 조건.
 - 파일 256MiB, direct/libaio, QD32, 각 12초, 끝에서 fsync, discard OFF.
-- 각 정책/FS 전환 시 raw zone reset 및 새 mkfs. 동일 VM boot이고 독립 반복은 아님.
+- 각 조건마다 raw zone reset 및 새 mkfs. 동일 VM boot이고 독립 반복은 아님.
 - 실제 write-cache 광고, 조기 ACK/commit/error 카운터, 커널 로그와 SHA 보존.
 - udev settle 및 일반 `dmsetup remove --retry`를 사용하며 강제 제거는 하지 않는다.
 

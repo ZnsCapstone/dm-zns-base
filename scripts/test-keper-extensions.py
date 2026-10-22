@@ -24,7 +24,6 @@ typedef uint64_t sector_t;
 #define min_t(t,a,b) ((t)(a)<(t)(b)?(t)(a):(t)(b))
 #define READ_ONCE(x) (x)
 #define cmpxchg(p,o,n) __sync_val_compare_and_swap(p,o,n)
-static bool adaptive_gc;
 static unsigned int wal_batch_max_records=127,wal_group_pages=1,failpoint;
 '''
         cases = '''int main(void) {
@@ -37,7 +36,7 @@ assert(append_extent_sectors(8,64,512,1024)==8);
 assert(append_extent_sectors(2048,1,512,1024)==8);
 assert(append_extent_sectors(2048,64,0,1024)==8);
 assert(append_extent_sectors(2048,64,15,1024)==8);
-assert(gc_reclaim_threshold(10,8,1,100)==5); adaptive_gc=true;
+assert(gc_reclaim_threshold(10,8,1,100)==20);
 assert(gc_reclaim_threshold(10,8,99,100)==20);
 assert(gc_reclaim_threshold(9,8,24,100)==20);
 assert(gc_reclaim_threshold(9,8,25,100)==10);
@@ -74,7 +73,7 @@ assert(failpoint==0 && !failpoint_hit(2)); return 0;
         self.assertIn('pages[p]->crc32 = cpu_to_le32(crc32', worker)
         self.assertIn('pages[p], WAL_PAGE_SECTORS, p == nr_pages - 1', worker)
         self.assertIn('bio->bi_opf |= REQ_PREFLUSH', function('wal_page_append_sync'))
-        self.assertIn('(wal_group_pages > 1 && !wal_writeback)', function('zns_base_ctr'))
+        self.assertIn('wal_group_pages > 16', function('zns_base_ctr'))
 
     def test_probe_error_never_becomes_not_found(self):
         done = function('sstable_probe_done')

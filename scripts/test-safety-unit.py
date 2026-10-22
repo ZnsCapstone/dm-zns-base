@@ -40,7 +40,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_wal_diagnostics_preserve_scheduling_and_retry(self):
         self.assertIn('static bool wal_timing_enabled;', SOURCE)
-        self.assertIn('static unsigned int wal_batch_delay_ms = 2;', SOURCE)
+        self.assertIn('static unsigned int wal_batch_delay_ms = 0;', SOURCE)
         submit = function('submit_wal_async')
         self.assertIn('mod_delayed_work', submit)
         self.assertIn('queue_delayed_work(zns_wal_wq, &c->wal_batch_work,', submit)

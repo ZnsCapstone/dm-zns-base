@@ -53,7 +53,7 @@ class WritebackTests(unittest.TestCase):
     def test_barrier_error_and_teardown_drain(self):
         pending = function('pending_flush_work_fn')
         self.assertIn('failed = c->metadata_failed', pending)
-        self.assertIn('wal_writeback && list_empty(&c->pending_flush_bios)', pending)
+        self.assertIn('if (list_empty(&c->pending_flush_bios))', pending)
         self.assertIn('pending->bio->bi_status = BLK_STS_IOERR', pending)
         self.assertIn('mod_delayed_work(zns_wal_wq', function('zns_base_dtr'))
         self.assertIn('!READ_ONCE(c->wal_buffered_count)', function('zns_base_dtr'))
@@ -61,12 +61,20 @@ class WritebackTests(unittest.TestCase):
         self.assertIn('mod_delayed_work(zns_wal_wq', function('wal_rotate_work_fn'))
 
     def test_volatile_cache_advertises_barriers(self):
-        self.assertIn('ti->flush_supported = wal_writeback', function('zns_base_ctr'))
+        self.assertIn('ti->flush_supported = true', function('zns_base_ctr'))
 
     def test_buffered_allocation_failure_cannot_gc_away_old_data(self):
         worker = function('wal_batch_work_fn')
-        self.assertIn('c->stopping || (wal_writeback && c->wal_buffered_count)', worker)
+        self.assertIn('c->stopping || c->wal_buffered_count', worker)
         self.assertIn('wal_complete_buffered(ctx, wal_status)', function('wal_commit_ctx'))
+
+    def test_production_defaults_and_removed_policy_switches(self):
+        source = (ROOT/'src/dm-zns-base-main.c').read_text()
+        for name in ['wal_writeback', 'adaptive_gc', 'sstable_probe_cache']:
+            self.assertNotIn(f'module_param({name},', source)
+        for definition in ['wal_batch_delay_ms = 0;', 'data_append_max_blocks = 64;',
+                           'wal_group_pages = 8;']:
+            self.assertIn(definition, source)
 
 
 if __name__ == '__main__':
