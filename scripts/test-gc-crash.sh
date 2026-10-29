@@ -1,28 +1,14 @@
 #!/usr/bin/env bash
-# GC 재배치의 크래시 안전성 검증 (A번 이슈 수정 확인용).
+# GC 이주 후 모듈을 재적재해 WAL이 새 물리 위치를 복원하는지 확인한다.
+# 큰 flush_threshold로 이주 매핑이 WAL에 의존하는 상황을 유지한다.
+# 영역을 먼저 채우고 랜덤 overwrite로 무효 블록을 만든 뒤 실제 이주 발생을 로그로 확인한다.
+# zone reset 없이 재적재한 후 전체 영역의 데이터 유실 여부를 검사한다.
+# 정상 모듈 제거를 거치므로 전원 차단이나 실제 커널 크래시 시험으로 해석하지 않는다.
 #
-# 버그: GC relocation이 데이터를 새 위치에 durable하게 쓴 뒤 mapping_put으로
-# memtable만 갱신하고 WAL에는 안 남겼다. 그 매핑이 SSTable로 flush되기 전에
-# 크래시가 나면 WAL replay가 옛 위치(곧 reset될 victim)로 복원 → victim이
-# 이미 지워져 그 블록이 0으로 읽힌다(데이터 유실). 수정: 재배치도 WAL PUT을
-# 남겨(batch GC WAL) replay가 새 위치로 복원하게 함.
-#
-# 재현 전략:
-#   - flush_threshold를 기본값(매우 큼)으로 둬 flush를 아예 안 나게 한다 →
-#     재배치 매핑이 memtable(+WAL)에만 있는 "취약한 창"을 크래시까지 유지.
-#   - 영역 A 전체를 먼저 순차로 채워(모든 블록 non-zero) 전부 살아있게 한다.
-#   - A 안에서 random overwrite를 해 각 zone을 부분적으로 죽인다(uniform) →
-#     free zone이 watermark 이하로 떨어지면 GC가 "부분만 죽은" zone을 victim으로
-#     골라 살아있는 블록을 재배치할 수밖에 없다(이게 이 테스트의 핵심 —
-#     "M memtable entries relocated"의 M>0을 확인).
-#   - zone reset 없이 재적재(크래시) 후, A 전체를 읽어 all-zero 4K 블록이
-#     하나라도 있으면 유실(FAIL). A는 전부 urandom으로 썼으므로 정상이면
-#     0 블록이 없어야 한다.
-#
-# Env: UNDERLYING (default /dev/nullb0), DM_NAME (default myzns-base),
-#      FILL_MB (default 512 — 너무 크면 flush 없이 WAL이 안 줄어 ENOSPC),
-#      OVERWRITE_MB (default 256 — A 안에서 덮어쓸 총량, 부분-죽은 zone 생성),
-#      GC_LOW_WATERMARK (default 20 — 높게 잡아 GC가 일찍/자주 돌게).
+# 환경변수: UNDERLYING (기본값 /dev/nullb0), DM_NAME (기본값 myzns-base),
+#      FILL_MB (기본값 512 — 너무 크면 flush 없이 WAL이 안 줄어 ENOSPC),
+#      OVERWRITE_MB (기본값 256 — A 안에서 덮어쓸 총량, 부분-죽은 zone 생성),
+#      GC_LOW_WATERMARK (기본값 20 — 높게 잡아 GC가 일찍/자주 돌게).
 
 set -uo pipefail
 
@@ -77,12 +63,12 @@ echo "[OK] A 전체가 non-zero로 채워짐"
 echo
 echo "=== [2/6] A 안에서 random overwrite (${OVERWRITE_MB}MB) — 부분-죽은 zone 생성 → GC 유발 ==="
 fio --name=gc-crash-ow \
-    --filename="$DM_DEV" \
-    --rw=randwrite --bs=4k \
-    --size=$fill_bytes \
-    --io_size=$((OVERWRITE_MB * 1024 * 1024)) \
-    --ioengine=libaio --iodepth=32 --direct=1 \
-    2>&1 | grep -E 'WRITE|err' || true
+	--filename="$DM_DEV" \
+	--rw=randwrite --bs=4k \
+	--size=$fill_bytes \
+	--io_size=$((OVERWRITE_MB * 1024 * 1024)) \
+	--ioengine=libaio --iodepth=32 --direct=1 \
+	2>&1 | grep -E 'WRITE|err' || true
 sync
 for _ in $(seq 1 60); do
 	dmesg | grep -q "gc: reclaimed zone" && break

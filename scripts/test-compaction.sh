@@ -1,15 +1,9 @@
 #!/usr/bin/env bash
-# Compaction verification (implementation plan 9단계 확인용).
+# SSTable 병합 후 table 수 감소와 데이터 유지 여부를 확인한다.
 #
-# flush_threshold/compaction_k를 낮춰서 SSTable이 여러 개(K 이상) 쌓이며
-# compaction이 자동으로(백그라운드 workqueue) 돌게 만든다. 전부 겹치지 않는
-# 서로 다른 LBA 범위로 한 번에 쓰기 때문에(overwrite 없음), compaction이
-# 데이터를 잃어버리지 않고 정확히 병합했는지 최종 재읽기 hash로 검증한다 —
-# 겹치는 LBA에 대한 "최신값 우선" 자체는 test-sstable-read.sh가 이미 확인함.
-#
-# Env: UNDERLYING (default /dev/nullb0), DM_NAME (default myzns-base),
-#      FLUSH_THRESHOLD (default 50), COMPACTION_K (default 4),
-#      WRITE_COUNT (default 500, 4K블록 수 — FLUSH_THRESHOLD의 몇 배는 되어야
+# 환경변수: UNDERLYING (기본값 /dev/nullb0), DM_NAME (기본값 myzns-base),
+# 추가 설정: FLUSH_THRESHOLD (기본값 50), COMPACTION_K (기본값 4),
+#      WRITE_COUNT (기본값 500, 4K블록 수 — FLUSH_THRESHOLD의 몇 배는 되어야
 #      SSTable이 COMPACTION_K개 이상 쌓임).
 
 set -uo pipefail

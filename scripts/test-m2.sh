@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# M2 smoke test: ext4 round-trip data integrity check.
+# M2 smoke 테스트: EXT4 재마운트 전후 데이터 정합성을 확인한다.
 #
-# Success criterion: md5sum of a file matches before and after umount/remount.
-# The umount/remount cycle flushes the page cache, forcing reads to go through
-# the DM mapping layer instead of being served from RAM.
+# 통과 기준: 재마운트 전후 파일의 md5sum이 같아야 한다.
+# 재마운트로 파일 캐시를 비운 뒤 읽는다.
+# 읽기가 파일 캐시에만 의존하지 않고 DM 매핑 경로를 통과하는지 확인한다.
 #
-# Env: UNDERLYING (default /dev/nullb0), DM_NAME (default myzns-base).
+# 환경변수: UNDERLYING (기본값 /dev/nullb0), DM_NAME (기본값 myzns-base).
 
 set -uo pipefail
 
@@ -55,7 +55,7 @@ echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" || {
 
 mkdir -p "$MNT"
 
-# ── [1/4] mkfs.ext4 + mount ───────────────────────────────────────────────────
+# ── [1/4] EXT4 생성과 마운트 ───────────────────────────────────────────────────
 echo
 echo "=== [1/4] mkfs.ext4 + mount ==="
 mkfs.ext4 -F "$DM_DEV" >/dev/null 2>&1 || {

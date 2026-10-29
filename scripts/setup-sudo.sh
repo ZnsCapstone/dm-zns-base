@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Optional: install /etc/sudoers.d/dm-zns-base so scripts/* can run without
-# a password prompt. Uninstall with:  sudo rm /etc/sudoers.d/dm-zns-base
+# 선택 사항: 스크립트를 비밀번호 입력 없이 실행하도록 /etc/sudoers.d/dm-zns-base를 설치한다.
+# 제거할 때는 sudo rm /etc/sudoers.d/dm-zns-base를 실행한다.
 
 set -euo pipefail
 
@@ -16,7 +16,7 @@ fi
 USER_NAME=${SUDO_USER:-$(logname 2>/dev/null || echo splab)}
 
 cat > "$TMP" <<EOF
-# NOPASSWD entries for the dm-zns-base helper scripts.
+# dm-zns-base 보조 스크립트의 비밀번호 없는 실행 규칙이다.
 $USER_NAME ALL=(root) NOPASSWD: /usr/bin/bash /home/splab/dm-zns-base/scripts/nullblk-up.sh
 $USER_NAME ALL=(root) NOPASSWD: /usr/bin/bash /home/splab/dm-zns-base/scripts/nullblk-down.sh
 $USER_NAME ALL=(root) NOPASSWD: /usr/bin/bash /home/splab/dm-zns-base/scripts/test-basic.sh

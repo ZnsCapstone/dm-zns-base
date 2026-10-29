@@ -1,25 +1,11 @@
 #!/usr/bin/env bash
-# WAL zone 회수 + 회수 후 크래시 복구 검증 (implementation plan 13단계 확인용).
+# checkpoint로 보호된 이전 WAL zone의 회수와 재적재 후 데이터 복원을 확인한다.
+# zone 재사용 뒤에도 generation 순서로 WAL이 재생되는지 검사한다.
+# 모듈을 정상 제거·재적재하는 시험이며 전원 차단을 주입하지 않는다.
 #
-# 13단계 전까지 WAL zone은 아무도 회수하지 않아 단조 증가했다. 이제 체크포인트가
-# durable해지면 온전히 flush된 WAL zone을 reset한다. 이 테스트의 핵심은 회수
-# 자체가 아니라 **회수 후에도 크래시 복구가 정확한가**다 — WAL zone을 회수하면
-# zone_id 순서 ≠ 기록 순서가 되어, replay가 generation 순서로 정확히 재생해야만
-# 데이터가 복원된다(그래서 13단계에서 zone 헤더에 generation을 넣었다).
-#
-# 시나리오:
-#   1) flush_threshold를 낮게 잡아 flush/체크포인트가 자주 일어나게 한다.
-#   2) WAL zone 하나(≈512MB, 131072 레코드)를 넘겨 쓰도록 넉넉히 distinct
-#      오프셋에 기록한다 — 그래야 첫 WAL zone이 회수 대상이 된다. GC와 섞이지
-#      않도록 겹쳐쓰기 없이 device 앞쪽 영역에만 쓴다(free zone 여유 유지).
-#   3) "wal reclaim: reclaimed zone" 로그로 실제 회수를 확인한다.
-#   4) zone reset 없이 모듈만 내렸다 다시 올려(크래시 시뮬레이션) 같은 영역을
-#      다시 읽어 hash가 일치하는지 본다 — 회수로 뒤섞인 WAL을 generation 순서로
-#      제대로 재생했는지 검증.
-#
-# Env: UNDERLYING (default /dev/nullb0), DM_NAME (default myzns-base),
-#      FLUSH_THRESHOLD (default 8000 — 낮게 잡아 flush 자주),
-#      WRITE_MB (default 768 — WAL zone 하나(≈512MB)를 확실히 넘기려고).
+# 환경변수: UNDERLYING (기본값 /dev/nullb0), DM_NAME (기본값 myzns-base),
+#      FLUSH_THRESHOLD (기본값 8000 — 낮게 잡아 flush 자주),
+#      WRITE_MB (기본값 768 — WAL zone 하나(≈512MB)를 확실히 넘기려고).
 
 set -uo pipefail
 

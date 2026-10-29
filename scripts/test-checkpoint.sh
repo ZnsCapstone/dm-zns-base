@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
-# WAL checkpoint verification (implementation plan 7단계 확인용).
+# SSTable flush와 checkpoint 이후 WAL replay 시작 경계를 확인한다.
+# zone reset 없이 모듈을 재적재하고 마지막 checkpoint를 사용했는지 로그로 검사한다.
+# 이 스크립트는 데이터 읽기 정합성을 검사하지 않으며 전원 차단 시험도 아니다.
 #
-# flush_threshold를 낮춰서 SSTable flush + WAL checkpoint가 실제로 여러 번
-# 일어나게 만든 뒤, 크래시 시뮬레이션(zone reset 없이 재insmod)을 하고
-# dmesg에서 "마지막 체크포인트를 찾아 그 이전 WAL은 건너뛰었는지"를 확인한다.
-#
-# 주의: SSTable 읽기 경로(8단계)가 아직 없어서, flush된 세대의 LBA는 재부팅
-# 후 못 읽는다 — 이 스크립트는 읽기 정확성이 아니라 체크포인트 메커니즘
-# 자체(로그)만 확인한다. test.sh의 0~3 회귀 스위트와는 별개.
-#
-# Env: UNDERLYING (default /dev/nullb0), DM_NAME (default myzns-base),
-#      FLUSH_THRESHOLD (default 1000), WRITE_COUNT (default 6000, 4K블록 수).
+# 환경변수: UNDERLYING (기본값 /dev/nullb0), DM_NAME (기본값 myzns-base),
+#      FLUSH_THRESHOLD (기본값 1000), WRITE_COUNT (기본값 6000, 4K블록 수).
 
 set -uo pipefail
 

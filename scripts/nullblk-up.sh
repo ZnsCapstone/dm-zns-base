@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Bring up a zoned null_blk device. No-op if one is already running under the
-# same name as host-managed zoned.
-# Env: NB_NAME / NB_SIZE_MB / NB_ZONE_SIZE_MB (default nullb0 / 2048 / 64).
+# zoned null_blk 장치를 생성한다.
+# 같은 이름의 host-managed zoned 장치가 있으면 유지한다.
+# 환경변수: NB_NAME / NB_SIZE_MB / NB_ZONE_SIZE_MB, 기본값은 nullb0 / 2048 / 64이다.
 
 set -uo pipefail
 
@@ -19,7 +19,7 @@ if [ -b "$DEV" ] && [ "$(cat /sys/block/$NB_NAME/queue/zoned 2>/dev/null)" = "ho
 	exit 0
 fi
 
-# nr_devices=0 disables the legacy auto-created instance; we drive it via configfs.
+# nr_devices=0으로 자동 생성을 막고 configfs에서 장치를 구성한다.
 if ! lsmod | grep -q '^null_blk '; then
 	echo "[*] Loading null_blk"
 	modprobe null_blk nr_devices=0 || { echo "[!] modprobe null_blk failed" >&2; exit 1; }

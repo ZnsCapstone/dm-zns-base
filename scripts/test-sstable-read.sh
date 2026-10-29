@@ -1,16 +1,9 @@
 #!/usr/bin/env bash
-# SSTable read-path verification (implementation plan 8단계 확인용).
+# flush된 SSTable을 장치에서 읽어 최신 seq_no의 매핑이 선택되는지 확인한다.
+# checkpoint 로그만 확인하는 테스트와 구분해 실제 읽기 정합성을 검사한다.
 #
-# flush_threshold를 낮춰 같은 LBA 범위를 두 번(서로 다른 데이터로) 덮어써서
-# flush가 여러 번 일어나게 만든 뒤 — 즉 같은 lba가 여러 SSTable 세대에 걸쳐
-# 있는 상태를 만든 뒤 — 다시 읽었을 때 가장 최근에 쓴 데이터가 나오는지
-# 확인한다(오래된 SSTable/세대가 아니라 seq_no 최댓값이 이겨야 함).
-#
-# test-checkpoint.sh(7단계)와 달리 이번엔 실제로 디바이스를 통해 읽어서
-# 정확성을 검증한다 — 8단계부터는 flush된 데이터도 읽을 수 있어야 하므로.
-#
-# Env: UNDERLYING (default /dev/nullb0), DM_NAME (default myzns-base),
-#      FLUSH_THRESHOLD (default 50), WRITE_COUNT (default 120, 4K블록 수).
+# 환경변수: UNDERLYING (기본값 /dev/nullb0), DM_NAME (기본값 myzns-base),
+#      FLUSH_THRESHOLD (기본값 50), WRITE_COUNT (기본값 120, 4K블록 수).
 
 set -uo pipefail
 

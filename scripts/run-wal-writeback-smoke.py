@@ -40,21 +40,21 @@ def main():
     results = []
 
     def save(name, value):
-        (args.out/name).write_text(json.dumps(value, ensure_ascii=False, indent=2)+'\n')
+        (args.out / name).write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
 
     def run(cmd, timeout=120, name=None, check=True, input=None):
-        with (args.out/'commands.jsonl').open('a') as log:
-            log.write(json.dumps(dict(at=time.time(), cmd=cmd))+'\n')
+        with (args.out / 'commands.jsonl').open('a') as log:
+            log.write(json.dumps(dict(at=time.time(), cmd=cmd)) + '\n')
         value = subprocess.run(cmd, input=input, text=True, capture_output=True, timeout=timeout)
         if name:
-            (args.out/name).write_text(value.stdout)
-            (args.out/(name+'.stderr')).write_text(value.stderr)
+            (args.out / name).write_text(value.stdout)
+            (args.out / (name + '.stderr')).write_text(value.stderr)
         if check and value.returncode:
             raise RuntimeError(f'{cmd}: rc={value.returncode}\n{value.stderr[-2000:]}')
         return value
 
     def status(label):
-        text = run(['sudo', '-n', 'dmsetup', 'status', NAME], name=label+'.status').stdout
+        text = run(['sudo', '-n', 'dmsetup', 'status', NAME], name=label + '.status').stdout
         return {k: int(v) for k, v in re.findall(r'(\w+)=(\d+)', text)}
 
     def attach(threshold):
@@ -70,13 +70,13 @@ def main():
                                   wal_group_pages=8, adaptive_gc=1, probe_cache=1,
                                   wal_delay_ms=0).items():
             if actual.get(key) != expected:
-                raise RuntimeError('모듈 기본값 불일치: '+key)
+                raise RuntimeError('모듈 기본값 불일치: ' + key)
         device = os.stat(DEV).st_rdev
         cache = Path(f'/sys/dev/block/{os.major(device)}:{os.minor(device)}/queue/write_cache').read_text().strip()
         if cache != 'write back':
             raise RuntimeError('DM volatile cache/barrier capability 누락')
-        with (args.out/'queue-cache.jsonl').open('a') as log:
-            log.write(json.dumps(dict(write_cache=cache))+'\n')
+        with (args.out / 'queue-cache.jsonl').open('a') as log:
+            log.write(json.dumps(dict(write_cache=cache)) + '\n')
 
     def detach(mounted=False):
         if mounted:
@@ -90,13 +90,13 @@ def main():
         run(['sudo', '-n', 'blkzone', 'reset', RAW], timeout=180)
 
     def fio(label, filename, options):
-        value = run(['sudo', '-n', 'fio', '--name='+label, '--filename='+filename,
+        value = run(['sudo', '-n', 'fio', '--name=' + label, '--filename=' + filename,
                      '--direct=1', '--ioengine=libaio', '--output-format=json',
                      '--thread=1', '--group_reporting=1', *options],
-                    timeout=args.seconds+180, name=label+'.fio.json')
+                    timeout=args.seconds + 180, name=label + '.fio.json')
         payload = json.loads(value.stdout)
         if len(payload.get('jobs', [])) != 1 or payload['jobs'][0].get('error'):
-            raise RuntimeError('fio 검증/실행 오류: '+label)
+            raise RuntimeError('fio 검증/실행 오류: ' + label)
         return payload['jobs'][0]
 
     start = float(Path('/proc/uptime').read_text().split()[0])
@@ -105,11 +105,11 @@ def main():
         model = run(['lsblk', '-dn', '-o', 'MODEL', RAW]).stdout
         if 'FEMU' not in model:
             raise RuntimeError('FEMU raw device 아님')
-        geometry = {k: Path('/sys/block/nvme0n1/'+k).read_text().strip()
+        geometry = {k: Path('/sys/block/nvme0n1/' + k).read_text().strip()
                     for k in ['size', 'queue/zoned', 'queue/chunk_sectors', 'queue/nr_zones']}
         if geometry != {'size': '67108864', 'queue/zoned': 'host-managed',
                         'queue/chunk_sectors': '1048576', 'queue/nr_zones': '64'}:
-            raise RuntimeError('허용된 32GiB/512MiB zone geometry 불일치: '+str(geometry))
+            raise RuntimeError('허용된 32GiB/512MiB zone geometry 불일치: ' + str(geometry))
         devices = run(['sudo', '-n', 'dmsetup', 'ls']).stdout.strip()
         if devices != 'No devices found':
             raise RuntimeError('기존 DM이 존재함: 자동 제거 금지')
@@ -178,16 +178,16 @@ def main():
                 attach(131072)
                 command = ['sudo', '-n', 'mkfs.ext4', '-F', '-E', 'nodiscard', DEV] if fs == 'ext4' else [
                     'sudo', '-n', 'mkfs.f2fs', '-f', '-t', '0', DEV]
-                run(command, timeout=180, name=label+'-mkfs.log')
+                run(command, timeout=180, name=label + '-mkfs.log')
                 run(['sudo', '-n', 'mount', '-t', fs, '-o', 'nodiscard', DEV, MOUNT])
-                filename = MOUNT+'/fio-smoke.bin'
-                fio(label+'-prepare', filename, ['--rw=write', '--bs=1m', '--iodepth=32',
+                filename = MOUNT + '/fio-smoke.bin'
+                fio(label + '-prepare', filename, ['--rw=write', '--bs=1m', '--iodepth=32',
                                                 '--size=256m', '--end_fsync=1'])
-                before = status(label+'-before')
-                job = fio(label, filename, ['--rw='+rw, '--bs='+bs, '--iodepth=32',
+                before = status(label + '-before')
+                job = fio(label, filename, ['--rw=' + rw, '--bs=' + bs, '--iodepth=32',
                           '--size=256m', '--time_based=1', f'--runtime={args.seconds}',
                           '--end_fsync=1', '--percentile_list=95:99'])
-                after = status(label+'-after')
+                after = status(label + '-after')
                 if after.get('wal_early_errors') or after.get('wal_buffered'):
                     raise RuntimeError('buffered WAL 오류')
                 results.append(dict(filesystem=fs, rw=rw, bs=bs,
@@ -202,7 +202,7 @@ def main():
         log = run(['sudo', '-n', 'dmesg'], check=False, name='kernel-after.log').stdout
         lines = [line for line in log.splitlines() if (match := re.match(r'\[\s*([\d.]+)\]', line))
                  and float(match[1]) >= start]
-        (args.out/'kernel-window.log').write_text('\n'.join(lines)+'\n')
+        (args.out / 'kernel-window.log').write_text('\n'.join(lines) + '\n')
         errors = [line for line in lines if re.search(
             r'I/O error|foreground WAL append failed|flush chain failed|checkpoint write failed|'
             r'BUG:|Oops:|KASAN:|insufficient relocation workspace', line, re.I)]

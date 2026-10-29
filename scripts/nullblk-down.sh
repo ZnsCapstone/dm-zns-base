@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Tear down a null_blk device created by nullblk-up.sh.
-# Also unloads the module if no instances remain.
+# nullblk-up.sh가 만든 null_blk 장치를 제거한다.
+# 남은 인스턴스가 없으면 모듈도 제거한다.
 
 set -uo pipefail
 

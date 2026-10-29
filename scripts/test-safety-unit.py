@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Non-destructive regression tests: compile actual driver helpers with fake kernel APIs.
+"""가짜 커널 API로 실제 드라이버 helper를 컴파일하는 비파괴 회귀 검사다.
 
-This tests decisions/error handling, NOT kernel concurrency, DMA, WAL replay or FEMU.
-No module is loaded and no block device is opened.
+정책 판단과 오류 처리를 검사하며 커널 동시성, DMA, WAL replay, FEMU는 검증하지 않는다.
+모듈을 적재하거나 블록 장치를 열지 않는다.
 """
 import pathlib
 import re
@@ -29,14 +29,14 @@ def function(name):
 
 class SafetyTests(unittest.TestCase):
     def test_wal_stage_diagnostics_cover_wait_and_completion(self):
-        worker=function('wal_batch_work_fn')
-        self.assertIn('WD_READY_NS',worker)
-        self.assertIn('WD_WORKER_NS',worker)
-        self.assertLess(worker.index('diag_complete_start ='),worker.index('wal_commit_ctx(ctx,'))
-        self.assertGreater(worker.index('WD_COMPLETE_NS'),worker.index('wal_commit_ctx(ctx,'))
-        io=function('wal_page_append_sync')
-        self.assertLess(io.index('zone_dispatch_wait_turn'),io.index('WD_DISPATCH_NS'))
-        self.assertLess(io.index('submit_bio_wait'),io.index('WD_SUBMIT_NS'))
+        worker = function('wal_batch_work_fn')
+        self.assertIn('WD_READY_NS', worker)
+        self.assertIn('WD_WORKER_NS', worker)
+        self.assertLess(worker.index('diag_complete_start ='), worker.index('wal_commit_ctx(ctx,'))
+        self.assertGreater(worker.index('WD_COMPLETE_NS'), worker.index('wal_commit_ctx(ctx,'))
+        io = function('wal_page_append_sync')
+        self.assertLess(io.index('zone_dispatch_wait_turn'), io.index('WD_DISPATCH_NS'))
+        self.assertLess(io.index('submit_bio_wait'), io.index('WD_SUBMIT_NS'))
 
     def test_wal_diagnostics_preserve_scheduling_and_retry(self):
         self.assertIn('static bool wal_timing_enabled;', SOURCE)

@@ -1,32 +1,14 @@
 #!/usr/bin/env bash
-# GC 검증 (implementation plan 10단계 확인용).
+# 작은 null_blk 장치에서 데이터 GC와 반복 overwrite의 진행 여부를 확인한다.
+# FILL_PERCENT 영역을 채운 뒤 같은 영역에 1.2배 쓰기를 수행한다.
+# --size는 접근 범위, --io_size는 총 쓰기량이며 두 단계의 접근 범위는 동일하다.
+# 기본 점유율 50%는 이주 공간을 남기기 위한 기능 검증 조건이다.
+# 이 설정을 FEMU 80% endurance 기준 통과로 해석하지 않는다.
+# 큰 flush_threshold로 SSTable 작업을 줄이며 GC 동작을 관찰한다.
 #
-# 용량의 FILL_PERCENT까지 채운 뒤, 같은 영역에 1.2배 분량의 random overwrite를
-# 한다 — 존을 여러 바퀴 돌려써야만 하므로 GC(victim 선정 → 재배치 → zone reset)
-# 가 실제로 여러 번 돌아야 "no space left"(ENOSPC) 없이 끝날 수 있다.
-#
-# fio의 --size는 건드리는 영역(고정, 1단계와 2단계가 반드시 같아야 "같은
-# 영역"이 됨)이고 --io_size가 실제 총 쓰기량이다 — 2단계에서 --io_size를
-# --size의 1.2배로 주면 같은 영역을 평균 1.2번씩 덮어쓰게 된다.
-#
-# ★ 왜 M3 원 기준인 80%가 아니라 50%인가 ★
-# foreground와 GC relocation WAL은 최대 127개 PUT을 4KB page 하나로 묶는다.
-# 다만 작은 null_blk 장치에서는 GC 자체의 이주 공간도 필요하므로 보수적인
-# 기본 fill 비율을 유지한다.
-# 그래서 여기서는 GC "로직의 정확성"만 검증할 수 있는 수준으로 채움 비율을
-# 낮춘다. 80% 달성은 WAL zone 회수(implementation plan 13단계)의 몫이며, 그게
-# 되면 FILL_PERCENT=80으로 이 스크립트를 그대로 다시 돌려 확인하면 된다.
-#
-# gc_low_watermark는 작은 null_blk에서도 GC를 일찍 유발하도록 높게 잡는다 — 너무 높으면
-# (이전 25) 회수할 가치가 없는 zone까지 계속 골라 순증가 0짜리 재배치를
-# 반복하고, 너무 낮으면 GC가 늦게 트리거돼 쓰기가 ENOSPC를 먼저 맞는다.
-#
-# flush_threshold는 기본값(매우 큼)으로 두어 compaction/SSTable 경로를 아예
-# 안 타게 하고, 이 테스트가 GC만 순수하게 검증하도록 격리한다.
-#
-# Env: UNDERLYING (default /dev/nullb0), DM_NAME (default myzns-base),
-#      FILL_PERCENT (default 50 — 13단계 완료 후 80으로 재검증),
-#      GC_LOW_WATERMARK (default 8 — null_blk 기본 32 zone 기준).
+# 환경변수: UNDERLYING (기본값 /dev/nullb0), DM_NAME (기본값 myzns-base),
+#      FILL_PERCENT (기본값 50),
+#      GC_LOW_WATERMARK (기본값 8 — null_blk 기본 32 zone 기준).
 
 set -uo pipefail
 
@@ -83,15 +65,15 @@ echo "[OK] device=${dev_bytes} bytes, ${FILL_PERCENT}%=${fill_bytes} bytes, 120%
 echo
 echo "=== [2/6] 용량의 ${FILL_PERCENT}%까지 randwrite로 채우기 ==="
 fio --name=gc-fill \
-    --filename="$DM_DEV" \
-    --rw=randwrite \
-    --bs=4k \
-    --size=$fill_bytes \
-    --ioengine=libaio \
-    --iodepth=32 \
-    --direct=1 \
-    --output-format=normal \
-    2>&1 | grep -E 'WRITE|iops|err'
+	--filename="$DM_DEV" \
+	--rw=randwrite \
+	--bs=4k \
+	--size=$fill_bytes \
+	--ioengine=libaio \
+	--iodepth=32 \
+	--direct=1 \
+	--output-format=normal \
+	2>&1 | grep -E 'WRITE|iops|err'
 FIO1_STATUS=${PIPESTATUS[0]}
 sync
 sleep 3   # GC(백그라운드 workqueue)가 이번 fill 도중 트리거된 만큼 정리될 시간
@@ -105,16 +87,16 @@ echo "[OK]"
 echo
 echo "=== [3/6] 같은 영역(${FILL_PERCENT}%)에 1.2배 분량 random overwrite — GC를 여러 번 유발 ==="
 fio --name=gc-overwrite \
-    --filename="$DM_DEV" \
-    --rw=randwrite \
-    --bs=4k \
-    --size=$fill_bytes \
-    --io_size=$over_bytes \
-    --ioengine=libaio \
-    --iodepth=32 \
-    --direct=1 \
-    --output-format=normal \
-    2>&1 | grep -E 'WRITE|iops|err'
+	--filename="$DM_DEV" \
+	--rw=randwrite \
+	--bs=4k \
+	--size=$fill_bytes \
+	--io_size=$over_bytes \
+	--ioengine=libaio \
+	--iodepth=32 \
+	--direct=1 \
+	--output-format=normal \
+	2>&1 | grep -E 'WRITE|iops|err'
 FIO2_STATUS=${PIPESTATUS[0]}
 sync
 sleep 5   # GC/zone reset이 다 끝날 시간을 넉넉히

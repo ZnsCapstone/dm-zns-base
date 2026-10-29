@@ -5,51 +5,37 @@
 
 int skiplist_init(struct skiplist *sl)
 {
-	/* head는 실제 데이터를 담지 않는 sentinel 노드. 모든 층에서 "시작점" 역할을
-	 *하므로 있을 수 있는 최대 층수(SKIPLIST_MAX_LEVEL)만큼 forward[]를 항상
-	 * 다 갖고 있어야 한다 — 나중에 어떤 노드가 몇 층으로 뽑히든 head는 그 층의
-	 * 시작점으로 바로 쓸 수 있어야 하기 때문. kzalloc이라 forward[]는 전부
-	 * NULL로 시작 = 아직 어느 층에도 데이터 노드가 없는 빈 리스트 상태.
-	 *
-	 * GFP_ATOMIC인 이유: 처음엔 ctr()(process context)에서만 불렸지만,
-	 * 6단계부터 memtable flush 트리거 시 wal_put_done(atomic context)에서도
-	 * 새 memtable을 만들려고 이 함수를 부른다 — skiplist_upsert와 같은 이유. */
+	/* sentinel은 모든 층의 시작점이다. atomic 경로에서도 초기화하므로 GFP_ATOMIC을 사용한다. */
 	sl->head = kzalloc(sizeof(*sl->head) +
 			    SKIPLIST_MAX_LEVEL * sizeof(struct skiplist_node *),
 			    GFP_ATOMIC);
 	if (!sl->head)
 		return -ENOMEM;
 
-	sl->head->level = SKIPLIST_MAX_LEVEL;  /* head 자신의 forward[] 크기 (고정값) */
-	sl->level = 1;   /* "지금 실제로 쓰이는" 최고 층수. 데이터가 없으니 최소값 1부터 */
-	sl->count = 0;   /* 엔트리 개수. memtable flush 트리거 판단에 쓰임 */
+	sl->head->level = SKIPLIST_MAX_LEVEL;
+	sl->level = 1;
+	sl->count = 0;
 	sl->allocated_bytes = sizeof(*sl) + ksize(sl->head);
 	return 0;
 }
 
 void skiplist_destroy(struct skiplist *sl)
 {
-	/* 0층(forward[0])은 모든 노드를 빠짐없이 정렬 순서로 잇고 있는 유일한 층이라,
-	 * 이거 하나만 따라가면 몇 층짜리든 상관없이 전체 노드를 다 방문할 수 있다.
-	 * (1층, 2층... 을 따로 순회할 필요가 없음 — 거긴 일부 노드만 골라서 도는 지름길일 뿐) */
+	/* 모든 노드는 0층에 연결되므로 한 번의 순회로 해제할 수 있다. */
 	struct skiplist_node *node = sl->head->forward[0];
 	struct skiplist_node *next;
 
 	while (node) {
-		next = node->forward[0];  /* node를 kfree하기 전에 다음 노드 주소부터 챙겨둠 */
+		next = node->forward[0];
 		kfree(node);
 		node = next;
 	}
-	kfree(sl->head);  /* 마지막으로 sentinel 자신도 해제. sl 컨테이너 자체는 호출자 책임 */
+	kfree(sl->head); /* sl 자체는 호출자가 해제한다. */
 }
 
 int skiplist_random_level(void)
 {
-	/* 동전 던지기: 50% 확률로 한 층씩 계속 올라간다. 그러니 결과 분포는
-	 * level=1일 확률 1/2, level=2일 확률 1/4, level=3일 확률 1/8 ... 식으로
-	 * 절반씩 줄어든다 — 대부분 노드가 낮은 층에 머물고, 아주 일부만 위층까지
-	 * 뻗는 게 skip list가 노리는 모양 그대로다. SKIPLIST_MAX_LEVEL에서 강제로 멈춘다
-	 * (안 그러면 이론상 무한정 올라갈 수 있음, 확률은 갈수록 0에 수렴하지만). */
+	/* 각 추가 층을 50% 확률로 선택하되 SKIPLIST_MAX_LEVEL을 넘지 않는다. */
 	int level = 1;
 
 	while (level < SKIPLIST_MAX_LEVEL && (get_random_u32() & 1))
@@ -59,88 +45,62 @@ int skiplist_random_level(void)
 
 int skiplist_upsert(struct skiplist *sl, u64 lba, u64 phys, u64 *old_phys_out)
 {
-	/* update[l] = "l층에서, 삽입/갱신 지점 바로 앞 노드".
-	 * 검색하면서 지나온 위치를 기억해두는 용도 — 나중에 새 노드를 끼워넣을 때
-	 * "누구 뒤에 이어붙여야 하는지"를 다시 찾지 않고 바로 쓸 수 있게 해준다. */
+	/* 각 층의 삽입 위치 직전 노드를 저장한다. 호출자가 락으로 보호한다. */
 	struct skiplist_node *update[SKIPLIST_MAX_LEVEL];
 	struct skiplist_node *x = sl->head;
 	struct skiplist_node *found, *n;
 	int l, i;
 	int new_level;
 
-	/* --- 1. 검색: 위층(sl->level-1)부터 0층까지 내려오면서 lba 바로 앞자리를 찾는다 ---
-	 * 각 층에서 "다음 노드가 lba보다 작은 동안"만 전진하고, lba 이상인 노드를
-	 * 만나면(혹은 그 층 끝이면) 멈추고 한 층 내려간다. x는 층이 바뀌어도
-	 * head로 되돌리지 않고 그대로 들고 내려간다 — 위층에서 이미 확인한 구간은
-	 * 아래층에서 다시 훑을 필요가 없기 때문(이게 O(log n)의 핵심). */
+	/* 위층에서 찾은 위치를 이어받아 아래층의 탐색 범위를 줄인다. */
 	for (l = sl->level - 1; l >= 0; l--) {
 		while (x->forward[l] && x->forward[l]->lba < lba) {
 			x = x->forward[l];
 		}
-		update[l] = x; // 삽입되거나 갱신될 자리
+		update[l] = x;
 	}
 
-	/* --- 2. 판정: 0층에서 x 바로 다음 노드가 lba와 같은 키인가? ---
-	 * 위 검색이 끝난 시점의 x는 항상 "lba보다 작은 값 중 가장 큰 노드"이므로,
-	 * x->forward[0]이 lba와 같다면 그게 바로 우리가 찾던 기존 엔트리다. */
+	/* 같은 LBA가 있으면 물리 주소만 갱신한다. */
 	found = x->forward[0];
 	if (found && found->lba == lba) {
-		/* update(갱신) 경로: 새 노드를 만들 필요 없이 그 자리에서 phys만 교체.
-		 * 옛 phys를 호출자에게 돌려주는 이유 — 이 값이 가리키던 물리 위치는
-		 * 이 순간부터 아무도 안 쓰는 죽은 공간이 되므로, GC의 zone별
-		 * invalid_count를 갱신하려면 호출자(mapping_put)가 이 옛 값을 알아야 함. */
+		/* 호출자가 이전 물리 위치를 무효화할 수 있도록 옛 주소를 반환한다. */
 		*old_phys_out = found->phys;
 		found->phys = phys;
-		return 1; // 이미 존재하는 키 — 갱신됨
+		return 1; /* 이미 존재하는 키 — 갱신됨 */
 	}
 
-	/* --- 3. insert(신규삽입) 경로: 새 노드가 몇 층짜리가 될지 랜덤으로 결정 --- */
 	new_level = skiplist_random_level();
 
-	/* 새로 뽑힌 층수가 지금까지 리스트 전체의 최고층(sl->level)보다 높다면,
-	 * 그 초과분 층들은 위 1번 검색 루프가 아예 순회하지 않았으므로 update[]가
-	 * 비어있다(스택 배열이라 쓰레기값). 이 층들에선 지금까지 아무 노드도 없었다는
-	 * 뜻이니, "그 층의 시작점"은 항상 head다 — 그래서 head로 채워준다. */
+	/* 기존 최고층보다 높은 층은 sentinel 뒤에 삽입한다. */
 	if (new_level > sl->level) {
 		for (i = sl->level; i < new_level; i++) {
 			update[i] = sl->head;
 		}
-		sl->level = new_level;  /* 리스트 전체의 최고층 갱신 */
+		sl->level = new_level;
 	}
 
-	/* forward[]는 "노드"가 아니라 "포인터"의 배열이므로 sizeof(struct skiplist_node *)
-	 * 여야 한다. sizeof(struct skiplist_node)로 하면 노드 하나 크기만큼(포인터의
-	 * 몇 배) 잡아서 매번 불필요하게 큰 메모리를 낭비하게 된다.
-	 *
-	 * GFP_ATOMIC인 이유: upsert()는 mapping_put()을 통해 bio 완료 콜백
-	 * (atomic/softirq 컨텍스트, c->lock 스핀락 보유 중)에서도 호출된다.
-	 * GFP_KERNEL은 메모리 회수를 위해 sleep할 수 있어 그런 컨텍스트에서
-	 * 쓰면 "sleeping while atomic" 데드락/행이 발생한다. */
+	/* forward[] 크기만큼 포인터 공간을 추가한다.
+	 * mapping 갱신은 spinlock/완료 콜백에서도 실행되므로 sleep 가능한 할당은 금지한다. */
 	n = kzalloc(sizeof(*n) + new_level * sizeof(struct skiplist_node *), GFP_ATOMIC);
 	if (!n)
 		return -ENOMEM;
 
 	n->lba = lba;
 	n->phys = phys;
-	n->level = new_level;  /* 이 노드가 몇 층까지 뻗어있는지 기록 (destroy 등에서 참고 가능) */
+	n->level = new_level;
 
-	/* 새 노드를 0층부터 new_level-1층까지 전부 끼워넣는다. 각 층 i에서:
-	 * "새 노드의 forward[i]는 update[i]가 원래 가리키던 다음 노드"로,
-	 * "update[i]의 forward[i]는 새 노드"로 — 즉 update[i]와 그 다음 노드
-	 * 사이에 새 노드를 끼워넣는 표준적인 연결리스트 삽입이다. */
+	/* 각 층에서 직전 노드와 다음 노드 사이에 연결한다. */
 	for (i = 0; i < new_level; i++) {
 		n->forward[i] = update[i]->forward[i];
 		update[i]->forward[i] = n;
 	}
 
-	sl->count++;  /* 실제로 새 엔트리가 늘어난 경우에만 증가 (갱신 경로는 여기 안 옴) */
+	sl->count++;
 	sl->allocated_bytes += ksize(n);
-	return 0;     // 신규 삽입됨
+	return 0; /* 신규 삽입됨 */
 }
 
-/* TODO(직접 구현): upsert의 "1. 검색"과 완전히 같은 top-down 순회를 하되,
- * update[]도 필요 없고(삽입 안 하니까) 찾았을 때 갱신도 안 함 — 조회만.
- * x->forward[0]이 lba와 같으면 *phys_out에 담고 1, 아니면 0. */
+/* 호출자가 접근을 보호한다. 조회 중에는 매핑을 변경하지 않는다. */
 int skiplist_lookup(struct skiplist *sl, u64 lba, u64 *phys_out)
 {
 	struct skiplist_node *x = sl->head;
@@ -149,7 +109,7 @@ int skiplist_lookup(struct skiplist *sl, u64 lba, u64 *phys_out)
 
 	for (l = SKIPLIST_MAX_LEVEL - 1; l >= 0; l--) {
 		while (x->forward[l] && x->forward[l]->lba < lba)
-                      x = x->forward[l];
+			x = x->forward[l];
 	}
 
 	found = x->forward[0];

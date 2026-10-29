@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# End-to-end smoke test for the M0 scaffold.
-# build -> insmod -> dmsetup create -> blkzone report -> zone 0 reset
-# -> 4 KiB sequential write -> verify wp -> clean up.
+# 초기 M0의 zone 전달 경로를 확인하는 참고용 smoke 테스트다.
+# 빌드·모듈 적재·DM 생성 뒤 zone report와 첫 zone reset을 확인한다.
+# 4KiB 순차 쓰기 후 wp를 확인하고 정리한다.
 #
-# Env: UNDERLYING (default /dev/nullb0), DM_NAME (default myzns-base).
+# 환경변수: UNDERLYING (기본값 /dev/nullb0), DM_NAME (기본값 myzns-base).
 
 set -uo pipefail
 

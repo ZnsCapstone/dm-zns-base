@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location('safety', ROOT/'scripts/test-safety-unit.py')
+spec = importlib.util.spec_from_file_location('safety', ROOT / 'scripts/test-safety-unit.py')
 safety = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(safety)
 function = safety.function
@@ -16,18 +16,18 @@ function = safety.function
 
 class WritebackTests(unittest.TestCase):
     def test_actual_buffer_and_completion_helpers(self):
-        harness = (ROOT/'scripts/wal-writeback-harness.c').read_text()
+        harness = (ROOT / 'scripts/wal-writeback-harness.c').read_text()
         for name in ['wal_try_buffer_write', 'wal_complete_buffered']:
-            harness = harness.replace('/* '+name+' */', function(name))
+            harness = harness.replace('/* ' + name + ' */', function(name))
         with tempfile.TemporaryDirectory(prefix='wal-writeback-') as folder:
             path = Path(folder)
-            (path/'test.c').write_text(harness)
+            (path / 'test.c').write_text(harness)
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
-                            '-fsanitize=address,undefined', '-g', str(path/'test.c'),
-                            '-o', str(path/'test')], check=True)
+                            '-fsanitize=address,undefined', '-g', str(path / 'test.c'),
+                            '-o', str(path / 'test')], check=True)
             # 관리형 실행기의 ptrace 하에서는 LSan이 동작하지 않는다.
             # ASan/UBSan은 유지하고 소유권 해제는 harness에서도 계수한다.
-            subprocess.run([str(path/'test')], check=True,
+            subprocess.run([str(path / 'test')], check=True,
                            env=dict(os.environ, ASAN_OPTIONS='detect_leaks=0'))
 
     def test_data_flush_precedes_durable_wal_and_publication(self):
@@ -69,7 +69,7 @@ class WritebackTests(unittest.TestCase):
         self.assertIn('wal_complete_buffered(ctx, wal_status)', function('wal_commit_ctx'))
 
     def test_production_defaults_and_removed_policy_switches(self):
-        source = (ROOT/'src/dm-zns-base-main.c').read_text()
+        source = (ROOT / 'src/dm-zns-base-main.c').read_text()
         for name in ['wal_writeback', 'adaptive_gc', 'sstable_probe_cache']:
             self.assertNotIn(f'module_param({name},', source)
         for definition in ['wal_batch_delay_ms = 0;', 'data_append_max_blocks = 64;',

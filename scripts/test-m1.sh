@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# M1 smoke test: verify random writes are translated into sequential writes.
+# M1 smoke 테스트: 랜덤 쓰기가 순차 물리 쓰기로 변환되는지 확인한다.
 #
-# Visual proof:
-#   - blkzone report on /dev/nullb0 BEFORE fio: all zones wp=0x0
-#   - blkzone report on /dev/nullb0 AFTER  fio: zone(s) wp advanced sequentially
-#   - dmsetup status shows per-zone write pointer table
+# 확인 항목:
+# - fio 전 /dev/nullb0의 zone wp가 초기 상태인지 확인한다.
+# - fio 후 zone wp가 순차적으로 전진했는지 확인한다.
+# - dmsetup status에서 zone별 wp를 확인한다.
 #
-# Success criterion: fio 4K randwrite 100MB → blk_update_request delta=0
+# 통과 기준: fio 4KiB 랜덤 쓰기 100MB 동안 blk_update_request 오류 증가가 없어야 한다.
 #
-# Env: UNDERLYING (default /dev/nullb0), DM_NAME (default myzns-base).
+# 환경변수: UNDERLYING (기본값 /dev/nullb0), DM_NAME (기본값 myzns-base).
 
 set -uo pipefail
 
@@ -42,7 +42,7 @@ fi
 dmsetup remove "$DM_NAME" 2>/dev/null || true
 rmmod $MOD_NAME 2>/dev/null || true
 
-# Reset all zones for a clean starting point
+# 초기 상태를 만들기 위해 모든 zone을 reset한다.
 blkzone reset "$UNDERLYING"
 
 echo "[*] insmod $KO_PATH"
@@ -72,21 +72,21 @@ echo "    (모든 wp = 0x0 이어야 함 — 아무것도 안 썼으므로)"
 blkzone report "$UNDERLYING" | head -6
 echo "    ..."
 
-# ── [3] fio randwrite ─────────────────────────────────────────────────────────
+# ── [3] fio 랜덤 쓰기 ─────────────────────────────────────────────────────────
 echo
 echo "=== [3/5] fio 4K randwrite 100MB (iodepth=32, direct=1) ==="
 before=$(dmesg 2>/dev/null | grep -c 'blk_update_request.*I/O error' || true)
 
 fio --name=m1-randw \
-    --filename="$DM_DEV" \
-    --rw=randwrite \
-    --bs=4k \
-    --size=100M \
-    --ioengine=libaio \
-    --iodepth=32 \
-    --direct=1 \
-    --output-format=normal \
-    2>&1 | grep -E 'WRITE|iops|err'
+	--filename="$DM_DEV" \
+	--rw=randwrite \
+	--bs=4k \
+	--size=100M \
+	--ioengine=libaio \
+	--iodepth=32 \
+	--direct=1 \
+	--output-format=normal \
+	2>&1 | grep -E 'WRITE|iops|err'
 
 after=$(dmesg 2>/dev/null | grep -c 'blk_update_request.*I/O error' || true)
 

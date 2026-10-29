@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Vagrant provisioner: install apt dependencies only.
-# null_blk creation lives in scripts/nullblk-up.sh so it can be re-run
-# after every reboot (the device is memory-backed and doesn't persist).
+# Vagrant 초기 구성에서는 필요한 패키지만 설치한다.
+# null_blk 생성은 scripts/nullblk-up.sh로 분리해 재실행할 수 있게 한다.
+# 메모리 기반 장치는 재부팅 후 유지되지 않는다.
 
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive

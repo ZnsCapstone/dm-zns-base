@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
-# Crash-recovery smoke test (implementation plan 5단계 확인용).
+# zone reset 없이 모듈을 제거·재적재해 WAL과 zone header의 매핑 복원을 확인한다.
+# 정상 dtr 경로를 거치는 재적재 시험이며 전원 차단이나 실제 커널 크래시를 주입하지 않는다.
 #
-# 정상적인 dtr() 경로를 거치더라도, memtable/zone_pool의 태그·wp는 메모리에만
-# 있어서 재적재하면 사라진다. zone reset 없이 모듈만 내렸다 다시 올려서,
-# WAL replay + zone 헤더 스캔이 실제로 매핑을 복원하는지 확인한다.
-#
-# Env: UNDERLYING (default /dev/nullb0), DM_NAME (default myzns-base).
+# 환경변수: UNDERLYING (기본값 /dev/nullb0), DM_NAME (기본값 myzns-base).
 
 set -uo pipefail
 
