@@ -23,3 +23,13 @@ compile_commands.json
 CLAUDE.md
 OT.pdf
 report/
+
+# 로컬 실험 보고서와 검증 산출물
+/docs/wal-writeback-experiment.md
+/docs/keper-extensions-experiment.md
+/docs/11-zone-append-experiment.md
+/docs/코드-작성-기준.md
+/report-*.md
+/docs/코드-검증-*.md
+__pycache__/
+*.py[cod]
